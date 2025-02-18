@@ -1,0 +1,46 @@
+name: Build Image And Deploy
+on:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubicloud
+    env:
+      ECR_REPO_URI: 011528263343.dkr.ecr.eu-west-1.amazonaws.com/swift
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@master
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_NON_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY_NON_PROD }}
+          aws-region: 'eu-west-1'
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install kubectl
+        run: |
+          curl -o kubectl https://s3.us-west-2.amazonaws.com/amazon-eks/1.23.7/2022-06-29/bin/linux/amd64/kubectl
+          curl https://s3.us-west-2.amazonaws.com/amazon-eks/1.23.7/2022-06-29/bin/linux/amd64/kubectl.sha256
+          openssl sha1 -sha256 kubectl
+          chmod +x ./kubectl
+          kubectl version --client=true
+
+      - name: Docker build
+        run: |
+          ECR_REPO_URI=011528263343.dkr.ecr.eu-west-1.amazonaws.com/swift
+          docker build -f ./Dockerfile --no-cache -t $ECR_REPO_URI:$GITHUB_SHA-master -t $ECR_REPO_URI:latest-master .
+          docker push $ECR_REPO_URI:$GITHUB_SHA-master
+          docker push $ECR_REPO_URI:latest-master
+
+      - name: Restart deployment
+        run: |
+          aws eks update-kubeconfig --name drift-non-prod-cluster --region eu-west-1 --role-arn arn:aws:iam::011528263343:role/k8sAdmin
+          kubectl rollout restart -n master deployment/swift-server-app
+          kubectl rollout restart -n master statefulset/swift-ws-server-app
+          kubectl rollout restart -n master deployment/swift-confirmation-server-app

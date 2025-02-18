@@ -1,0 +1,65 @@
+name: build_and_test
+
+on:
+  pull_request:
+    branches:
+      - master
+      - mainnet-beta
+
+jobs:
+  build_and_test:
+    runs-on: ubicloud
+    container: rust:1.84.1
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        task: ['build', 'test']
+    env:
+        CARGO_DRIFT_FFI_PATH: /usr/local/lib
+    steps:
+      # Common steps
+      - name: Checkout main
+        uses: actions/checkout@v3
+
+      - name: Install OS dependencies
+        run: apt-get update && apt-get install -y git libssl-dev libsasl2-dev cmake
+
+      - name: Install rustfmt and toolchain
+        run: rustup component add rustfmt
+
+      - name: Install libdrift_ffi
+        run: curl -L https://github.com/drift-labs/drift-ffi-sys/releases/download/v2.109.0/libdrift_ffi_sys.so -o libdrift_ffi_sys.so && cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
+
+      - name: Cache cargo index
+        uses: actions/cache@v2
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-index-
+
+      # Conditional steps based on matrix task
+      - name: Fmt
+        if: matrix.task == 'build'
+        run: cargo fmt
+
+      - name: Build
+        if: matrix.task == 'build'
+        run: cargo check
+
+      - name: Setup Redis
+        if: matrix.task == 'test'
+        run: |
+          apt-get install -y redis-server redis-tools
+          service redis-server start
+          redis-server --daemonize yes
+
+      - name: Add test entries to Redis
+        if: matrix.task == 'test'
+        run: |
+          redis-cli set "fastlane-hashes::test_hash_1" "test_value_1"
+          redis-cli set "fastlane-hashes::test_hash_2" "test_value_2"
+
+      - name: Run tests
+        if: matrix.task == 'test'
+        run: cargo test
