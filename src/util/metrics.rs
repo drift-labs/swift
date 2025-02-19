@@ -21,7 +21,10 @@ pub async fn metrics_handler(
         eprintln!("could not encode custom metrics: {}", e);
     }
     let response = String::from_utf8(buffer).unwrap();
-    axum::response::Html(response)
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/plain;version=1.0.0;charset=utf-8")
+        .body(response)
+        .unwrap()
 }
 
 #[derive(Clone)]
