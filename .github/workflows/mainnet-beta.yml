@@ -1,7 +1,7 @@
 name: Build Image And Deploy
 on:
   push:
-    branches: [master]
+    branches: [mainnet-beta]
 
 jobs:
   build:
