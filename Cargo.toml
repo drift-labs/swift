@@ -1,0 +1,63 @@
+[package]
+name = "fastlane-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+arrayvec = "0.7.6"
+anchor-lang = "0.30"
+aws-config = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    "rustls",
+    "sso",
+]}
+aws-sdk-kafka = "1.42.0"
+aws-sdk-sts = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "rustls",
+]}
+axum = { version = "^0.7.5", features = ["ws"] }
+axum-prometheus = "0.7.0"
+base64 = "0.22.1"
+deadpool-redis = { version = "0.18", features = ["serde"] }
+clap = { version = "4.0", features = ["derive"] }
+dashmap = "6.1.0"
+dotenv = "0.15.0"
+drift-rs = { git = "https://github.com/drift-labs/drift-rs.git" , tag = "v1.0.0-alpha.11" }
+ed25519-dalek = "1.0.1"
+env_logger = "0.11.5"
+faster-hex = "0.10.0"
+futures-util = "0.3.30"
+log = "0.4.22"
+nanoid = "0.4.0"
+prometheus = "0.13"
+rand = "0.8.5"
+rdkafka = { version = "0.36.2", features = ["ssl", "sasl"] }
+redis = { version = "0.27", features = ["tokio-comp", "tokio-native-tls-comp", "tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.127"
+solana-client = "2.0.14"
+solana-sdk = "2.0.14"
+tokio = { version = "1.0", features = ["full"] }
+# fork with Ws compression enabled
+tokio-tungstenite = { git = "https://github.com/drift-labs/tokio-tungstenite", features = ["native-tls"] }
+urlencoding = "2.1.0"
+uuid = { version = "1.10.0", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
+tower-http = { version = "0.6.2", features= ["cors"] }
+strum_macros = "0.27.0"
+
+[features]
+default = ["rdkafka/cmake-build"]
+# build with linked librdkafka
+fast = ["rdkafka/dynamic-linking"]
+
+[dev-dependencies]
+axum-macros = "0.4.2"
+
+[profile.dev.package]
+ark-ff = { opt-level = 0 }
+ring = { opt-level = 0 }
+zstd-sys = { opt-level = 0 }
+solana-program = { opt-level = 0 }

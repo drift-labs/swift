@@ -1,0 +1,14 @@
+FROM apache/kafka:latest
+USER root
+RUN apk update && apk add --no-cache nodejs npm
+ENV PATH="/opt/kafka/bin:$PATH"
+WORKDIR /app
+COPY ts/package*.json ./
+RUN npm install
+
+COPY ts/tsconfig.json ./
+COPY ts/src/ ./src/
+RUN npm run build
+
+RUN echo '#!/bin/bash\nnode /app/dist/cli.js "$@"' > /usr/local/bin/kafka-cli && chmod +x /usr/local/bin/kafka-cli
+ENTRYPOINT ["/bin/bash"]
