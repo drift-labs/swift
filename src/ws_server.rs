@@ -458,8 +458,9 @@ impl WsConnection {
                             } else {
                                 let sender = self.message_tx.clone();
                                 let log_prefix = log_prefix.clone();
+                                let sleep_fut = tokio::time::sleep(send_delay);
                                 tokio::spawn(async move {
-                                    let _ = tokio::time::sleep(send_delay).await;
+                                    let _ = sleep_fut.await;
                                     for new_order_info in updates {
                                         // forward kafka messages to the outbox
                                         if let Err(err) = sender.try_send(new_order_info) {

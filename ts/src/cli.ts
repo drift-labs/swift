@@ -1,3 +1,4 @@
+// Kafka helper cli
 import { execSync } from 'child_process';
 import { writeFileSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
