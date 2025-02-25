@@ -69,7 +69,15 @@ const ENDPOINT: LazyCell<String> = LazyCell::new(|| {
     env::var("ENDPOINT").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string())
 });
 
-type Subscriptions = DashMap<String, broadcast::Sender<String>>;
+#[derive(Clone, Debug)]
+pub struct OrderNotification {
+    /// json-ified order
+    json: String,
+    /// internal order processing latency
+    recv_lag: u64,
+}
+
+type Subscriptions = DashMap<String, broadcast::Sender<OrderNotification>>;
 
 // Used for authentication
 #[derive(Clone, Debug)]
@@ -157,7 +165,7 @@ async fn determine_fast_ws(authority: &Pubkey) -> Result<bool> {
 pub struct WsConnection {
     /// True if the connection has authenticated its pubkey
     authenticated: bool,
-    subscribed_topics: HashMap<String, broadcast::Receiver<String>>,
+    subscribed_topics: HashMap<String, broadcast::Receiver<OrderNotification>>,
     challenge: Option<Challenge>,
     fast_ws: Arc<AtomicBool>,
     /// write half of outbound message queue
@@ -179,7 +187,7 @@ impl WsConnection {
             fast_ws: Default::default(),
             subscribed_topics: Default::default(),
             challenge: Some(Challenge {
-                // Set nonce store for authentication and the nsend message immdiately to the user
+                // Set nonce store for authentication and the send message immediately to the user
                 nonce: rand::thread_rng()
                     .sample_iter(&rand::distributions::Alphanumeric)
                     .take(30)
@@ -393,10 +401,10 @@ impl WsConnection {
             let mut kafka_subs =
                 FuturesUnordered::from_iter(self.subscribed_topics.iter_mut().map(|r| r.1.recv()))
                     .try_ready_chunks(8);
-
+            let pending_messages = self.message_rx.len();
             tokio::select! {
                 biased;
-                n_read = self.message_rx.recv_many(&mut outbox, 16) => {
+                n_read = self.message_rx.recv_many(&mut outbox, 16), if pending_messages > 0 => {
                     shared_state.metrics.ws_outbox_size.observe(self.message_rx.len() as f64 + n_read as f64);
                     debug!(target: "ws", "queued {n_read} outbox messages");
                 }
@@ -448,7 +456,7 @@ impl WsConnection {
                             if send_delay.is_zero() {
                                 for new_order_info in updates {
                                     // forward kafka messages to the outbox
-                                    if let Err(err) = self.message_tx.try_send(new_order_info) {
+                                    if let Err(err) = self.message_tx.try_send(new_order_info.json) {
                                         // client will miss this message
                                         // either channel is full or closed
                                         log::error!(target: "ws", "{log_prefix}: queueing send failed: {err:?}");
@@ -458,12 +466,14 @@ impl WsConnection {
                             } else {
                                 let sender = self.message_tx.clone();
                                 let log_prefix = log_prefix.clone();
-                                let sleep_fut = tokio::time::sleep(send_delay);
+                                // remove internal routing latency from the delay
+                                let delay_ms = send_delay.as_millis() as u64 - updates.first().unwrap().recv_lag;
+                                let delay_fut = tokio::time::sleep(Duration::from_millis(delay_ms));
                                 tokio::spawn(async move {
-                                    let _ = sleep_fut.await;
+                                    let _ = delay_fut.await;
                                     for new_order_info in updates {
                                         // forward kafka messages to the outbox
-                                        if let Err(err) = sender.try_send(new_order_info) {
+                                        if let Err(err) = sender.try_send(new_order_info.json) {
                                             // client will miss this message
                                             // either channel is full or closed
                                             log::error!(target: "ws", "{log_prefix}: queueing send failed: {err:?}");
@@ -499,11 +509,9 @@ impl WsConnection {
                         );
                         break 'handler Ok(());
                     }
-                    if let Err(err) = self.send_message(
-                        WsMessage::heartbeat().set_message(&unix_now_ms().to_string())
-                    ) {
-                        break 'handler Err(err);
-                    }
+                    outbox.push(
+                        WsMessage::heartbeat().set_message(&unix_now_ms().to_string()).jsonify()
+                    );
                 }
             }
 
@@ -610,7 +618,10 @@ async fn subscribe_kafka_consumer(
                 );
                 let message = WsMessage::new(topic).set_order(&order_metadata);
                 log::debug!("message jsonify(): {:?}", message);
-                match tx.send(message.jsonify()) {
+                match tx.send(OrderNotification {
+                    json: message.jsonify(),
+                    recv_lag: unix_now_ms().saturating_sub(order_metadata.ts),
+                }) {
                     Ok(_) => {
                         log::debug!(
                             target: "kafka",
@@ -709,7 +720,10 @@ async fn subscribe_redis_pubsub(
         );
         let message = WsMessage::new(topic).set_order(&order_metadata);
         log::trace!("message jsonify(): {:?}", message);
-        match tx.send(message.jsonify()) {
+        match tx.send(OrderNotification {
+            json: message.jsonify(),
+            recv_lag: unix_now_ms().saturating_sub(order_metadata.ts),
+        }) {
             Ok(_) => {
                 log::debug!(
                     target: "redis",
@@ -1212,7 +1226,12 @@ mod test {
             tokio::spawn(async move {
                 // wait to send the update after the Ws connection is alive
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                sender.send("wow much update".into()).expect("sent");
+                sender
+                    .send(OrderNotification {
+                        json: "wow much update".into(),
+                        recv_lag: 0,
+                    })
+                    .expect("sent");
             });
 
             // run Ws connection
