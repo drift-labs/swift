@@ -401,10 +401,9 @@ impl WsConnection {
             let mut kafka_subs =
                 FuturesUnordered::from_iter(self.subscribed_topics.iter_mut().map(|r| r.1.recv()))
                     .try_ready_chunks(8);
-            let pending_messages = self.message_rx.len();
             tokio::select! {
                 biased;
-                n_read = self.message_rx.recv_many(&mut outbox, 16), if pending_messages > 0 => {
+                n_read = self.message_rx.recv_many(&mut outbox, 16) => {
                     shared_state.metrics.ws_outbox_size.observe(self.message_rx.len() as f64 + n_read as f64);
                     debug!(target: "ws", "queued {n_read} outbox messages");
                 }
