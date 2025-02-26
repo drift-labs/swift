@@ -1,7 +1,7 @@
 name: Deploy on ts sdk update
 on:
   repository_dispatch:
-    types: [jit-sdk-update]
+    types: [sdk-update]
 
 jobs:
   update-sdk:
