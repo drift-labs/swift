@@ -389,14 +389,9 @@ impl WsConnection {
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         let _ = heartbeat_interval.tick().await; // skip first immediate tick
 
-        let send_delay = if self.is_fast() {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(FAST_SLOW_WS_DIFF.as_millis() as u64)
-        };
-
         // Loop that handles the message forwarding and transmission
         let res = 'handler: loop {
+            let is_fast_ws = self.is_fast();
             let has_subs = !self.subscribed_topics.is_empty();
             let mut kafka_subs =
                 FuturesUnordered::from_iter(self.subscribed_topics.iter_mut().map(|r| r.1.recv()))
@@ -452,7 +447,7 @@ impl WsConnection {
                     // forward kafka messages to the outbox
                     match batch_updates {
                         Some(Ok(updates)) => {
-                            if send_delay.is_zero() {
+                            if is_fast_ws {
                                 for new_order_info in updates {
                                     // forward kafka messages to the outbox
                                     if let Err(err) = self.message_tx.try_send(new_order_info.json) {
@@ -466,8 +461,8 @@ impl WsConnection {
                                 let sender = self.message_tx.clone();
                                 let log_prefix = log_prefix.clone();
                                 // remove internal routing latency from the delay
-                                let delay_ms = send_delay.as_millis() as u64 - updates.first().unwrap().recv_lag;
-                                let delay_fut = tokio::time::sleep(Duration::from_millis(delay_ms));
+                                let delay_ms = FAST_SLOW_WS_DIFF - Duration::from_millis(updates.first().unwrap().recv_lag);
+                                let delay_fut = tokio::time::sleep(delay_ms);
                                 tokio::spawn(async move {
                                     let _ = delay_fut.await;
                                     for new_order_info in updates {
@@ -538,11 +533,13 @@ impl WsConnection {
         }
 
         // Decrement connection counter
-        shared_state
-            .metrics
-            .ws_connections
-            .with_label_values(&[&self.is_fast().to_string()])
-            .dec();
+        if self.is_authenticated() {
+            shared_state
+                .metrics
+                .ws_connections
+                .with_label_values(&[&self.is_fast().to_string()])
+                .dec();
+        }
 
         if let Err(err) = res {
             log::warn!(target: "ws", "{log_prefix}: closed unexpectedly: {err:?}");
