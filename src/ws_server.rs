@@ -184,7 +184,7 @@ impl WsConnection {
         let (message_tx, message_rx) = mpsc::channel::<String>(128);
         Self {
             authenticated: false,
-            fast_ws: Default::default(),
+            fast_ws: Arc::new(AtomicBool::new(true)),
             subscribed_topics: Default::default(),
             challenge: Some(Challenge {
                 // Set nonce store for authentication and the send message immediately to the user
@@ -316,42 +316,46 @@ impl WsConnection {
                         self.send_message(WsMessage::auth().set_message("Authenticated"))?;
                         self.authenticated = true;
                         self.challenge.take();
-
-                        // Load the connection priority from IF stake (async)
-                        tokio::spawn({
-                            let fast_ws = Arc::clone(&self.fast_ws);
-                            let pubkey = self.pubkey;
-                            async move {
-                                let is_fast_ws = determine_fast_ws(&pubkey).await;
-                                if let Err(ref err) = is_fast_ws {
-                                    log::error!(
-                                        "{}: Failed to determine if fast ws: {err:?}",
-                                        pubkey.to_string()
-                                    );
-                                    shared_state
-                                        .metrics
-                                        .ws_connections
-                                        .with_label_values(&["false"])
-                                        .inc();
-                                } else {
-                                    log::info!(
-                                        target: "ws",
-
-                                        "{}: Is fast ws: {is_fast_ws:?}",
-                                        pubkey.to_string()
-                                    );
-                                    let is_fast_ws = is_fast_ws.unwrap();
-                                    shared_state
-                                        .metrics
-                                        .ws_connections
-                                        .with_label_values(&[&is_fast_ws.to_string()])
-                                        .inc();
-                                    fast_ws.store(is_fast_ws, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        });
+                        shared_state
+                            .metrics
+                            .ws_connections
+                            .with_label_values(&[&self.is_fast().to_string()])
+                            .inc();
 
                         Ok(())
+                        // Load the connection priority from IF stake (async)
+                        // tokio::spawn({
+                        //     let fast_ws = Arc::clone(&self.fast_ws);
+                        //     let pubkey = self.pubkey;
+                        //     async move {
+                        //         let is_fast_ws = determine_fast_ws(&pubkey).await;
+                        //         if let Err(ref err) = is_fast_ws {
+                        //             log::error!(
+                        //                 "{}: Failed to determine if fast ws: {err:?}",
+                        //                 pubkey.to_string()
+                        //             );
+                        //             shared_state
+                        //                 .metrics
+                        //                 .ws_connections
+                        //                 .with_label_values(&["false"])
+                        //                 .inc();
+                        //         } else {
+                        //             log::info!(
+                        //                 target: "ws",
+
+                        //                 "{}: Is fast ws: {is_fast_ws:?}",
+                        //                 pubkey.to_string()
+                        //             );
+                        //             let is_fast_ws = is_fast_ws.unwrap();
+                        //             shared_state
+                        //                 .metrics
+                        //                 .ws_connections
+                        //                 .with_label_values(&[&is_fast_ws.to_string()])
+                        //                 .inc();
+                        //             fast_ws.store(is_fast_ws, std::sync::atomic::Ordering::Relaxed);
+                        //         }
+                        //     }
+                        // });
                     }
                     Err(e) => {
                         self.send_message(
