@@ -35,7 +35,7 @@ async fn main() {
             confirmation_server::start_server().await;
         }
         "swift" => {
-            // Run the fastlane http server
+            // Run the swift http server
             swift_server::start_server().await;
         }
         "ws" => {
