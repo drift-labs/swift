@@ -1,4 +1,4 @@
-# Server Server
+# Swift Server
 
 Infrastructure for the Server order pipeline.
 
@@ -6,7 +6,7 @@ Infrastructure for the Server order pipeline.
 
 There are 3 server components:
 
-- **Server Server**: HTTP server for receiving signed order messages from takers e.g. via the UI
+- **Swift Server**: HTTP server for receiving signed order messages from takers e.g. via the UI
 - **Ws Server**: Ws server for broadcasting taker orders to market makers
 - **Confirmation Server**: Provides API for server progress tracking
 
@@ -33,11 +33,11 @@ graph TD
 
 ## Build
 
-ensure an x86_64 toolchain is configured for building `server-server`
+ensure an x86_64 toolchain is configured for building `swift-server`
 
 ```shell
 rustup install 1.83.0-x86_64-apple-darwin
-# run inside server-server directory
+# run inside swift-server directory
 rusutp override set 1.83.0-x86_64-apple-darwin
 ```
 
@@ -48,7 +48,7 @@ cargo build --release
 Run it
 
 ```shell
-./target/release/server-server --help
+./target/release/swift-server --help
 ```
 
 ## Run
