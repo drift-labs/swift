@@ -1,13 +1,13 @@
-FROM rust:1.81.0 AS builder
+FROM rust:1.84.1 AS builder
 
 RUN apt update -y && \
-  apt install -y git libssl-dev libsasl2-dev cmake
+  apt install -y git libssl-dev libsasl2-dev cmake jq
 
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN rustup component add rustfmt && rustup install 1.76.0-x86_64-unknown-linux-gnu
-RUN curl -L https://github.com/drift-labs/drift-ffi-sys/releases/download/v2.109.0/libdrift_ffi_sys.so > libdrift_ffi_sys.so && cp libdrift_ffi_sys.so /usr/local/lib
-
-RUN rustc --version && cargo --version && cmake --version
+RUN rustup component add rustfmt
+RUN SO_URL=$(curl -s https://api.github.com/repos/drift-labs/drift-ffi-sys/releases/latest | jq -r '.assets[] | select(.name=="libdrift_ffi_sys.so") | .browser_download_url') &&\
+  curl -L -o libdrift_ffi_sys.so "$SO_URL" &&\
+  cp libdrift_ffi_sys.so /usr/local/lib
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -20,9 +20,9 @@ FROM amazonlinux:2023
 RUN yum install -y openssl cyrus-sasl cyrus-sasl-devel
 
 COPY --from=builder /usr/local/lib/libdrift_ffi_sys.so /usr/lib/
-COPY --from=builder /app/target/release/fastlane-server /usr/local/bin/fastlane-server
+COPY --from=builder /app/target/release/swift-server /usr/local/bin/swift-server
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libsasl2.so.2 /usr/lib/
 
 RUN ldconfig
 
-ENTRYPOINT ["/usr/local/bin/fastlane-server"]
+ENTRYPOINT ["/usr/local/bin/swift-server"]

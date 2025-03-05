@@ -1,0 +1,27 @@
+name: Deploy on ts sdk update
+on:
+  repository_dispatch:
+    types: [sdk-update]
+
+jobs:
+  update-sdk:
+    runs-on: ubicloud
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@master
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY_PROD }}
+          aws-region: ${{ secrets.EKS_PROD_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.30.0"
+
+      - name: Configure AWS EKS Credentials
+        run: aws eks update-kubeconfig --name ${{ secrets.EKS_PROD_CLUSTER_NAME }} --region ${{ secrets.EKS_PROD_REGION }} --role-arn ${{ secrets.EKS_PROD_DEPLOY_ROLE }}
+
+      - name: Restart deployment
+        run: |
+          kubectl rollout restart -n mainnet-beta deployment/fastlane-server-app

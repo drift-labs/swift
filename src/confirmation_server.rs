@@ -51,7 +51,7 @@ pub async fn get_all_hashes(
         }
     };
 
-    let pattern = "fastlane-hashes::*";
+    let pattern = "swift-hashes::*";
     let scan_opts = ScanOptions::default().with_pattern(pattern).with_count(100);
     let keys = match conn.scan_options::<String>(scan_opts).await {
         Ok(it) => it.collect::<Vec<String>>().await,
@@ -86,7 +86,7 @@ pub async fn get_all_hashes(
         .filter_map(|(key, value)| {
             value.map(|v| {
                 let hash = key
-                    .strip_prefix("fastlane-hashes::")
+                    .strip_prefix("swift-hashes::")
                     .unwrap_or(&key)
                     .to_string();
                 (hash, v)
@@ -135,7 +135,7 @@ pub async fn get_hash_status(
         }
     };
 
-    let redis_key = format!("fastlane-hashes::{}", decoded_hash);
+    let redis_key = format!("swift-hashes::{}", decoded_hash);
     match conn.get::<_, Option<String>>(redis_key).await {
         Ok(Some(value)) => {
             println!("Value for decoded_hash {}: {}", decoded_hash, value);
@@ -199,7 +199,7 @@ pub async fn start_server() {
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     log::info!(
-        "Fastlane confirmation server on {}",
+        "Swift confirmation server on {}",
         listener.local_addr().unwrap()
     );
 
@@ -215,7 +215,7 @@ pub async fn start_server() {
 
     let listener_metrics = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
     log::info!(
-        "Fastlane confirmation metrics server on {}",
+        "Swift confirmation metrics server on {}",
         listener_metrics.local_addr().unwrap()
     );
 

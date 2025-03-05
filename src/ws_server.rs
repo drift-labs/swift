@@ -18,7 +18,7 @@ use drift_rs::{
         accounts::{PerpMarket, UserStats},
         MarketType,
     },
-    Pubkey, Wallet,
+    Pubkey, RpcClient, Wallet,
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use futures_util::{
@@ -32,7 +32,6 @@ use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     Message as KafkaMessage,
 };
-use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::bs58::{self};
 use tokio::{
     io::AsyncWriteExt,
@@ -69,7 +68,15 @@ const ENDPOINT: LazyCell<String> = LazyCell::new(|| {
     env::var("ENDPOINT").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string())
 });
 
-type Subscriptions = DashMap<String, broadcast::Sender<String>>;
+#[derive(Clone, Debug)]
+pub struct OrderNotification {
+    /// json-ified order
+    json: String,
+    /// internal order processing latency
+    recv_lag: u64,
+}
+
+type Subscriptions = DashMap<String, broadcast::Sender<OrderNotification>>;
 
 // Used for authentication
 #[derive(Clone, Debug)]
@@ -149,7 +156,7 @@ async fn determine_fast_ws(authority: &Pubkey) -> Result<bool> {
         user_stats.if_staked_gov_token_amount
     );
 
-    Ok(user_stats.if_staked_gov_token_amount > 0)
+    Ok(user_stats.if_staked_gov_token_amount >= 0)
 }
 
 /// Stateful Ws connection
@@ -157,7 +164,7 @@ async fn determine_fast_ws(authority: &Pubkey) -> Result<bool> {
 pub struct WsConnection {
     /// True if the connection has authenticated its pubkey
     authenticated: bool,
-    subscribed_topics: HashMap<String, broadcast::Receiver<String>>,
+    subscribed_topics: HashMap<String, broadcast::Receiver<OrderNotification>>,
     challenge: Option<Challenge>,
     fast_ws: Arc<AtomicBool>,
     /// write half of outbound message queue
@@ -176,10 +183,10 @@ impl WsConnection {
         let (message_tx, message_rx) = mpsc::channel::<String>(128);
         Self {
             authenticated: false,
-            fast_ws: Default::default(),
+            fast_ws: Arc::new(AtomicBool::new(true)),
             subscribed_topics: Default::default(),
             challenge: Some(Challenge {
-                // Set nonce store for authentication and the nsend message immdiately to the user
+                // Set nonce store for authentication and the send message immediately to the user
                 nonce: rand::thread_rng()
                     .sample_iter(&rand::distributions::Alphanumeric)
                     .take(30)
@@ -260,7 +267,7 @@ impl WsConnection {
                 }
 
                 let topic = format!(
-                    "fastlane_orders_{}_{}",
+                    "swift_orders_{}_{}",
                     market_type.as_str(),
                     market_index.unwrap()
                 );
@@ -308,42 +315,46 @@ impl WsConnection {
                         self.send_message(WsMessage::auth().set_message("Authenticated"))?;
                         self.authenticated = true;
                         self.challenge.take();
-
-                        // Load the connection priority from IF stake (async)
-                        tokio::spawn({
-                            let fast_ws = Arc::clone(&self.fast_ws);
-                            let pubkey = self.pubkey;
-                            async move {
-                                let is_fast_ws = determine_fast_ws(&pubkey).await;
-                                if let Err(ref err) = is_fast_ws {
-                                    log::error!(
-                                        "{}: Failed to determine if fast ws: {err:?}",
-                                        pubkey.to_string()
-                                    );
-                                    shared_state
-                                        .metrics
-                                        .ws_connections
-                                        .with_label_values(&["false"])
-                                        .inc();
-                                } else {
-                                    log::info!(
-                                        target: "ws",
-
-                                        "{}: Is fast ws: {is_fast_ws:?}",
-                                        pubkey.to_string()
-                                    );
-                                    let is_fast_ws = is_fast_ws.unwrap();
-                                    shared_state
-                                        .metrics
-                                        .ws_connections
-                                        .with_label_values(&[&is_fast_ws.to_string()])
-                                        .inc();
-                                    fast_ws.store(is_fast_ws, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        });
+                        shared_state
+                            .metrics
+                            .ws_connections
+                            .with_label_values(&[&self.is_fast().to_string()])
+                            .inc();
 
                         Ok(())
+                        // Load the connection priority from IF stake (async)
+                        // tokio::spawn({
+                        //     let fast_ws = Arc::clone(&self.fast_ws);
+                        //     let pubkey = self.pubkey;
+                        //     async move {
+                        //         let is_fast_ws = determine_fast_ws(&pubkey).await;
+                        //         if let Err(ref err) = is_fast_ws {
+                        //             log::error!(
+                        //                 "{}: Failed to determine if fast ws: {err:?}",
+                        //                 pubkey.to_string()
+                        //             );
+                        //             shared_state
+                        //                 .metrics
+                        //                 .ws_connections
+                        //                 .with_label_values(&["false"])
+                        //                 .inc();
+                        //         } else {
+                        //             log::info!(
+                        //                 target: "ws",
+
+                        //                 "{}: Is fast ws: {is_fast_ws:?}",
+                        //                 pubkey.to_string()
+                        //             );
+                        //             let is_fast_ws = is_fast_ws.unwrap();
+                        //             shared_state
+                        //                 .metrics
+                        //                 .ws_connections
+                        //                 .with_label_values(&[&is_fast_ws.to_string()])
+                        //                 .inc();
+                        //             fast_ws.store(is_fast_ws, std::sync::atomic::Ordering::Relaxed);
+                        //         }
+                        //     }
+                        // });
                     }
                     Err(e) => {
                         self.send_message(
@@ -381,19 +392,13 @@ impl WsConnection {
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         let _ = heartbeat_interval.tick().await; // skip first immediate tick
 
-        let send_delay = if self.is_fast() {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(FAST_SLOW_WS_DIFF.as_millis() as u64)
-        };
-
         // Loop that handles the message forwarding and transmission
         let res = 'handler: loop {
+            let is_fast_ws = self.is_fast();
             let has_subs = !self.subscribed_topics.is_empty();
             let mut kafka_subs =
                 FuturesUnordered::from_iter(self.subscribed_topics.iter_mut().map(|r| r.1.recv()))
                     .try_ready_chunks(8);
-
             tokio::select! {
                 biased;
                 n_read = self.message_rx.recv_many(&mut outbox, 16) => {
@@ -445,10 +450,10 @@ impl WsConnection {
                     // forward kafka messages to the outbox
                     match batch_updates {
                         Some(Ok(updates)) => {
-                            if send_delay.is_zero() {
+                            if is_fast_ws {
                                 for new_order_info in updates {
                                     // forward kafka messages to the outbox
-                                    if let Err(err) = self.message_tx.try_send(new_order_info) {
+                                    if let Err(err) = self.message_tx.try_send(new_order_info.json) {
                                         // client will miss this message
                                         // either channel is full or closed
                                         log::error!(target: "ws", "{log_prefix}: queueing send failed: {err:?}");
@@ -458,11 +463,14 @@ impl WsConnection {
                             } else {
                                 let sender = self.message_tx.clone();
                                 let log_prefix = log_prefix.clone();
+                                // remove internal routing latency from the delay
+                                let delay_ms = FAST_SLOW_WS_DIFF - Duration::from_millis(updates.first().unwrap().recv_lag);
+                                let delay_fut = tokio::time::sleep(delay_ms);
                                 tokio::spawn(async move {
-                                    let _ = tokio::time::sleep(send_delay).await;
+                                    let _ = delay_fut.await;
                                     for new_order_info in updates {
                                         // forward kafka messages to the outbox
-                                        if let Err(err) = sender.try_send(new_order_info) {
+                                        if let Err(err) = sender.try_send(new_order_info.json) {
                                             // client will miss this message
                                             // either channel is full or closed
                                             log::error!(target: "ws", "{log_prefix}: queueing send failed: {err:?}");
@@ -498,11 +506,9 @@ impl WsConnection {
                         );
                         break 'handler Ok(());
                     }
-                    if let Err(err) = self.send_message(
-                        WsMessage::heartbeat().set_message(&unix_now_ms().to_string())
-                    ) {
-                        break 'handler Err(err);
-                    }
+                    outbox.push(
+                        WsMessage::heartbeat().set_message(&unix_now_ms().to_string()).jsonify()
+                    );
                 }
             }
 
@@ -530,11 +536,13 @@ impl WsConnection {
         }
 
         // Decrement connection counter
-        shared_state
-            .metrics
-            .ws_connections
-            .with_label_values(&[&self.is_fast().to_string()])
-            .dec();
+        if self.is_authenticated() {
+            shared_state
+                .metrics
+                .ws_connections
+                .with_label_values(&[&self.is_fast().to_string()])
+                .dec();
+        }
 
         if let Err(err) = res {
             log::warn!(target: "ws", "{log_prefix}: closed unexpectedly: {err:?}");
@@ -609,7 +617,10 @@ async fn subscribe_kafka_consumer(
                 );
                 let message = WsMessage::new(topic).set_order(&order_metadata);
                 log::debug!("message jsonify(): {:?}", message);
-                match tx.send(message.jsonify()) {
+                match tx.send(OrderNotification {
+                    json: message.jsonify(),
+                    recv_lag: unix_now_ms().saturating_sub(order_metadata.ts),
+                }) {
                     Ok(_) => {
                         log::debug!(
                             target: "kafka",
@@ -708,7 +719,10 @@ async fn subscribe_redis_pubsub(
         );
         let message = WsMessage::new(topic).set_order(&order_metadata);
         log::trace!("message jsonify(): {:?}", message);
-        match tx.send(message.jsonify()) {
+        match tx.send(OrderNotification {
+            json: message.jsonify(),
+            recv_lag: unix_now_ms().saturating_sub(order_metadata.ts),
+        }) {
             Ok(_) => {
                 log::debug!(
                     target: "redis",
@@ -743,7 +757,7 @@ pub async fn start_server() {
     let mut topic_names: Vec<String> = vec![];
     for market in &perp_market_accounts {
         let topic = format!(
-            "fastlane_orders_{}_{}",
+            "swift_orders_{}_{}",
             market.market_type(),
             market.market_index
         );
@@ -789,8 +803,7 @@ pub async fn start_server() {
         // Subscribe to kafka messages on a background task
         tokio::spawn(async move {
             let _ =
-                subscribe_kafka_consumer(&kafka_consumer.unwrap(), state, "^fastlane_orders_.*")
-                    .await;
+                subscribe_kafka_consumer(&kafka_consumer.unwrap(), state, "^swift_orders_.*").await;
             log::warn!(target: "kafka", "kafka subscriber task ended");
             std::process::exit(1);
         });
@@ -841,7 +854,7 @@ pub async fn start_server() {
         let listener_metrics = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         log::info!(
             target: "ws",
-            "Fastlane metrics server on {}",
+            "Swift metrics server on {}",
             listener_metrics.local_addr().unwrap()
         );
         let res = axum::serve(listener_metrics, metrics_app).await;
@@ -854,7 +867,7 @@ pub async fn start_server() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     log::info!(
         target: "ws",
-        "Fastlane Ws server on {}",
+        "Swift Ws server on {}",
         listener.local_addr().unwrap()
     );
 
@@ -1018,7 +1031,7 @@ mod test {
         let (sender, _receiver) = broadcast::channel(1);
         let shared_state = ServerParams {
             perp_markets: vec![sol_perp_market()],
-            subscriptions: DashMap::from_iter([("fastlane_orders_perp_0".into(), sender)]),
+            subscriptions: DashMap::from_iter([("swift_orders_perp_0".into(), sender)]),
             ..Default::default()
         };
 
@@ -1194,10 +1207,7 @@ mod test {
             let (sender, _receiver) = broadcast::channel(8);
             let shared_state = Box::leak(Box::new(ServerParams {
                 perp_markets: vec![sol_perp_market()],
-                subscriptions: DashMap::from_iter([(
-                    "fastlane_orders_perp_0".into(),
-                    sender.clone(),
-                )]),
+                subscriptions: DashMap::from_iter([("swift_orders_perp_0".into(), sender.clone())]),
                 ..Default::default()
             }));
 
@@ -1211,7 +1221,12 @@ mod test {
             tokio::spawn(async move {
                 // wait to send the update after the Ws connection is alive
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                sender.send("wow much update".into()).expect("sent");
+                sender
+                    .send(OrderNotification {
+                        json: "wow much update".into(),
+                        recv_lag: 0,
+                    })
+                    .expect("sent");
             });
 
             // run Ws connection
