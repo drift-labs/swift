@@ -28,7 +28,11 @@ jobs:
         run: rustup component add rustfmt
 
       - name: Install libdrift_ffi
-        run: curl -L https://github.com/drift-labs/drift-ffi-sys/releases/download/v2.109.0/libdrift_ffi_sys.so -o libdrift_ffi_sys.so && cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
+        run: |
+          SO_URL=$(curl -s https://api.github.com/repos/drift-labs/drift-ffi-sys/releases/latest | jq -r '.assets[] | select(.name=="libdrift_ffi_sys.so") | .browser_download_url')
+          echo "downloading libdrift: $SO_URL"
+          curl -L -o libdrift_ffi_sys.so "$SO_URL"
+          cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
 
       - name: Cache cargo index
         uses: actions/cache@v4
