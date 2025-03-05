@@ -18,7 +18,7 @@ pub struct KafkaConnectionConfigs {
 
 async fn _assume_role(config: &SdkConfig, role_name: String, session_name: Option<String>) {
     let provider = aws_config::sts::AssumeRoleProvider::builder(role_name)
-        .session_name(session_name.unwrap_or("fastlane_dev_session".into()))
+        .session_name(session_name.unwrap_or("swift_dev_session".into()))
         .configure(config)
         .build()
         .await;
@@ -90,7 +90,7 @@ impl KafkaClientBuilder {
             config
                 .set("bootstrap.servers", self.brokers)
                 .set("auto.offset.reset", "latest")
-                .set("group.id", "fastlane-local")
+                .set("group.id", "swift-local")
                 .set("metadata.max.age.ms", 30_000.to_string())
                 .set("topic.metadata.refresh.interval.ms", 10_000.to_string())
         } else {

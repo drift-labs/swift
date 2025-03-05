@@ -267,7 +267,7 @@ impl WsConnection {
                 }
 
                 let topic = format!(
-                    "fastlane_orders_{}_{}",
+                    "swift_orders_{}_{}",
                     market_type.as_str(),
                     market_index.unwrap()
                 );
@@ -757,7 +757,7 @@ pub async fn start_server() {
     let mut topic_names: Vec<String> = vec![];
     for market in &perp_market_accounts {
         let topic = format!(
-            "fastlane_orders_{}_{}",
+            "swift_orders_{}_{}",
             market.market_type(),
             market.market_index
         );
@@ -803,8 +803,7 @@ pub async fn start_server() {
         // Subscribe to kafka messages on a background task
         tokio::spawn(async move {
             let _ =
-                subscribe_kafka_consumer(&kafka_consumer.unwrap(), state, "^fastlane_orders_.*")
-                    .await;
+                subscribe_kafka_consumer(&kafka_consumer.unwrap(), state, "^swift_orders_.*").await;
             log::warn!(target: "kafka", "kafka subscriber task ended");
             std::process::exit(1);
         });
@@ -855,7 +854,7 @@ pub async fn start_server() {
         let listener_metrics = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
         log::info!(
             target: "ws",
-            "Fastlane metrics server on {}",
+            "Swift metrics server on {}",
             listener_metrics.local_addr().unwrap()
         );
         let res = axum::serve(listener_metrics, metrics_app).await;
@@ -868,7 +867,7 @@ pub async fn start_server() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     log::info!(
         target: "ws",
-        "Fastlane Ws server on {}",
+        "Swift Ws server on {}",
         listener.local_addr().unwrap()
     );
 
@@ -1032,7 +1031,7 @@ mod test {
         let (sender, _receiver) = broadcast::channel(1);
         let shared_state = ServerParams {
             perp_markets: vec![sol_perp_market()],
-            subscriptions: DashMap::from_iter([("fastlane_orders_perp_0".into(), sender)]),
+            subscriptions: DashMap::from_iter([("swift_orders_perp_0".into(), sender)]),
             ..Default::default()
         };
 
@@ -1208,10 +1207,7 @@ mod test {
             let (sender, _receiver) = broadcast::channel(8);
             let shared_state = Box::leak(Box::new(ServerParams {
                 perp_markets: vec![sol_perp_market()],
-                subscriptions: DashMap::from_iter([(
-                    "fastlane_orders_perp_0".into(),
-                    sender.clone(),
-                )]),
+                subscriptions: DashMap::from_iter([("swift_orders_perp_0".into(), sender.clone())]),
                 ..Default::default()
             }));
 
