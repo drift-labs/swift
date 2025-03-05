@@ -31,7 +31,7 @@ jobs:
         run: curl -L https://github.com/drift-labs/drift-ffi-sys/releases/download/v2.109.0/libdrift_ffi_sys.so -o libdrift_ffi_sys.so && cp libdrift_ffi_sys.so $CARGO_DRIFT_FFI_PATH
 
       - name: Cache cargo index
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
