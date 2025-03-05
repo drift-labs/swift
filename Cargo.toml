@@ -25,21 +25,21 @@ deadpool-redis = { version = "0.18", features = ["serde"] }
 clap = { version = "4.0", features = ["derive"] }
 dashmap = "6.1.0"
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs.git" , tag = "v1.0.0-alpha.11" }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs.git" , rev = "0389008" }
 ed25519-dalek = "1.0.1"
-env_logger = "0.11.5"
+env_logger = "0.11"
 faster-hex = "0.10.0"
 futures-util = "0.3.30"
 log = "0.4.22"
 nanoid = "0.4.0"
 prometheus = "0.13"
-rand = "0.8.5"
+rand = "0.8"
 rdkafka = { version = "0.36.2", features = ["ssl", "sasl"] }
 redis = { version = "0.27", features = ["tokio-comp", "tokio-native-tls-comp", "tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.127"
-solana-client = "2.0.14"
-solana-sdk = "2.0.14"
+solana-rpc-client-api = "2"
+solana-sdk = "2"
 tokio = { version = "1.0", features = ["full"] }
 # fork with Ws compression enabled
 tokio-tungstenite = { git = "https://github.com/drift-labs/tokio-tungstenite", features = ["native-tls"] }

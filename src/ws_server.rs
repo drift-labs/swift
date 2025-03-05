@@ -18,7 +18,7 @@ use drift_rs::{
         accounts::{PerpMarket, UserStats},
         MarketType,
     },
-    Pubkey, Wallet,
+    Pubkey, RpcClient, Wallet,
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use futures_util::{
@@ -32,7 +32,6 @@ use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     Message as KafkaMessage,
 };
-use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::bs58::{self};
 use tokio::{
     io::AsyncWriteExt,

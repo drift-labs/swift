@@ -19,7 +19,7 @@ use drift_rs::{
         errors::ErrorCode, Context, MarketType, OrderParams, OrderType, SdkError,
         SignedMsgOrderParamsMessage, VersionedTransaction,
     },
-    DriftClient, TransactionBuilder, Wallet,
+    DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
 use log::warn;
 use prometheus::Registry;
@@ -28,10 +28,9 @@ use rdkafka::{
     util::Timeout,
 };
 use redis::AsyncCommands;
-use solana_client::{
-    client_error::{self, ClientError},
-    nonblocking::rpc_client::RpcClient,
-    rpc_config::RpcSimulateTransactionConfig,
+use solana_rpc_client_api::{
+    client_error::{self, Error as ClientError},
+    config::RpcSimulateTransactionConfig,
 };
 use solana_sdk::{
     pubkey::Pubkey,
@@ -490,7 +489,7 @@ async fn simulate_taker_order_rpc(
         );
         let err = SdkError::Rpc(ClientError {
             request: None,
-            kind: client_error::ClientErrorKind::TransactionError(simulate_err.to_owned()),
+            kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
         });
         match err.to_anchor_error_code() {
             Some(code) => {
