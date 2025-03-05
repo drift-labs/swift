@@ -2002,47 +2002,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastlane-server"
-version = "0.1.0"
-dependencies = [
- "anchor-lang",
- "anyhow",
- "arrayvec",
- "aws-config",
- "aws-sdk-kafka",
- "aws-sdk-sts",
- "axum",
- "axum-macros",
- "axum-prometheus",
- "base64 0.22.1",
- "clap",
- "dashmap",
- "deadpool-redis",
- "dotenv",
- "drift-rs",
- "ed25519-dalek",
- "env_logger",
- "faster-hex",
- "futures-util",
- "log",
- "nanoid",
- "prometheus",
- "rand 0.8.5",
- "rdkafka",
- "redis",
- "serde",
- "serde_json",
- "solana-rpc-client-api",
- "solana-sdk",
- "strum_macros",
- "tokio",
- "tokio-tungstenite 0.24.0 (git+https://github.com/drift-labs/tokio-tungstenite)",
- "tower-http 0.6.2",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5120,6 +5079,47 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "swift-server"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anyhow",
+ "arrayvec",
+ "aws-config",
+ "aws-sdk-kafka",
+ "aws-sdk-sts",
+ "axum",
+ "axum-macros",
+ "axum-prometheus",
+ "base64 0.22.1",
+ "clap",
+ "dashmap",
+ "deadpool-redis",
+ "dotenv",
+ "drift-rs",
+ "ed25519-dalek",
+ "env_logger",
+ "faster-hex",
+ "futures-util",
+ "log",
+ "nanoid",
+ "prometheus",
+ "rand 0.8.5",
+ "rdkafka",
+ "redis",
+ "serde",
+ "serde_json",
+ "solana-rpc-client-api",
+ "solana-sdk",
+ "strum_macros",
+ "tokio",
+ "tokio-tungstenite 0.24.0 (git+https://github.com/drift-labs/tokio-tungstenite)",
+ "tower-http 0.6.2",
+ "urlencoding",
+ "uuid",
+]
 
 [[package]]
 name = "syn"
