@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install OS dependencies
-        run: apt-get update && apt-get install -y git libssl-dev libsasl2-dev cmake
+        run: apt-get update && apt-get install -y git libssl-dev libsasl2-dev cmake jq
 
       - name: Install rustfmt and toolchain
         run: rustup component add rustfmt
