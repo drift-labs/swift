@@ -1,16 +1,16 @@
-# Fastlane Server
-Infrastructure for the Fastlane order pipeline.
+# Swift Server
+Infrastructure for the Swift order pipeline (formerly Fastlane).
 
 ### Architecture
 There are 3 server components:
-- **Fastlane Server**: HTTP server for receiving signed order messages from takers e.g. via the UI
+- **Swift Server**: HTTP server for receiving signed order messages from takers e.g. via the UI
 - **Ws Server**: Ws server for broadcasting taker orders to market makers
-- **Confirmation Server**: Provides API for fastlane progress tracking
+- **Confirmation Server**: Provides API for Swift progress tracking
 
 ```mermaid
 graph TD
     A[Taker]
-    B[Fastlane Server]
+    B[Swift Server]
     C[WebSocket Server]
     D[Market Makers]
     E[Kafka]
@@ -29,10 +29,10 @@ graph TD
 ```
 
 ## Build
-ensure an x86_64 toolchain is configured for building `fastlane-server`
+ensure an x86_64 toolchain is configured for building `swift-server`
 ```shell
 rustup install 1.83.0-x86_64-apple-darwin
-# run inside fastlane-server directory
+# run inside swift-server directory
 rusutp override set 1.83.0-x86_64-apple-darwin
 ```
 
@@ -42,9 +42,9 @@ cargo build --release
 
 Run it
 ```shell
-./target/release/fastlane-server --help
+./target/release/swift-server --help
 ```
 
 ## Run
-The fastlane stack uses kafka for sending messages between the `fastlane_server` and the `ws_server`.  
+The swift stack uses kafka for sending messages between the `swift_server` and the `ws_server`.  
 `docker-compose up` to run a local kafka instance.  

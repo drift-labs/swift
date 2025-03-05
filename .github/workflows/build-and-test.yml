@@ -61,8 +61,8 @@ jobs:
       - name: Add test entries to Redis
         if: matrix.task == 'test'
         run: |
-          redis-cli set "fastlane-hashes::test_hash_1" "test_value_1"
-          redis-cli set "fastlane-hashes::test_hash_2" "test_value_2"
+          redis-cli set "swift-hashes::test_hash_1" "test_value_1"
+          redis-cli set "swift-hashes::test_hash_2" "test_value_2"
 
       - name: Run tests
         if: matrix.task == 'test'

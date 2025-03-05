@@ -24,4 +24,4 @@ jobs:
 
       - name: Restart deployment
         run: |
-          kubectl rollout restart -n mainnet-beta deployment/fastlane-server-app
+          kubectl rollout restart -n mainnet-beta deployment/swift-server-app

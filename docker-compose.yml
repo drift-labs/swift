@@ -20,20 +20,20 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
   
-  fastlane:
+  swift:
     build: .
     depends_on:
     - kafka
     ports:
       - "3000:3000"
-    command: ["--server", "fastlane"]
+    command: ["--server", "swift"]
     platform: "linux/amd64"
     environment:
       RUST_LOG: "kafka=debug,ws=debug"
       RUNNING_LOCAL: true
       ENDPOINT: "https://api.devnet.solana.com"
   
-  fastlane-ws:
+  swift-ws:
     build: .
     depends_on:
     - kafka

@@ -31,7 +31,7 @@ pub async fn metrics_handler(
 }
 
 #[derive(Clone)]
-pub struct FastlaneServerMetrics {
+pub struct SwiftServerMetrics {
     pub taker_orders_counter: Counter,
     pub order_type_counter: CounterVec,
     pub kafka_forward_fail_counter: Counter,
@@ -40,7 +40,7 @@ pub struct FastlaneServerMetrics {
     pub response_time_histogram: Histogram,
 }
 
-impl FastlaneServerMetrics {
+impl SwiftServerMetrics {
     pub fn new() -> Self {
         let taker_orders_counter =
             Counter::new("fl_taker_orders_count", "Number of taker orders received").unwrap();
@@ -72,7 +72,7 @@ impl FastlaneServerMetrics {
         )
         .unwrap();
 
-        FastlaneServerMetrics {
+        SwiftServerMetrics {
             taker_orders_counter,
             order_type_counter,
             kafka_forward_fail_counter,

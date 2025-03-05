@@ -45,7 +45,7 @@ use crate::{
         messages::{IncomingSignedMessage, OrderMetadataAndMessage},
         types::unix_now_ms,
     },
-    util::metrics::{metrics_handler, FastlaneServerMetrics, MetricsServerParams},
+    util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
 };
 
 /// RPC tx simulation timeout
@@ -58,7 +58,7 @@ pub struct ServerParams {
     pub kafka_producer: Option<FutureProducer>,
     pub host: String,
     pub port: String,
-    pub metrics: FastlaneServerMetrics,
+    pub metrics: SwiftServerMetrics,
     pub redis_pool: Option<Pool>,
 }
 
@@ -154,7 +154,7 @@ pub async fn process_order(
     let market_index = taker_message.signed_msg_order_params.market_index;
     let market_type = taker_message.signed_msg_order_params.market_type;
 
-    let topic = format!("fastlane_orders_{}_{market_index}", market_type.as_str());
+    let topic = format!("swift_orders_{}_{market_index}", market_type.as_str());
     log::trace!(target: "server", "{log_prefix}: Topic: {topic}");
 
     if let Some(kafka_producer) = &server_params.kafka_producer {
@@ -302,7 +302,7 @@ pub async fn start_server() {
 
     // Registry for metrics
     let registry = Registry::new();
-    let metrics = FastlaneServerMetrics::new();
+    let metrics = SwiftServerMetrics::new();
     metrics.register(&registry);
 
     let context = match drift_env.as_str() {
@@ -342,7 +342,7 @@ pub async fn start_server() {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    log::info!("Fastlane server on {}", listener.local_addr().unwrap());
+    log::info!("Swift server on {}", listener.local_addr().unwrap());
 
     // Metrics
     let registry = Arc::new(registry);
@@ -359,7 +359,7 @@ pub async fn start_server() {
 
     let listener_metrics = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
     log::info!(
-        "Fastlane metrics server on {}",
+        "Swift metrics server on {}",
         listener_metrics.local_addr().unwrap()
     );
 

@@ -33,7 +33,7 @@ jobs:
         uses: docker/build-push-action@v6
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: fastlane
+          ECR_REPOSITORY: swift
           IMAGE_TAG: ${{ github.sha }}
           BRANCH_NAME: ${{ github.ref_name }}
         with:
@@ -66,6 +66,6 @@ jobs:
         env:
           BRANCH_NAME: ${{ github.ref_name }}
         run: |
-          kubectl rollout restart -n $BRANCH_NAME deployment/fastlane-server-app
-          kubectl rollout restart -n $BRANCH_NAME deployment/fastlane-confirmation-server-app
-          kubectl rollout restart -n $BRANCH_NAME statefulset/fastlane-ws-server-app
+          kubectl rollout restart -n $BRANCH_NAME deployment/swift-server-app
+          kubectl rollout restart -n $BRANCH_NAME deployment/swift-confirmation-server-app
+          kubectl rollout restart -n $BRANCH_NAME statefulset/swift-ws-server-app
