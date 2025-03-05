@@ -20,7 +20,7 @@ FROM amazonlinux:2023
 RUN yum install -y openssl cyrus-sasl cyrus-sasl-devel
 
 COPY --from=builder /usr/local/lib/libdrift_ffi_sys.so /usr/lib/
-COPY --from=builder /app/target/release/server-server /usr/local/bin/server-server
+COPY --from=builder /app/target/release/swift-server /usr/local/bin/swift-server
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libsasl2.so.2 /usr/lib/
 
 RUN ldconfig
