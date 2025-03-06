@@ -139,6 +139,8 @@ pub struct WsSubscribeMessage {
 
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct WsAuthMessage {
+    #[serde(deserialize_with = "base58_to_array", default = "default_deserialize")]
+    pub stake_pubkey: [u8; 32],
     #[serde(deserialize_with = "base58_to_array")]
     pub pubkey: [u8; 32],
     #[serde(deserialize_with = "base64_to_array")]
