@@ -39,8 +39,8 @@ export async function runWsListener() {
 
   const landedOrdersStream = new grpcSignedMsgUserOrdersAccountSubscriber({
     grpcConfigs: {
-      endpoint: '',
-      token: '',
+      endpoint: process.env.GRPC_ENDPOINT!,
+      token: process.env.GRPC_TOKEN!,
     },
     driftClient,
     commitment: 'finalized',
@@ -50,7 +50,7 @@ export async function runWsListener() {
   });
   await landedOrdersStream.subscribe();
 
-  // log that it is not expired
+  // log that the swift order didn't expire
   landedOrdersStream.eventEmitter.on('newSignedMsgOrderIds', (newIds, authority) => {
     for(const id of newIds) {
       console.log(`placed uuid:${id}`);
