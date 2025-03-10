@@ -68,6 +68,9 @@ const ENDPOINT: LazyCell<String> = LazyCell::new(|| {
     env::var("ENDPOINT").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string())
 });
 
+const FAST_CHECK: LazyCell<bool> =
+    LazyCell::new(|| env::var("FAST_CHECK").unwrap_or("true".to_string()) == "true");
+
 #[derive(Clone, Debug)]
 pub struct OrderNotification {
     /// json-ified order
@@ -355,11 +358,15 @@ impl WsConnection {
                             let fast_ws = Arc::clone(&self.fast_ws);
                             let pubkey = self.pubkey;
                             async move {
-                                let is_fast_ws = determine_fast_ws(
-                                    &pubkey,
-                                    &Pubkey::new_from_array(stake_pubkey),
-                                )
-                                .await;
+                                let is_fast_ws = if *FAST_CHECK {
+                                    determine_fast_ws(
+                                        &pubkey,
+                                        &Pubkey::new_from_array(stake_pubkey),
+                                    )
+                                    .await
+                                } else {
+                                    Ok(true)
+                                };
                                 if let Err(ref err) = is_fast_ws {
                                     log::error!(
                                         "{}: Failed to determine if fast ws: {err:?}",
