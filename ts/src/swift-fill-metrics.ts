@@ -52,7 +52,7 @@ export async function runWsListener() {
 
   // log that the swift order didn't expire
   landedOrdersStream.eventEmitter.on('newSignedMsgOrderIds', (newIds, authority) => {
-    for(const id of newIds) {
+    for (const id of newIds) {
       console.log(`placed uuid:${id}`);
     }
   });

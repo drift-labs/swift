@@ -11,4 +11,6 @@ COPY ts/src/ ./src/
 RUN npm run build
 
 RUN echo '#!/bin/bash\nnode /app/dist/cli.js "$@"' > /usr/local/bin/kafka-cli && chmod +x /usr/local/bin/kafka-cli
+RUN echo '#!/bin/bash\nnode /app/dist/swift-fill-metrics.js "$@"' > /usr/local/bin/swift-fill-metrics && chmod +x /usr/local/bin/swift-fill-metrics
+
 ENTRYPOINT ["/bin/bash"]
