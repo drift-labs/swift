@@ -5,6 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use anchor_lang::AccountDeserialize;
 use axum::{
     extract::State,
     http::Method,
@@ -16,7 +17,7 @@ use dotenv::dotenv;
 use drift_rs::{
     event_subscriber::PubsubClient,
     types::{
-        errors::ErrorCode, Context, MarketType, OrderParams, OrderType, SdkError,
+        accounts::User, errors::ErrorCode, Context, MarketType, OrderParams, OrderType, SdkError,
         SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
     },
     DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -50,6 +51,7 @@ use crate::{
     },
     util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
 };
+use base64::prelude::*;
 
 /// RPC tx simulation timeout
 const SIMULATION_TIMEOUT: Duration = Duration::from_millis(300);
@@ -63,6 +65,7 @@ pub struct ServerParams {
     pub port: String,
     pub metrics: SwiftServerMetrics,
     pub redis_pool: Option<Pool>,
+    pub usermap_redis_pool: Pool,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -124,7 +127,15 @@ pub async fn process_order(
             format!("invalid order: {err:?}"),
         );
     }
-    match simulate_taker_order_rpc(&server_params.drift, &taker_pubkey, &taker_message).await {
+    match simulate_taker_order_rpc(
+        &server_params.drift,
+        &taker_pubkey,
+        &taker_message,
+        &server_params.usermap_redis_pool,
+        server_params.slot_subscriber.current_slot(),
+    )
+    .await
+    {
         Ok(sim_res) => {
             server_params
                 .metrics
@@ -345,6 +356,25 @@ pub async fn start_server() {
         None
     };
 
+    let usermap_redis_pool = {
+        let elasticache_host =
+            env::var("USERMAP_ELASTICACHE_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let elasticache_port =
+            env::var("USERMAP_ELASTICACHE_PORT").unwrap_or_else(|_| "6379".to_string());
+        let connection_string = if env::var("USERMAP_USE_SSL")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase()
+            == "true"
+        {
+            format!("rediss://{}:{}", elasticache_host, elasticache_port)
+        } else {
+            format!("redis://{}:{}", elasticache_host, elasticache_port)
+        };
+        let cfg = Config::from_url(connection_string);
+        cfg.create_pool(Some(Runtime::Tokio1))
+            .expect("Failed to create Redis pool")
+    };
+
     // Slot subscriber
     let mut ws_clients = vec![];
     for (_k, ws_endpoint) in std::env::vars().filter(|(k, _v)| k.starts_with("WS_ENDPOINT")) {
@@ -388,6 +418,7 @@ pub async fn start_server() {
         port: env::var("PORT").unwrap_or("3000".to_string()),
         metrics,
         redis_pool,
+        usermap_redis_pool,
     }));
 
     // App
@@ -535,28 +566,47 @@ async fn simulate_taker_order_rpc(
     drift: &DriftClient,
     taker_pubkey: &Pubkey,
     taker_message: &SignedMsgOrderParamsMessage,
+    redis_pool: &Pool,
+    slot: u64,
 ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
     let taker_subaccount_pubkey =
         Wallet::derive_user_account(taker_pubkey, taker_message.sub_account_id);
 
     let t0 = SystemTime::now();
-    let user_with_timeout = tokio::time::timeout(
+
+    let user_with_timeout_redis = tokio::time::timeout(
         SIMULATION_TIMEOUT,
-        drift.get_user_account(&taker_subaccount_pubkey),
+        fetch_user_from_redis(&taker_subaccount_pubkey, redis_pool, slot),
     )
     .await;
-    if user_with_timeout.is_err() {
-        warn!("simulateTransaction degraded (timeout)");
-        return Ok(SimulationStatus::Timeout);
-    }
-    let user = user_with_timeout.unwrap();
-    if let Err(err) = user.as_ref() {
-        return Err((
-            axum::http::StatusCode::NOT_FOUND,
-            format!("unable to fetch user: {err:?}"),
-        ));
-    }
-    let user = user.unwrap();
+
+    let user = match user_with_timeout_redis {
+        Ok(Ok(Some(user))) => user, // Successfully retrieved user from Redis
+        _ => {
+            log::warn!("fetching user with redis failed");
+            let user_with_timeout = tokio::time::timeout(
+                SIMULATION_TIMEOUT,
+                drift.get_user_account(&taker_subaccount_pubkey),
+            )
+            .await;
+
+            if user_with_timeout.is_err() {
+                warn!("simulateTransaction degraded (timeout)");
+                return Ok(SimulationStatus::Timeout);
+            }
+
+            let user_result = user_with_timeout.unwrap();
+            match user_result {
+                Ok(user) => user,
+                Err(err) => {
+                    return Err((
+                        axum::http::StatusCode::NOT_FOUND,
+                        format!("unable to fetch user: {err:?}"),
+                    ))
+                }
+            }
+        }
+    };
 
     let message = TransactionBuilder::new(
         drift.program_data(),
@@ -628,4 +678,61 @@ async fn simulate_taker_order_rpc(
     log::info!("simulate tx: {:?}", SystemTime::now().duration_since(t0));
 
     Ok(SimulationStatus::Success)
+}
+
+async fn fetch_user_from_redis(
+    taker_pubkey: &Pubkey,
+    redis_pool: &Pool,
+    slot: u64,
+) -> Result<Option<User>, ()> {
+    let mut conn = match redis_pool.get().await {
+        Ok(conn) => conn,
+        Err(_) => {
+            return Err(());
+        }
+    };
+
+    let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string()) == "true";
+    let redis_key = if running_local {
+        format!("{}", taker_pubkey.to_string())
+    } else {
+        format!("usermap-server::{}", taker_pubkey.to_string())
+    };
+    let redis_key_clone = redis_key.clone();
+    match conn.get::<_, Option<String>>(redis_key).await {
+        Ok(Some(value)) => {
+            let value_vec: Vec<&str> = value.split("::").collect();
+            let redis_slot = value_vec[0].parse::<u64>().unwrap();
+            if slot.checked_sub(redis_slot).unwrap_or(0) > (90 as f64 * 2.5) as u64 {
+                log::warn!("User found in redis is too old");
+                return Ok(None);
+            }
+            let user = User::try_deserialize(
+                &mut &base64::engine::general_purpose::STANDARD
+                    .decode(value_vec[1])
+                    .unwrap()[..],
+            );
+            match user {
+                Ok(user) => {
+                    log::info!("User found in redis");
+                    return Ok(Some(user));
+                }
+                Err(_) => {
+                    log::warn!("Failed to deserialize user from redis");
+                    return Err(());
+                }
+            }
+        }
+        Ok(None) => {
+            log::warn!(
+                "No value found in usermap server for key: {}",
+                redis_key_clone
+            );
+            Ok(None)
+        }
+        Err(e) => {
+            log::error!("Error: {:?}", e);
+            return Err(());
+        }
+    }
 }
