@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     env,
     net::SocketAddr,
+    str::FromStr,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
@@ -32,7 +33,6 @@ use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     Message as KafkaMessage,
 };
-use solana_sdk::bs58::{self};
 use tokio::{
     io::AsyncWriteExt,
     sync::{
@@ -999,22 +999,16 @@ pub async fn start_server() {
 }
 
 // extract pubkey string from HTTP request
-fn decode_pubkey(request: &str) -> Result<Pubkey, ()> {
+fn decode_pubkey(request: &str) -> Result<Pubkey, &'static str> {
     if let Some(idx) = request.find('=') {
-        let idx = idx + 1;
-        let mut pubkey = [0_u8; 32];
-        if bs58::decode(&request[idx..idx + 44])
-            .with_alphabet(bs58::Alphabet::DEFAULT)
-            .onto(&mut pubkey)
-            .is_err()
-        {
-            return Err(());
-        }
-
-        return Ok(Pubkey::new_from_array(pubkey));
+        let pubkey_str = &request[idx + 1..];
+        let pubkey_token = pubkey_str
+            .split_whitespace()
+            .next()
+            .ok_or("No pubkey found")?;
+        return Pubkey::from_str(pubkey_token).map_err(|_| "Invalid pubkey format");
     }
-
-    Err(())
+    Err("No '=' found in request")
 }
 
 #[cfg(test)]
