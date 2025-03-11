@@ -17,7 +17,7 @@ use drift_rs::{
     event_subscriber::PubsubClient,
     types::{
         errors::ErrorCode, Context, MarketType, OrderParams, OrderType, SdkError,
-        SignedMsgOrderParamsMessage, VersionedTransaction,
+        SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
     },
     DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
@@ -33,8 +33,11 @@ use solana_rpc_client_api::{
     config::RpcSimulateTransactionConfig,
 };
 use solana_sdk::{
+    hash::Hash,
+    message::v0::Message,
     pubkey::Pubkey,
     signature::{Keypair, Signature},
+    signer::Signer,
 };
 use tower_http::cors::{Any, CorsLayer};
 
@@ -363,10 +366,53 @@ pub async fn start_server() {
         listener_metrics.local_addr().unwrap()
     );
 
-    let _ = tokio::try_join!(
-        axum::serve(listener, app),
-        axum::serve(listener_metrics, metrics_app)
-    );
+    // RPC sim loop to avoid rpc cold starts when orders are infrequent
+    // Build tx once and just resign with new blockhash
+    let rpc_sim_loop = tokio::spawn(async {
+        let sender = Keypair::new();
+        let receiver = Keypair::new();
+        let instruction = solana_sdk::system_instruction::transfer(
+            &sender.pubkey(),
+            &receiver.pubkey(),
+            1_000_000_000u64,
+        );
+
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            interval.tick().await;
+            let message = Message::try_compile(
+                &sender.pubkey(),
+                &[instruction.clone()],
+                &[],
+                Hash::default(),
+            )
+            .unwrap();
+            let versioned_message = VersionedMessage::V0(message);
+            let result = state
+                .drift
+                .rpc()
+                .simulate_transaction_with_config(
+                    &VersionedTransaction {
+                        message: versioned_message,
+                        // must provide a signature for the RPC call to work
+                        signatures: vec![Signature::new_unique()],
+                    },
+                    RpcSimulateTransactionConfig {
+                        sig_verify: false,
+                        replace_recent_blockhash: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            println!("{:?}", result.unwrap().value)
+        }
+    });
+
+    let axum_server = tokio::spawn(async { axum::serve(listener, app).await });
+    let metrics_server = tokio::spawn(async { axum::serve(listener_metrics, metrics_app).await });
+
+    let _ = tokio::try_join!(rpc_sim_loop, axum_server, metrics_server);
 }
 
 /// Simple validation from program's `handle_signed_order_ix`
