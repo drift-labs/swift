@@ -389,7 +389,7 @@ pub async fn start_server() {
             )
             .unwrap();
             let versioned_message = VersionedMessage::V0(message);
-            let result = state
+            let _ = state
                 .drift
                 .rpc()
                 .simulate_transaction_with_config(
@@ -405,7 +405,6 @@ pub async fn start_server() {
                     },
                 )
                 .await;
-            println!("{:?}", result.unwrap().value)
         }
     });
 
