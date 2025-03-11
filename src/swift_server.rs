@@ -423,7 +423,6 @@ async fn simulate_taker_order_rpc(
         Wallet::derive_user_account(taker_pubkey, taker_message.sub_account_id);
 
     let t0 = SystemTime::now();
-    // TODO: pull from RPC
     let user_with_timeout = tokio::time::timeout(
         SIMULATION_TIMEOUT,
         drift.get_user_account(&taker_subaccount_pubkey),
@@ -470,33 +469,6 @@ async fn simulate_taker_order_rpc(
             format!("invalid order: {:?}", err.to_anchor_error_code(),),
         ));
     }
-    // let simulate_result_value = simulate_result.unwrap().value;
-    // if let Some(simulate_err) = &simulate_result_value.err {
-    //     log::info!(
-    //         "simulate tx failed: {simulate_err:?}, {:?}",
-    //         &simulate_result_value
-    //             .logs
-    //             .unwrap_or_else(|| vec!["no logs".into()])
-    //     );
-    //     let err = SdkError::Rpc(ClientError {
-    //         request: None,
-    //         kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
-    //     });
-    //     match err.to_anchor_error_code() {
-    //         Some(code) => {
-    //             return Err((
-    //                 axum::http::StatusCode::BAD_REQUEST,
-    //                 format!("invalid order. error code: {code:?}"),
-    //             ));
-    //         }
-    //         None => {
-    //             return Err((
-    //                 axum::http::StatusCode::BAD_REQUEST,
-    //                 format!("invalid order: {err:?}"),
-    //             ));
-    //         }
-    //     }
-    // }
     log::info!("simulate tx: {:?}", SystemTime::now().duration_since(t1));
 
     Ok(SimulationStatus::Success)

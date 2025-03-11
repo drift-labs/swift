@@ -156,7 +156,7 @@ async fn determine_fast_ws(authority: &Pubkey) -> Result<bool> {
         user_stats.if_staked_gov_token_amount
     );
 
-    Ok(user_stats.if_staked_gov_token_amount > 0)
+    Ok(user_stats.if_staked_gov_token_amount >= 0)
 }
 
 /// Stateful Ws connection
