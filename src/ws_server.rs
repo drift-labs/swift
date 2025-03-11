@@ -599,7 +599,7 @@ async fn subscribe_kafka_consumer(
     topics_prefix: &str,
 ) {
     kafka_consumer
-        .subscribe(&[topics_prefix])
+        .subscribe(&[topics_prefix, &"heartbeat"])
         .context("Failed to subscribe to topics")
         .expect("subscribed topic prefix");
 
@@ -626,9 +626,11 @@ async fn subscribe_kafka_consumer(
                     .expect("topic channel exists");
 
                 if (tx.receiver_count() as u32) < 1 {
-                    // TODO: consumer got the message but it won't be forwarded since no one's listening??
-                    // do we want to have something where it replays recent message on connect?
-                    log::error!(target: "kafka", "No receiver found for topic: {topic}, order message lost!");
+                    if topic != "heartbeat" {
+                        log::warn!(target: "kafka", "No receiver found for topic: {topic}, order message lost!");
+                    } else {
+                        log::debug!(target: "kafka", "Received heartbeat message");
+                    }
                     continue;
                 }
                 let payload: &[u8] = message.payload().context("Failed to get payload").unwrap();
@@ -728,9 +730,11 @@ async fn subscribe_redis_pubsub(
             .expect("topic channel exists");
 
         if (tx.receiver_count() as u32) < 1 {
-            // TODO: consumer got the message but it won't be forwarded since no one's listening??
-            // do we want to have something where it replays recent message on connect?
-            log::error!(target: "ws", "No receiver found for topic: {topic}, order message lost!");
+            if topic != "heartbeat" {
+                log::warn!(target: "ws", "No receiver found for topic: {topic}, order message lost!");
+            } else {
+                log::debug!(target: "ws", "Received heartbeat message");
+            }
             continue;
         }
         let payload: &[u8] = message.get_payload_bytes();
@@ -793,8 +797,12 @@ pub async fn start_server() {
 
     // Set up the server with the server params
     let subscriptions = DashMap::new();
-    let mut topic_names: Vec<String> = vec![];
+    let mut topic_names: Vec<String> = vec!["heartbeat".to_string()];
     for market in &perp_market_accounts {
+        if market.symbol().contains("BET") {
+            log::info!("Skipping BET market");
+            continue;
+        }
         let topic = format!(
             "swift_orders_{}_{}",
             market.market_type(),
@@ -1299,7 +1307,7 @@ mod test {
         let mut ws_conn = WsConnection::new(Pubkey::new_unique());
         ws_conn.authenticated = true;
 
-        ws_conn
+        let _ = ws_conn
             .spawn_handler(&mut client_rx, &mut client_tx, Box::leak(Box::default()))
             .await;
 
@@ -1330,7 +1338,7 @@ mod test {
         let mut client_rx = vec![];
         let mut client_tx = stream::iter([Ok(Message::Close(None))]);
         let ws_conn = WsConnection::new(Pubkey::new_unique());
-        ws_conn
+        let _ = ws_conn
             .spawn_handler(&mut client_rx, &mut client_tx, Box::leak(Box::default()))
             .await;
     }
@@ -1344,7 +1352,7 @@ mod test {
         let _ = ws_conn.send_message(WsMessage::heartbeat());
         let _ = ws_conn.send_message(WsMessage::heartbeat());
         let _ = ws_conn.send_message(WsMessage::heartbeat());
-        ws_conn
+        let _ = ws_conn
             .spawn_handler(&mut client_rx, &mut client_tx, Box::leak(Box::default()))
             .await;
         assert!(client_rx.len() >= 3);
