@@ -3,7 +3,7 @@ import { Keypair } from '@solana/web3.js';
 import { decodeUTF8 } from 'tweetnacl-util';
 import WebSocket from 'ws';
 import nacl from 'tweetnacl';
-import { loadKeypair, DriftClient, decodeName, grpcSignedMsgUserOrdersAccountSubscriber, decodeUser, SignedMsgUserOrdersAccount } from '@drift-labs/sdk';
+import { loadKeypair, DriftClient, decodeName, grpcSignedMsgUserOrdersAccountSubscriber, SignedMsgUserOrdersAccount } from '@drift-labs/sdk';
 import dotenv from 'dotenv';
 import { Connection } from '@solana/web3.js';
 import { Wallet } from '@coral-xyz/anchor';
@@ -36,6 +36,9 @@ export async function runWsListener() {
       decodeName(perpMarketAccount.name)
     );
   }
+
+  console.log(process.env.GRPC_ENDPOINT);
+  console.log(process.env.GRPC_TOKEN);
 
   const landedOrdersStream = new grpcSignedMsgUserOrdersAccountSubscriber({
     grpcConfigs: {

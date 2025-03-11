@@ -487,10 +487,10 @@
   dependencies:
     "@jridgewell/trace-mapping" "0.3.9"
 
-"@drift-labs/sdk@^2.113.0-beta.5":
-  version "2.113.0-beta.5"
-  resolved "https://registry.yarnpkg.com/@drift-labs/sdk/-/sdk-2.113.0-beta.5.tgz#6a9882f58a5dbf719016b8020aac0481856dc8ec"
-  integrity sha512-Cg6Ib89GJ5zBFnS3xXlY0f0ZMfQ754BF7Utll1kx4xpvW6mK3Nt+XuwoUjTifQyT52vhr8WdrL5/NvokjvwTTg==
+"@drift-labs/sdk@^2.114.0-beta.0":
+  version "2.114.0-beta.5"
+  resolved "https://registry.yarnpkg.com/@drift-labs/sdk/-/sdk-2.114.0-beta.5.tgz#8d37965f5ff970fd9fd6e370375a92167908eae3"
+  integrity sha512-m0CLYCL8nH0Ff3kG6ostX1zx7908+4++vyG86r4SrjvaReuEENA14k/i71W60txlv3g8OWWFtXa04TqroxYy4w==
   dependencies:
     "@coral-xyz/anchor" "0.29.0"
     "@coral-xyz/anchor-30" "npm:@coral-xyz/anchor@0.30.1"
@@ -2749,6 +2749,18 @@ require-directory@^2.1.1:
   version "2.1.1"
   resolved "https://registry.yarnpkg.com/require-directory/-/require-directory-2.1.1.tgz#8c64ad5fd30dab1c976e2344ffe7f792a6a6df42"
   integrity sha512-fGxEI7+wsG9xrvdjsrlmL22OMTTiHRwAMroiEeMgq8gzoLC/PQr7RsRDSTLUg/bZAZtF+TVIkHc6/4RIKrui+Q==
+
+rpc-websockets@7.11.0:
+  version "7.11.0"
+  resolved "https://registry.yarnpkg.com/rpc-websockets/-/rpc-websockets-7.11.0.tgz#05451975963a7d1a4cf36d54e200bfc4402a56d7"
+  integrity sha512-IkLYjayPv6Io8C/TdCL5gwgzd1hFz2vmBZrjMw/SPEXo51ETOhnzgS4Qy5GWi2JQN7HKHa66J3+2mv0fgNh/7w==
+  dependencies:
+    eventemitter3 "^4.0.7"
+    uuid "^8.3.2"
+    ws "^8.5.0"
+  optionalDependencies:
+    bufferutil "^4.0.1"
+    utf-8-validate "^5.0.2"
 
 rpc-websockets@7.5.1:
   version "7.5.1"
