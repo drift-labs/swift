@@ -45,7 +45,7 @@ export async function runWsListener() {
     driftClient,
     commitment: 'finalized',
     decodeFn(name, data) {
-      return driftClient.program.coder.types.decode('SignedMsgUserOrdersAccount', data) as SignedMsgUserOrdersAccount
+      return driftClient.program.coder.types.decode('SignedMsgUserOrders', data) as SignedMsgUserOrdersAccount
     },
   });
   await landedOrdersStream.subscribe();
