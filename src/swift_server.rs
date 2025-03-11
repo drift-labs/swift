@@ -250,11 +250,6 @@ pub async fn send_heartbeat(server_params: &mut ServerParams) -> () {
                     .order_type_counter
                     .with_label_values(&["_", "heartbeat"])
                     .inc();
-
-                server_params
-                    .metrics
-                    .response_time_histogram
-                    .observe((unix_now_ms() - hearbeat_time) as f64);
             }
             Err((e, _)) => {
                 log::error!(
@@ -284,11 +279,6 @@ pub async fn send_heartbeat(server_params: &mut ServerParams) -> () {
                     .order_type_counter
                     .with_label_values(&["_", "heartbeat"])
                     .inc();
-
-                server_params
-                    .metrics
-                    .response_time_histogram
-                    .observe((unix_now_ms() - hearbeat_time) as f64);
             }
             Err(e) => {
                 log::error!(
