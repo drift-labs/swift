@@ -21,9 +21,9 @@ export async function runWsListener() {
     connection: new Connection(endpoint),
     wallet: new Wallet(keypair),
   });
+  await driftClient.subscribe();
   console.log(`connected: endpoint: ${endpoint}, wsBaseUrl: ${wsBaseUrl}, network: ${network}`);
 
-  await driftClient.subscribe();
   const marketLookup = new Map();
   const perpMarkets = driftClient.getPerpMarketAccounts();
   for (const perpMarketAccount of perpMarkets) {
@@ -68,9 +68,11 @@ export async function runWsListener() {
       if (message['order']) {
         const order = message['order'];
         const uuid = order['uuid'];
+        const taker = order['taker_authority'];
+        const orderSignature = order['order_signature'];
         const marketName = marketLookup.get(order['market_index'])!;
         const { oraclePrice, bid, ask } = await getOracleAndBbo(marketName);
-        console.log(`oracle:${oraclePrice},dlobAsk:${ask},dlobBid:${bid},uuid:${uuid},latency:${now - order['ts']}`);
+        console.log(`oracle:${oraclePrice},dlobAsk:${ask},dlobBid:${bid},uuid:${uuid},taker:${taker},orderSig:${orderSignature},latency:${now - order['ts']}`);
         return;
       }
 
