@@ -69,7 +69,7 @@ const ENDPOINT: LazyCell<String> = LazyCell::new(|| {
 });
 
 const FAST_CHECK: LazyCell<bool> =
-    LazyCell::new(|| env::var("FAST_CHECK").unwrap_or("true".to_string()) == "true");
+    LazyCell::new(|| env::var("FAST_CHECK").unwrap_or("false".to_string()) == "true");
 
 #[derive(Clone, Debug)]
 pub struct OrderNotification {
