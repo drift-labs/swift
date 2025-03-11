@@ -231,6 +231,75 @@ pub async fn process_order(
     }
 }
 
+pub async fn send_heartbeat(server_params: &mut ServerParams) -> () {
+    let hearbeat_time = unix_now_ms();
+    let log_prefix = format!("[hearbeat: {hearbeat_time}]");
+
+    if let Some(kafka_producer) = &server_params.kafka_producer {
+        match kafka_producer
+            .send(
+                FutureRecord::<String, String>::to(&"hearbeat").payload(&"love you".to_string()),
+                Timeout::After(Duration::ZERO),
+            )
+            .await
+        {
+            Ok(_) => {
+                log::trace!(target: "kafka", "{log_prefix}: Sent heartbeat");
+                server_params
+                    .metrics
+                    .order_type_counter
+                    .with_label_values(&["_", "heartbeat"])
+                    .inc();
+
+                server_params
+                    .metrics
+                    .response_time_histogram
+                    .observe((unix_now_ms() - hearbeat_time) as f64);
+            }
+            Err((e, _)) => {
+                log::error!(
+                    target: "kafka",
+                    "{log_prefix}: Failed to deliver heartbeat, error: {e:?}"
+                );
+                server_params.metrics.kafka_forward_fail_counter.inc();
+            }
+        }
+    } else {
+        let mut conn = match server_params.redis_pool.as_ref().unwrap().get().await {
+            Ok(conn) => conn,
+            Err(_) => {
+                log::error!(target: "redis", "{log_prefix}: Obtaining redis connection failed");
+                return;
+            }
+        };
+
+        match conn
+            .publish::<String, String, i64>("heartbeat".to_string(), "love you".to_string())
+            .await
+        {
+            Ok(_) => {
+                log::trace!(target: "redis", "{log_prefix}: Sent redis heartbeat");
+                server_params
+                    .metrics
+                    .order_type_counter
+                    .with_label_values(&["_", "heartbeat"])
+                    .inc();
+
+                server_params
+                    .metrics
+                    .response_time_histogram
+                    .observe((unix_now_ms() - hearbeat_time) as f64);
+            }
+            Err(e) => {
+                log::error!(
+                    target: "redis",
+                    "{log_prefix}: Failed to deliver heartbeat, error: {e:?}"
+                );
+            }
+        }
+    }
+}
+
 pub async fn health_check() -> impl axum::response::IntoResponse {
     axum::http::StatusCode::OK
 }
@@ -408,10 +477,25 @@ pub async fn start_server() {
         }
     });
 
+    let mut state_clone = state.clone();
+    let send_heartbeat_loop = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+
+        loop {
+            interval.tick().await;
+            send_heartbeat(&mut state_clone).await;
+        }
+    });
+
     let axum_server = tokio::spawn(async { axum::serve(listener, app).await });
     let metrics_server = tokio::spawn(async { axum::serve(listener_metrics, metrics_app).await });
 
-    let _ = tokio::try_join!(rpc_sim_loop, axum_server, metrics_server);
+    let _ = tokio::try_join!(
+        rpc_sim_loop,
+        axum_server,
+        metrics_server,
+        send_heartbeat_loop
+    );
 }
 
 /// Simple validation from program's `handle_signed_order_ix`
