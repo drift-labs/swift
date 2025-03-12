@@ -1,4 +1,5 @@
 use std::{
+    cell::LazyCell,
     env,
     net::SocketAddr,
     sync::Arc,
@@ -53,6 +54,9 @@ use crate::{
 
 /// RPC tx simulation timeout
 const SIMULATION_TIMEOUT: Duration = Duration::from_millis(300);
+/// Disable RPC simulation
+const DISABLE_RPC_SIM: LazyCell<bool> =
+    LazyCell::new(|| std::env::var("DISABLE_RPC_SIM").unwrap_or("false".to_string()) == "true");
 
 #[derive(Clone)]
 pub struct ServerParams {
@@ -231,14 +235,14 @@ pub async fn process_order(
     }
 }
 
-pub async fn send_heartbeat(server_params: &mut ServerParams) -> () {
+pub async fn send_heartbeat(server_params: &'static ServerParams) {
     let hearbeat_time = unix_now_ms();
     let log_prefix = format!("[hearbeat: {hearbeat_time}]");
 
     if let Some(kafka_producer) = &server_params.kafka_producer {
         match kafka_producer
             .send(
-                FutureRecord::<String, String>::to(&"hearbeat").payload(&"love you".to_string()),
+                FutureRecord::<String, String>::to("hearbeat").payload(&"love you".to_string()),
                 Timeout::After(Duration::ZERO),
             )
             .await
@@ -380,7 +384,7 @@ pub async fn start_server() {
     .await
     .expect("initialized client");
 
-    let state = Box::leak(Box::new(ServerParams {
+    let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::clone(&slot_subscriber),
         kafka_producer,
@@ -467,13 +471,11 @@ pub async fn start_server() {
         }
     });
 
-    let mut state_clone = state.clone();
     let send_heartbeat_loop = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
-
         loop {
             interval.tick().await;
-            send_heartbeat(&mut state_clone).await;
+            send_heartbeat(state).await;
         }
     });
 
@@ -518,6 +520,7 @@ enum SimulationStatus {
     Success,
     Degraded,
     Timeout,
+    Disabled,
 }
 
 impl SimulationStatus {
@@ -526,6 +529,7 @@ impl SimulationStatus {
             Self::Success => "success",
             Self::Degraded => "degraded",
             Self::Timeout => "timeout",
+            Self::Disabled => "disabled",
         }
     }
 }
@@ -536,6 +540,10 @@ async fn simulate_taker_order_rpc(
     taker_pubkey: &Pubkey,
     taker_message: &SignedMsgOrderParamsMessage,
 ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
+    if *DISABLE_RPC_SIM {
+        return Ok(SimulationStatus::Disabled);
+    }
+
     let taker_subaccount_pubkey =
         Wallet::derive_user_account(taker_pubkey, taker_message.sub_account_id);
 
