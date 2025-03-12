@@ -45,7 +45,7 @@ use crate::{
     connection::kafka_connect::KafkaClientBuilder,
     super_slot_subscriber::SuperSlotSubscriber,
     types::{
-        messages::{IncomingSignedMessage, OrderMetadataAndMessage},
+        messages::{IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse},
         types::unix_now_ms,
     },
     util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
@@ -96,7 +96,13 @@ pub async fn process_order(
         Ok(taker_message_and_prefix) => taker_message_and_prefix,
         Err(e) => {
             log::error!("{log_prefix}: Error verifying signed message: {e:?}",);
-            return (axum::http::StatusCode::BAD_REQUEST, format!("Error: {e:?}"));
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ProcessOrderResponse {
+                    message: "Error verifying signed message".to_string(),
+                    error: Some(e.to_string()),
+                }),
+            );
         }
     };
     let taker_message = taker_message_and_prefix.message;
@@ -111,9 +117,13 @@ pub async fn process_order(
             taker_message.slot,
             server_params.slot_subscriber.current_slot(),
         );
+        let err_str = "Order slot too old";
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            "order slot too old".to_string(),
+            Json(ProcessOrderResponse {
+                message: err_str.to_string(),
+                error: Some(err_str.to_string()),
+            }),
         );
     }
 
@@ -121,7 +131,10 @@ pub async fn process_order(
     if let Err(err) = validate_signed_order_params(&taker_message.signed_msg_order_params) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("invalid order: {err:?}"),
+            Json(ProcessOrderResponse {
+                message: "invalid order".to_string(),
+                error: Some(err.to_string()),
+            }),
         );
     }
     match simulate_taker_order_rpc(&server_params.drift, &taker_pubkey, &taker_message).await {
@@ -132,16 +145,23 @@ pub async fn process_order(
                 .with_label_values(&[sim_res.as_str()])
                 .inc();
         }
-        Err(sim_err) => {
+        Err((status, sim_err_str)) => {
             server_params
                 .metrics
                 .rpc_simulation_status
                 .with_label_values(&["invalid"])
                 .inc();
-            return sim_err;
+            return (
+                status,
+                Json(ProcessOrderResponse {
+                    message: "invalid order".to_string(),
+                    error: Some(sim_err_str),
+                }),
+            );
         }
     }
 
+    // TODO: try new devnet rpc
     let slot = server_params.slot_subscriber.current_slot();
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
@@ -181,7 +201,13 @@ pub async fn process_order(
                     .metrics
                     .response_time_histogram
                     .observe((unix_now_ms() - process_order_time) as f64);
-                (axum::http::StatusCode::OK, "Order processed".to_string())
+                (
+                    axum::http::StatusCode::OK,
+                    Json(ProcessOrderResponse {
+                        message: "Order processed".to_string(),
+                        error: None,
+                    }),
+                )
             }
             Err((e, _)) => {
                 log::error!(
@@ -191,17 +217,23 @@ pub async fn process_order(
                 server_params.metrics.kafka_forward_fail_counter.inc();
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to deliver message: {e}"),
+                    Json(ProcessOrderResponse {
+                        message: "Failed to deliver message".to_string(),
+                        error: Some(format!("kafka publish error: {e:?}")),
+                    }),
                 )
             }
         }
     } else {
         let mut conn = match server_params.redis_pool.as_ref().unwrap().get().await {
             Ok(conn) => conn,
-            Err(_) => {
+            Err(e) => {
                 return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Redis connection failed".to_string(),
+                    Json(ProcessOrderResponse {
+                        message: "Internal connection error".to_string(),
+                        error: Some(format!("redis connection error: {e:?}")),
+                    }),
                 )
             }
         };
@@ -221,11 +253,20 @@ pub async fn process_order(
                     .response_time_histogram
                     .observe((unix_now_ms() - process_order_time) as f64);
 
-                (axum::http::StatusCode::OK, "Order processed".to_string())
+                (
+                    axum::http::StatusCode::OK,
+                    Json(ProcessOrderResponse {
+                        message: "Order processed".to_string(),
+                        error: None,
+                    }),
+                )
             }
             Err(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to deliver message: {e}"),
+                Json(ProcessOrderResponse {
+                    message: "Failed to deliver message".to_string(),
+                    error: Some(format!("redis publish error: {e:?}")),
+                }),
             ),
         }
     }

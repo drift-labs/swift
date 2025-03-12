@@ -121,6 +121,13 @@ impl OrderMetadataAndMessage {
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct ProcessOrderResponse {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum SubscribeActions {
