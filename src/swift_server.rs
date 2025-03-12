@@ -235,7 +235,7 @@ pub async fn process_order(
     }
 }
 
-pub async fn send_heartbeat(server_params: &mut ServerParams) {
+pub async fn send_heartbeat(server_params: &'static ServerParams) {
     let hearbeat_time = unix_now_ms();
     let log_prefix = format!("[hearbeat: {hearbeat_time}]");
 
@@ -384,7 +384,7 @@ pub async fn start_server() {
     .await
     .expect("initialized client");
 
-    let state = Box::leak(Box::new(ServerParams {
+    let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::clone(&slot_subscriber),
         kafka_producer,
@@ -471,13 +471,11 @@ pub async fn start_server() {
         }
     });
 
-    let mut state_clone = state.clone();
     let send_heartbeat_loop = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
-
         loop {
             interval.tick().await;
-            send_heartbeat(&mut state_clone).await;
+            send_heartbeat(state).await;
         }
     });
 
