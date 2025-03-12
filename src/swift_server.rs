@@ -1,4 +1,5 @@
 use std::{
+    cell::LazyCell,
     env,
     net::SocketAddr,
     sync::Arc,
@@ -53,6 +54,9 @@ use crate::{
 
 /// RPC tx simulation timeout
 const SIMULATION_TIMEOUT: Duration = Duration::from_millis(300);
+/// Disable RPC simulation
+const DISABLE_RPC_SIM: LazyCell<bool> =
+    LazyCell::new(|| std::env::var("DISABLE_RPC_SIM").unwrap_or("false".to_string()) == "true");
 
 #[derive(Clone)]
 pub struct ServerParams {
@@ -231,14 +235,14 @@ pub async fn process_order(
     }
 }
 
-pub async fn send_heartbeat(server_params: &mut ServerParams) -> () {
+pub async fn send_heartbeat(server_params: &mut ServerParams) {
     let hearbeat_time = unix_now_ms();
     let log_prefix = format!("[hearbeat: {hearbeat_time}]");
 
     if let Some(kafka_producer) = &server_params.kafka_producer {
         match kafka_producer
             .send(
-                FutureRecord::<String, String>::to(&"hearbeat").payload(&"love you".to_string()),
+                FutureRecord::<String, String>::to("hearbeat").payload(&"love you".to_string()),
                 Timeout::After(Duration::ZERO),
             )
             .await
@@ -518,6 +522,7 @@ enum SimulationStatus {
     Success,
     Degraded,
     Timeout,
+    Disabled,
 }
 
 impl SimulationStatus {
@@ -526,6 +531,7 @@ impl SimulationStatus {
             Self::Success => "success",
             Self::Degraded => "degraded",
             Self::Timeout => "timeout",
+            Self::Disabled => "disabled",
         }
     }
 }
@@ -536,6 +542,10 @@ async fn simulate_taker_order_rpc(
     taker_pubkey: &Pubkey,
     taker_message: &SignedMsgOrderParamsMessage,
 ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
+    if *DISABLE_RPC_SIM {
+        return Ok(SimulationStatus::Disabled);
+    }
+
     let taker_subaccount_pubkey =
         Wallet::derive_user_account(taker_pubkey, taker_message.sub_account_id);
 

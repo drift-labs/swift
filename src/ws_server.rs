@@ -172,7 +172,7 @@ async fn determine_fast_ws(ws_delegate: &Pubkey, stake_pubkey: &Pubkey) -> Resul
         SignedMsgWsDelegates::try_deserialize(&mut response[0].as_ref().unwrap().data.as_slice())
             .context("Could not deserialize ws delegates")?;
 
-    if !ws_delegates_for_stake.delegates.contains(&ws_delegate) {
+    if !ws_delegates_for_stake.delegates.contains(ws_delegate) {
         log::debug!(
             target: "ws",
             "Delegate {ws_delegate:?} not found in stake {stake_pubkey:?}"
@@ -599,7 +599,7 @@ async fn subscribe_kafka_consumer(
     topics_prefix: &str,
 ) {
     kafka_consumer
-        .subscribe(&[topics_prefix, &"heartbeat"])
+        .subscribe(&[topics_prefix, "heartbeat"])
         .context("Failed to subscribe to topics")
         .expect("subscribed topic prefix");
 
@@ -1025,6 +1025,12 @@ mod test {
             name: sol_perp_name,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn decode_pubkey_works() {
+        assert!(decode_pubkey("blahblah=").is_err());
+        assert!(decode_pubkey("=DxoRJ4f5XRMvXU9SGuM4ZziBFUxbhB3ubur5sVZEvue2").is_ok());
     }
 
     #[tokio::test]
