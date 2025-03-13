@@ -6,7 +6,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anchor_lang::AccountDeserialize;
 use axum::{
     extract::State,
     http::Method,
@@ -18,7 +17,7 @@ use dotenv::dotenv;
 use drift_rs::{
     event_subscriber::PubsubClient,
     types::{
-        accounts::User, errors::ErrorCode, Context, MarketType, OrderParams, OrderType, SdkError,
+        errors::ErrorCode, Context, MarketType, OrderParams, OrderType, SdkError,
         SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
     },
     DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -54,7 +53,6 @@ use crate::{
     user_account_fetcher::{UserAccountFetcher, UserAccountFetcherImpl, UserMapFetcher},
     util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
 };
-use base64::prelude::*;
 
 /// RPC tx simulation timeout
 const SIMULATION_TIMEOUT: Duration = Duration::from_millis(300);
