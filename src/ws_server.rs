@@ -3,6 +3,7 @@ use std::{
     collections::HashMap,
     env,
     net::SocketAddr,
+    str::FromStr,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
@@ -15,7 +16,7 @@ use dotenv::dotenv;
 use drift_rs::{
     constants::MarketExt,
     types::{
-        accounts::{PerpMarket, UserStats},
+        accounts::{PerpMarket, SignedMsgWsDelegates, UserStats},
         MarketType,
     },
     Pubkey, RpcClient, Wallet,
@@ -32,7 +33,6 @@ use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     Message as KafkaMessage,
 };
-use solana_sdk::bs58::{self};
 use tokio::{
     io::AsyncWriteExt,
     sync::{
@@ -67,6 +67,9 @@ const FAST_SLOW_WS_DIFF: Duration = Duration::from_secs(1);
 const ENDPOINT: LazyCell<String> = LazyCell::new(|| {
     env::var("ENDPOINT").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string())
 });
+
+const FAST_CHECK: LazyCell<bool> =
+    LazyCell::new(|| env::var("FAST_CHECK").unwrap_or("false".to_string()) == "true");
 
 #[derive(Clone, Debug)]
 pub struct OrderNotification {
@@ -138,25 +141,56 @@ fn find_market_index_from_symbol(
     }
 }
 
-async fn determine_fast_ws(authority: &Pubkey) -> Result<bool> {
-    let rpc = RpcClient::new(ENDPOINT.to_string());
-    let user_stats_pubkey = Wallet::derive_stats_account(authority);
-    let response = rpc
-        .get_account_data(&user_stats_pubkey)
-        .await
-        .context("Failed to get user stats account data")?;
+pub fn derive_ws_auth_delegates_pubkey(authority: &Pubkey) -> Pubkey {
+    let (account_drift_pda, _seed) = Pubkey::find_program_address(
+        &[&b"SIGNED_MSG_WS"[..], authority.as_ref()],
+        &drift_rs::constants::PROGRAM_ID,
+    );
+    account_drift_pda
+}
 
-    let user_stats = UserStats::try_deserialize(&mut response.as_slice())
+async fn determine_fast_ws(ws_delegate: &Pubkey, stake_pubkey: &Pubkey) -> Result<bool> {
+    let rpc = RpcClient::new(ENDPOINT.to_string());
+    if stake_pubkey.to_bytes() == [0u8; 32] {
+        return Ok(false);
+    }
+
+    let ws_auth_delegates_pubkey = derive_ws_auth_delegates_pubkey(stake_pubkey);
+    let user_stats_pubkey = Wallet::derive_stats_account(stake_pubkey);
+
+    let response = rpc
+        .get_multiple_accounts(&[ws_auth_delegates_pubkey, user_stats_pubkey])
+        .await
+        .context("Failed to get stake and ws delegate account data")?;
+
+    if response[0].is_none() || response[1].is_none() {
+        log::debug!("Failed to get stake and ws delegate account data for {stake_pubkey:?}");
+        return Ok(false);
+    }
+
+    let ws_delegates_for_stake =
+        SignedMsgWsDelegates::try_deserialize(&mut response[0].as_ref().unwrap().data.as_slice())
+            .context("Could not deserialize ws delegates")?;
+
+    if !ws_delegates_for_stake.delegates.contains(ws_delegate) {
+        log::debug!(
+            target: "ws",
+            "Delegate {ws_delegate:?} not found in stake {stake_pubkey:?}"
+        );
+        return Ok(false);
+    }
+
+    let user_stats = UserStats::try_deserialize(&mut response[1].as_ref().unwrap().data.as_slice())
         .context("Could not deserialize user stats")?;
 
     log::debug!(
         target: "ws",
         "Gov stake for {}: {}",
-        authority.to_string(),
+        stake_pubkey.to_string(),
         user_stats.if_staked_gov_token_amount
     );
 
-    Ok(user_stats.if_staked_gov_token_amount >= 0)
+    Ok(user_stats.if_staked_gov_token_amount > 0)
 }
 
 /// Stateful Ws connection
@@ -304,7 +338,11 @@ impl WsConnection {
                     }
                 }
             }
-            WsClientMessage::Auth(WsAuthMessage { pubkey, signature }) => {
+            WsClientMessage::Auth(WsAuthMessage {
+                pubkey,
+                signature,
+                stake_pubkey,
+            }) => {
                 if self.is_authenticated() {
                     return Ok(());
                 }
@@ -315,46 +353,47 @@ impl WsConnection {
                         self.send_message(WsMessage::auth().set_message("Authenticated"))?;
                         self.authenticated = true;
                         self.challenge.take();
-                        shared_state
-                            .metrics
-                            .ws_connections
-                            .with_label_values(&[&self.is_fast().to_string()])
-                            .inc();
-
-                        Ok(())
                         // Load the connection priority from IF stake (async)
-                        // tokio::spawn({
-                        //     let fast_ws = Arc::clone(&self.fast_ws);
-                        //     let pubkey = self.pubkey;
-                        //     async move {
-                        //         let is_fast_ws = determine_fast_ws(&pubkey).await;
-                        //         if let Err(ref err) = is_fast_ws {
-                        //             log::error!(
-                        //                 "{}: Failed to determine if fast ws: {err:?}",
-                        //                 pubkey.to_string()
-                        //             );
-                        //             shared_state
-                        //                 .metrics
-                        //                 .ws_connections
-                        //                 .with_label_values(&["false"])
-                        //                 .inc();
-                        //         } else {
-                        //             log::info!(
-                        //                 target: "ws",
-
-                        //                 "{}: Is fast ws: {is_fast_ws:?}",
-                        //                 pubkey.to_string()
-                        //             );
-                        //             let is_fast_ws = is_fast_ws.unwrap();
-                        //             shared_state
-                        //                 .metrics
-                        //                 .ws_connections
-                        //                 .with_label_values(&[&is_fast_ws.to_string()])
-                        //                 .inc();
-                        //             fast_ws.store(is_fast_ws, std::sync::atomic::Ordering::Relaxed);
-                        //         }
-                        //     }
-                        // });
+                        tokio::spawn({
+                            let fast_ws = Arc::clone(&self.fast_ws);
+                            let pubkey = self.pubkey;
+                            async move {
+                                let is_fast_ws = if *FAST_CHECK {
+                                    determine_fast_ws(
+                                        &pubkey,
+                                        &Pubkey::new_from_array(stake_pubkey),
+                                    )
+                                    .await
+                                } else {
+                                    Ok(true)
+                                };
+                                if let Err(ref err) = is_fast_ws {
+                                    log::error!(
+                                        "{}: Failed to determine if fast ws: {err:?}",
+                                        pubkey.to_string()
+                                    );
+                                    shared_state
+                                        .metrics
+                                        .ws_connections
+                                        .with_label_values(&["false"])
+                                        .inc();
+                                } else {
+                                    log::info!(
+                                        target: "ws",
+                                        "{}: Is fast ws: {is_fast_ws:?}",
+                                        pubkey.to_string()
+                                    );
+                                    let is_fast_ws = is_fast_ws.unwrap();
+                                    shared_state
+                                        .metrics
+                                        .ws_connections
+                                        .with_label_values(&[&is_fast_ws.to_string()])
+                                        .inc();
+                                    fast_ws.store(is_fast_ws, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        });
+                        Ok(())
                     }
                     Err(e) => {
                         self.send_message(
@@ -560,7 +599,7 @@ async fn subscribe_kafka_consumer(
     topics_prefix: &str,
 ) {
     kafka_consumer
-        .subscribe(&[topics_prefix])
+        .subscribe(&[topics_prefix, "heartbeat"])
         .context("Failed to subscribe to topics")
         .expect("subscribed topic prefix");
 
@@ -587,9 +626,11 @@ async fn subscribe_kafka_consumer(
                     .expect("topic channel exists");
 
                 if (tx.receiver_count() as u32) < 1 {
-                    // TODO: consumer got the message but it won't be forwarded since no one's listening??
-                    // do we want to have something where it replays recent message on connect?
-                    log::error!(target: "kafka", "No receiver found for topic: {topic}, order message lost!");
+                    if topic != "heartbeat" {
+                        log::warn!(target: "kafka", "No receiver found for topic: {topic}, order message lost!");
+                    } else {
+                        log::debug!(target: "kafka", "Received heartbeat message");
+                    }
                     continue;
                 }
                 let payload: &[u8] = message.payload().context("Failed to get payload").unwrap();
@@ -689,9 +730,11 @@ async fn subscribe_redis_pubsub(
             .expect("topic channel exists");
 
         if (tx.receiver_count() as u32) < 1 {
-            // TODO: consumer got the message but it won't be forwarded since no one's listening??
-            // do we want to have something where it replays recent message on connect?
-            log::error!(target: "ws", "No receiver found for topic: {topic}, order message lost!");
+            if topic != "heartbeat" {
+                log::warn!(target: "ws", "No receiver found for topic: {topic}, order message lost!");
+            } else {
+                log::debug!(target: "ws", "Received heartbeat message");
+            }
             continue;
         }
         let payload: &[u8] = message.get_payload_bytes();
@@ -754,8 +797,12 @@ pub async fn start_server() {
 
     // Set up the server with the server params
     let subscriptions = DashMap::new();
-    let mut topic_names: Vec<String> = vec![];
+    let mut topic_names: Vec<String> = vec!["heartbeat".to_string()];
     for market in &perp_market_accounts {
+        if market.symbol().contains("BET") {
+            log::info!("Skipping BET market");
+            continue;
+        }
         let topic = format!(
             "swift_orders_{}_{}",
             market.market_type(),
@@ -952,22 +999,16 @@ pub async fn start_server() {
 }
 
 // extract pubkey string from HTTP request
-fn decode_pubkey(request: &str) -> Result<Pubkey, ()> {
+fn decode_pubkey(request: &str) -> Result<Pubkey, &'static str> {
     if let Some(idx) = request.find('=') {
-        let idx = idx + 1;
-        let mut pubkey = [0_u8; 32];
-        if bs58::decode(&request[idx..idx + 44])
-            .with_alphabet(bs58::Alphabet::DEFAULT)
-            .onto(&mut pubkey)
-            .is_err()
-        {
-            return Err(());
-        }
-
-        return Ok(Pubkey::new_from_array(pubkey));
+        let pubkey_str = &request[idx + 1..];
+        let pubkey_token = pubkey_str
+            .split_whitespace()
+            .next()
+            .ok_or("No pubkey found")?;
+        return Pubkey::from_str(pubkey_token).map_err(|_| "Invalid pubkey format");
     }
-
-    Err(())
+    Err("No '=' found in request")
 }
 
 #[cfg(test)]
@@ -986,6 +1027,12 @@ mod test {
         }
     }
 
+    #[test]
+    fn decode_pubkey_works() {
+        assert!(decode_pubkey("blahblah=").is_err());
+        assert!(decode_pubkey("=DxoRJ4f5XRMvXU9SGuM4ZziBFUxbhB3ubur5sVZEvue2").is_ok());
+    }
+
     #[tokio::test]
     async fn auth_challenge_ok() {
         let wallet = Wallet::new(Keypair::new().into());
@@ -998,6 +1045,7 @@ mod test {
         let res = ws_conn.handle_client_message(
             WsClientMessage::Auth(WsAuthMessage {
                 pubkey: wallet.authority().to_bytes(),
+                stake_pubkey: Pubkey::new_unique().to_bytes(),
                 signature: signature.as_ref().try_into().unwrap(),
             }),
             Box::leak(Box::default()),
@@ -1010,11 +1058,13 @@ mod test {
     #[tokio::test]
     async fn auth_challenge_fail() {
         let pubkey = Pubkey::new_unique();
+        let stake_pubkey = Pubkey::new_unique();
         let mut ws_conn = WsConnection::new(pubkey);
         let res = ws_conn.handle_client_message(
             WsClientMessage::Auth(WsAuthMessage {
                 pubkey: pubkey.to_bytes(),
                 signature: [1u8; 64],
+                stake_pubkey: stake_pubkey.to_bytes(),
             }),
             Box::leak(Box::default()),
         );
@@ -1257,7 +1307,7 @@ mod test {
         let mut ws_conn = WsConnection::new(Pubkey::new_unique());
         ws_conn.authenticated = true;
 
-        ws_conn
+        let _ = ws_conn
             .spawn_handler(&mut client_rx, &mut client_tx, Box::leak(Box::default()))
             .await;
 
@@ -1288,7 +1338,7 @@ mod test {
         let mut client_rx = vec![];
         let mut client_tx = stream::iter([Ok(Message::Close(None))]);
         let ws_conn = WsConnection::new(Pubkey::new_unique());
-        ws_conn
+        let _ = ws_conn
             .spawn_handler(&mut client_rx, &mut client_tx, Box::leak(Box::default()))
             .await;
     }
@@ -1302,7 +1352,7 @@ mod test {
         let _ = ws_conn.send_message(WsMessage::heartbeat());
         let _ = ws_conn.send_message(WsMessage::heartbeat());
         let _ = ws_conn.send_message(WsMessage::heartbeat());
-        ws_conn
+        let _ = ws_conn
             .spawn_handler(&mut client_rx, &mut client_tx, Box::leak(Box::default()))
             .await;
         assert!(client_rx.len() >= 3);

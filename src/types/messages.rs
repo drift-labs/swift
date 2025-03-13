@@ -10,7 +10,7 @@ use base64::Engine;
 use drift_rs::types::{MarketType, SignedMsgOrderParamsMessage};
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use solana_sdk::{hash::Hash, pubkey::Pubkey};
+use solana_sdk::pubkey::Pubkey;
 
 #[derive(AnchorDeserialize, AnchorSerialize, Debug, Clone, InitSpace, Copy, Default, PartialEq)]
 pub struct SignedOrderParamsMessageWithPrefix {
@@ -139,6 +139,8 @@ pub struct WsSubscribeMessage {
 
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct WsAuthMessage {
+    #[serde(deserialize_with = "base58_to_array", default = "default_deserialize")]
+    pub stake_pubkey: [u8; 32],
     #[serde(deserialize_with = "base58_to_array")]
     pub pubkey: [u8; 32],
     #[serde(deserialize_with = "base64_to_array")]
@@ -239,10 +241,6 @@ pub struct BorshBuf<const N: usize> {
 }
 
 impl<const N: usize> BorshBuf<N> {
-    /// Get the SHA256 digest of the buffer
-    pub fn sha256_digest(&self) -> Hash {
-        solana_sdk::hash::hash(self.data())
-    }
     /// Deserialize the buffer as `T`
     pub fn deserialize<T: anchor_lang::AnchorDeserialize>(&self) -> Result<T, std::io::Error> {
         T::deserialize(&mut self.data())
@@ -288,7 +286,9 @@ where
 }
 
 /// Deserialize base64 str as fixed size byte array with Borsh helpers
-pub fn base64_to_borsh_buf<'de, D, const N: usize>(deserializer: D) -> Result<BorshBuf<N>, D::Error>
+pub fn _base64_to_borsh_buf<'de, D, const N: usize>(
+    deserializer: D,
+) -> Result<BorshBuf<N>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

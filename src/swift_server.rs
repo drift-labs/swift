@@ -1,4 +1,5 @@
 use std::{
+    cell::LazyCell,
     env,
     net::SocketAddr,
     sync::Arc,
@@ -18,7 +19,7 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     types::{
         errors::ErrorCode, Context, MarketId, MarketType, OrderParams, OrderType,
-        SignedMsgOrderParamsMessage,
+        SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
     },
     DriftClient, RpcClient, Wallet,
 };
@@ -29,7 +30,14 @@ use rdkafka::{
     util::Timeout,
 };
 use redis::AsyncCommands;
-use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
+use solana_sdk::{
+    hash::Hash,
+    message::v0::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature},
+    signer::Signer,
+};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::{
@@ -44,6 +52,9 @@ use crate::{
 
 /// RPC tx simulation timeout
 const SIMULATION_TIMEOUT: Duration = Duration::from_millis(300);
+/// Disable RPC simulation
+const DISABLE_RPC_SIM: LazyCell<bool> =
+    LazyCell::new(|| std::env::var("DISABLE_RPC_SIM").unwrap_or("false".to_string()) == "true");
 
 #[derive(Clone)]
 pub struct ServerParams {
@@ -222,6 +233,65 @@ pub async fn process_order(
     }
 }
 
+pub async fn send_heartbeat(server_params: &'static ServerParams) {
+    let hearbeat_time = unix_now_ms();
+    let log_prefix = format!("[hearbeat: {hearbeat_time}]");
+
+    if let Some(kafka_producer) = &server_params.kafka_producer {
+        match kafka_producer
+            .send(
+                FutureRecord::<String, String>::to("hearbeat").payload(&"love you".to_string()),
+                Timeout::After(Duration::ZERO),
+            )
+            .await
+        {
+            Ok(_) => {
+                log::trace!(target: "kafka", "{log_prefix}: Sent heartbeat");
+                server_params
+                    .metrics
+                    .order_type_counter
+                    .with_label_values(&["_", "heartbeat"])
+                    .inc();
+            }
+            Err((e, _)) => {
+                log::error!(
+                    target: "kafka",
+                    "{log_prefix}: Failed to deliver heartbeat, error: {e:?}"
+                );
+                server_params.metrics.kafka_forward_fail_counter.inc();
+            }
+        }
+    } else {
+        let mut conn = match server_params.redis_pool.as_ref().unwrap().get().await {
+            Ok(conn) => conn,
+            Err(_) => {
+                log::error!(target: "redis", "{log_prefix}: Obtaining redis connection failed");
+                return;
+            }
+        };
+
+        match conn
+            .publish::<String, String, i64>("heartbeat".to_string(), "love you".to_string())
+            .await
+        {
+            Ok(_) => {
+                log::trace!(target: "redis", "{log_prefix}: Sent redis heartbeat");
+                server_params
+                    .metrics
+                    .order_type_counter
+                    .with_label_values(&["_", "heartbeat"])
+                    .inc();
+            }
+            Err(e) => {
+                log::error!(
+                    target: "redis",
+                    "{log_prefix}: Failed to deliver heartbeat, error: {e:?}"
+                );
+            }
+        }
+    }
+}
+
 pub async fn health_check() -> impl axum::response::IntoResponse {
     axum::http::StatusCode::OK
 }
@@ -320,7 +390,7 @@ pub async fn start_server() {
         log::error!("couldn't subscribe oracles: {err:?}");
     }
 
-    let state = Box::leak(Box::new(ServerParams {
+    let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::clone(&slot_subscriber),
         kafka_producer,
@@ -365,9 +435,64 @@ pub async fn start_server() {
         listener_metrics.local_addr().unwrap()
     );
 
+    // RPC sim loop to avoid rpc cold starts when orders are infrequent
+    // Build tx once and just resign with new blockhash
+    let rpc_sim_loop = tokio::spawn(async {
+        let sender = Keypair::new();
+        let receiver = Keypair::new();
+        let instruction = solana_sdk::system_instruction::transfer(
+            &sender.pubkey(),
+            &receiver.pubkey(),
+            1_000_000_000u64,
+        );
+
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            interval.tick().await;
+            let message = Message::try_compile(
+                &sender.pubkey(),
+                &[instruction.clone()],
+                &[],
+                Hash::default(),
+            )
+            .unwrap();
+            let versioned_message = VersionedMessage::V0(message);
+            let _ = state
+                .drift
+                .rpc()
+                .simulate_transaction_with_config(
+                    &VersionedTransaction {
+                        message: versioned_message,
+                        // must provide a signature for the RPC call to work
+                        signatures: vec![Signature::new_unique()],
+                    },
+                    RpcSimulateTransactionConfig {
+                        sig_verify: false,
+                        replace_recent_blockhash: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+    });
+
+    let send_heartbeat_loop = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            send_heartbeat(state).await;
+        }
+    });
+
+    let axum_server = tokio::spawn(async { axum::serve(listener, app).await });
+    let metrics_server = tokio::spawn(async { axum::serve(listener_metrics, metrics_app).await });
+
     let _ = tokio::try_join!(
-        axum::serve(listener, app),
-        axum::serve(listener_metrics, metrics_app)
+        rpc_sim_loop,
+        axum_server,
+        metrics_server,
+        send_heartbeat_loop
     );
 }
 
@@ -401,6 +526,7 @@ enum SimulationStatus {
     Success,
     Degraded,
     Timeout,
+    Disabled,
 }
 
 impl SimulationStatus {
@@ -409,6 +535,7 @@ impl SimulationStatus {
             Self::Success => "success",
             Self::Degraded => "degraded",
             Self::Timeout => "timeout",
+            Self::Disabled => "disabled",
         }
     }
 }
@@ -419,6 +546,10 @@ async fn simulate_taker_order_rpc(
     taker_pubkey: &Pubkey,
     taker_message: &SignedMsgOrderParamsMessage,
 ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
+    if *DISABLE_RPC_SIM {
+        return Ok(SimulationStatus::Disabled);
+    }
+
     let taker_subaccount_pubkey =
         Wallet::derive_user_account(taker_pubkey, taker_message.sub_account_id);
 
