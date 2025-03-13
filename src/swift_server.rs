@@ -494,7 +494,7 @@ pub async fn start_server() {
 fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), ErrorCode> {
     if !matches!(
         taker_order_params.order_type,
-        OrderType::Market | OrderType::Oracle
+        OrderType::Market | OrderType::Oracle | OrderType::Limit
     ) {
         return Err(ErrorCode::InvalidOrderMarketType);
     }
@@ -503,11 +503,9 @@ fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), 
         return Err(ErrorCode::InvalidOrderMarketType);
     }
 
-    if taker_order_params
-        .auction_duration
-        .and(taker_order_params.auction_start_price)
-        .and(taker_order_params.auction_end_price)
-        .is_none()
+    if taker_order_params.auction_duration.is_none()
+        || taker_order_params.auction_start_price.is_none()
+        || taker_order_params.auction_end_price.is_none()
     {
         return Err(ErrorCode::InvalidOrderAuction);
     }
