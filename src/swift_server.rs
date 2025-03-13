@@ -99,7 +99,7 @@ pub async fn process_order(
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
-                    message: "Error verifying signed message".to_string(),
+                    message: "Error verifying signed message",
                     error: Some(e.to_string()),
                 }),
             );
@@ -121,7 +121,7 @@ pub async fn process_order(
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
-                message: err_str.to_string(),
+                message: err_str,
                 error: Some(err_str.to_string()),
             }),
         );
@@ -132,7 +132,7 @@ pub async fn process_order(
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
-                message: "invalid order".to_string(),
+                message: "invalid order",
                 error: Some(err.to_string()),
             }),
         );
@@ -154,7 +154,7 @@ pub async fn process_order(
             return (
                 status,
                 Json(ProcessOrderResponse {
-                    message: "invalid order".to_string(),
+                    message: "invalid order",
                     error: Some(sim_err_str),
                 }),
             );
@@ -204,7 +204,7 @@ pub async fn process_order(
                 (
                     axum::http::StatusCode::OK,
                     Json(ProcessOrderResponse {
-                        message: "Order processed".to_string(),
+                        message: "Order processed",
                         error: None,
                     }),
                 )
@@ -218,7 +218,7 @@ pub async fn process_order(
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ProcessOrderResponse {
-                        message: "Failed to deliver message".to_string(),
+                        message: "Failed to deliver message",
                         error: Some(format!("kafka publish error: {e:?}")),
                     }),
                 )
@@ -231,7 +231,7 @@ pub async fn process_order(
                 return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ProcessOrderResponse {
-                        message: "Internal connection error".to_string(),
+                        message: "Internal connection error",
                         error: Some(format!("redis connection error: {e:?}")),
                     }),
                 )
@@ -256,7 +256,7 @@ pub async fn process_order(
                 (
                     axum::http::StatusCode::OK,
                     Json(ProcessOrderResponse {
-                        message: "Order processed".to_string(),
+                        message: "Order processed",
                         error: None,
                     }),
                 )
@@ -264,7 +264,7 @@ pub async fn process_order(
             Err(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ProcessOrderResponse {
-                    message: "Failed to deliver message".to_string(),
+                    message: "Failed to deliver message",
                     error: Some(format!("redis publish error: {e:?}")),
                 }),
             ),

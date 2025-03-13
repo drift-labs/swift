@@ -123,7 +123,7 @@ impl OrderMetadataAndMessage {
 
 #[derive(serde::Serialize)]
 pub struct ProcessOrderResponse {
-    pub message: String,
+    pub message: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
