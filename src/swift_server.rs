@@ -32,6 +32,7 @@ use rdkafka::{
 use redis::AsyncCommands;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_sdk::{
+    clock::Slot,
     hash::Hash,
     message::v0::Message,
     pubkey::Pubkey,
@@ -47,6 +48,7 @@ use crate::{
         messages::{IncomingSignedMessage, OrderMetadataAndMessage},
         types::unix_now_ms,
     },
+    user_account_fetcher::{UserAccountFetcher, UserAccountFetcherImpl, UserMapFetcher},
     util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
 };
 
@@ -65,6 +67,7 @@ pub struct ServerParams {
     pub port: String,
     pub metrics: SwiftServerMetrics,
     pub redis_pool: Option<Pool>,
+    pub user_account_fetcher: UserAccountFetcherImpl,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -126,7 +129,15 @@ pub async fn process_order(
             format!("invalid order: {err:?}"),
         );
     }
-    match simulate_taker_order_rpc(&server_params.drift, &taker_pubkey, &taker_message).await {
+    match simulate_taker_order_rpc(
+        &server_params.drift,
+        &taker_pubkey,
+        &taker_message,
+        &server_params.user_account_fetcher,
+        server_params.slot_subscriber.current_slot(),
+    )
+    .await
+    {
         Ok(sim_res) => {
             server_params
                 .metrics
@@ -390,6 +401,12 @@ pub async fn start_server() {
         log::error!("couldn't subscribe oracles: {err:?}");
     }
 
+    let user_account_fetcher = if std::env::var("USE_USERMAP").is_ok_and(|v| v == "true") {
+        UserAccountFetcherImpl::UserMap(UserMapFetcher::from_env())
+    } else {
+        UserAccountFetcherImpl::Rpc(client.clone())
+    };
+
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::clone(&slot_subscriber),
@@ -398,6 +415,7 @@ pub async fn start_server() {
         port: env::var("PORT").unwrap_or("3000".to_string()),
         metrics,
         redis_pool,
+        user_account_fetcher,
     }));
 
     // App
@@ -545,6 +563,8 @@ async fn simulate_taker_order_rpc(
     drift: &DriftClient,
     taker_pubkey: &Pubkey,
     taker_message: &SignedMsgOrderParamsMessage,
+    user_account_fetcher: &UserAccountFetcherImpl,
+    slot: Slot,
 ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
     if *DISABLE_RPC_SIM {
         return Ok(SimulationStatus::Disabled);
@@ -554,23 +574,26 @@ async fn simulate_taker_order_rpc(
         Wallet::derive_user_account(taker_pubkey, taker_message.sub_account_id);
 
     let t0 = SystemTime::now();
+
     let user_with_timeout = tokio::time::timeout(
         SIMULATION_TIMEOUT,
-        drift.get_user_account(&taker_subaccount_pubkey),
+        user_account_fetcher.get_user(&taker_subaccount_pubkey, slot),
     )
     .await;
+
     if user_with_timeout.is_err() {
         warn!("simulateTransaction degraded (timeout)");
         return Ok(SimulationStatus::Timeout);
     }
-    let user = user_with_timeout.unwrap();
-    if let Err(err) = user.as_ref() {
-        return Err((
+
+    let user_result = user_with_timeout.unwrap();
+    let user = user_result.map_err(|err| {
+        (
             axum::http::StatusCode::NOT_FOUND,
             format!("unable to fetch user: {err:?}"),
-        ));
-    }
-    let user = user.unwrap();
+        )
+    })?;
+
     let t1 = SystemTime::now();
     log::info!("fetch user: {:?}", SystemTime::now().duration_since(t0));
     let state = drift.state_account().expect("state account");
