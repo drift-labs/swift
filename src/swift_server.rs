@@ -45,7 +45,15 @@ use crate::{
     connection::kafka_connect::KafkaClientBuilder,
     super_slot_subscriber::SuperSlotSubscriber,
     types::{
-        messages::{IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse},
+        messages::{
+            IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
+            PROCESS_ORDER_RESPONSE_ERROR_INTERNAL_CONNECTION_ERROR,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
+            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+        },
         types::unix_now_ms,
     },
     util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
@@ -99,7 +107,7 @@ pub async fn process_order(
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
-                    message: "Error verifying signed message",
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
                     error: Some(e.to_string()),
                 }),
             );
@@ -117,7 +125,7 @@ pub async fn process_order(
             taker_message.slot,
             server_params.slot_subscriber.current_slot(),
         );
-        let err_str = "Order slot too old";
+        let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -132,7 +140,7 @@ pub async fn process_order(
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
-                message: "invalid order",
+                message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
                 error: Some(err.to_string()),
             }),
         );
@@ -154,7 +162,7 @@ pub async fn process_order(
             return (
                 status,
                 Json(ProcessOrderResponse {
-                    message: "invalid order",
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
                     error: Some(sim_err_str),
                 }),
             );
@@ -204,7 +212,7 @@ pub async fn process_order(
                 (
                     axum::http::StatusCode::OK,
                     Json(ProcessOrderResponse {
-                        message: "Order processed",
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
                         error: None,
                     }),
                 )
@@ -218,7 +226,7 @@ pub async fn process_order(
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ProcessOrderResponse {
-                        message: "Failed to deliver message",
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                         error: Some(format!("kafka publish error: {e:?}")),
                     }),
                 )
@@ -231,7 +239,7 @@ pub async fn process_order(
                 return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ProcessOrderResponse {
-                        message: "Internal connection error",
+                        message: PROCESS_ORDER_RESPONSE_ERROR_INTERNAL_CONNECTION_ERROR,
                         error: Some(format!("redis connection error: {e:?}")),
                     }),
                 )
@@ -256,7 +264,7 @@ pub async fn process_order(
                 (
                     axum::http::StatusCode::OK,
                     Json(ProcessOrderResponse {
-                        message: "Order processed",
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
                         error: None,
                     }),
                 )
@@ -264,7 +272,7 @@ pub async fn process_order(
             Err(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ProcessOrderResponse {
-                    message: "Failed to deliver message",
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                     error: Some(format!("redis publish error: {e:?}")),
                 }),
             ),
