@@ -294,7 +294,9 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
     }
 }
 
-pub async fn health_check() -> impl axum::response::IntoResponse {
+pub async fn health_check(
+    State(server_params): State<&'static ServerParams>,
+) -> impl axum::response::IntoResponse {
     axum::http::StatusCode::OK
 }
 
