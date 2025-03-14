@@ -16,11 +16,12 @@ use deadpool_redis::{Config, Pool, Runtime};
 use dotenv::dotenv;
 use drift_rs::{
     event_subscriber::PubsubClient,
+    math::account_list_builder::AccountsListBuilder,
     types::{
-        errors::ErrorCode, Context, MarketType, OrderParams, OrderType, SdkError,
+        errors::ErrorCode, Context, MarketId, MarketType, OrderParams, OrderType,
         SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
     },
-    DriftClient, RpcClient, TransactionBuilder, Wallet,
+    DriftClient, RpcClient, Wallet,
 };
 use log::warn;
 use prometheus::Registry;
@@ -29,11 +30,9 @@ use rdkafka::{
     util::Timeout,
 };
 use redis::AsyncCommands;
-use solana_rpc_client_api::{
-    client_error::{self, Error as ClientError},
-    config::RpcSimulateTransactionConfig,
-};
+use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_sdk::{
+    clock::Slot,
     hash::Hash,
     message::v0::Message,
     pubkey::Pubkey,
@@ -49,6 +48,7 @@ use crate::{
         messages::{IncomingSignedMessage, OrderMetadataAndMessage},
         types::unix_now_ms,
     },
+    user_account_fetcher::{UserAccountFetcher, UserAccountFetcherImpl, UserMapFetcher},
     util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
 };
 
@@ -67,6 +67,7 @@ pub struct ServerParams {
     pub port: String,
     pub metrics: SwiftServerMetrics,
     pub redis_pool: Option<Pool>,
+    pub user_account_fetcher: UserAccountFetcherImpl,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -128,7 +129,15 @@ pub async fn process_order(
             format!("invalid order: {err:?}"),
         );
     }
-    match simulate_taker_order_rpc(&server_params.drift, &taker_pubkey, &taker_message).await {
+    match simulate_taker_order_rpc(
+        &server_params.drift,
+        &taker_pubkey,
+        &taker_message,
+        &server_params.user_account_fetcher,
+        server_params.slot_subscriber.current_slot(),
+    )
+    .await
+    {
         Ok(sim_res) => {
             server_params
                 .metrics
@@ -383,6 +392,20 @@ pub async fn start_server() {
     )
     .await
     .expect("initialized client");
+    let all_markets = client.get_all_market_ids();
+    log::info!("subscribing markets: {:?}", &all_markets);
+    if let Err(err) = client.subscribe_markets(&all_markets).await {
+        log::error!("couldn't subscribe markets: {err:?}");
+    }
+    if let Err(err) = client.subscribe_oracles(&all_markets).await {
+        log::error!("couldn't subscribe oracles: {err:?}");
+    }
+
+    let user_account_fetcher = if std::env::var("USE_USERMAP").is_ok_and(|v| v == "true") {
+        UserAccountFetcherImpl::UserMap(UserMapFetcher::from_env())
+    } else {
+        UserAccountFetcherImpl::Rpc(client.clone())
+    };
 
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
@@ -392,6 +415,7 @@ pub async fn start_server() {
         port: env::var("PORT").unwrap_or("3000".to_string()),
         metrics,
         redis_pool,
+        user_account_fetcher,
     }));
 
     // App
@@ -537,6 +561,8 @@ async fn simulate_taker_order_rpc(
     drift: &DriftClient,
     taker_pubkey: &Pubkey,
     taker_message: &SignedMsgOrderParamsMessage,
+    user_account_fetcher: &UserAccountFetcherImpl,
+    slot: Slot,
 ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
     if *DISABLE_RPC_SIM {
         return Ok(SimulationStatus::Disabled);
@@ -546,92 +572,56 @@ async fn simulate_taker_order_rpc(
         Wallet::derive_user_account(taker_pubkey, taker_message.sub_account_id);
 
     let t0 = SystemTime::now();
+
     let user_with_timeout = tokio::time::timeout(
         SIMULATION_TIMEOUT,
-        drift.get_user_account(&taker_subaccount_pubkey),
+        user_account_fetcher.get_user(&taker_subaccount_pubkey, slot),
     )
     .await;
+
     if user_with_timeout.is_err() {
         warn!("simulateTransaction degraded (timeout)");
         return Ok(SimulationStatus::Timeout);
     }
-    let user = user_with_timeout.unwrap();
-    if let Err(err) = user.as_ref() {
-        return Err((
+
+    let user_result = user_with_timeout.unwrap();
+    let user = user_result.map_err(|err| {
+        (
             axum::http::StatusCode::NOT_FOUND,
             format!("unable to fetch user: {err:?}"),
-        ));
-    }
-    let user = user.unwrap();
+        )
+    })?;
 
-    let message = TransactionBuilder::new(
-        drift.program_data(),
-        taker_subaccount_pubkey,
-        std::borrow::Cow::Owned(user),
-        false,
-    )
-    .with_priority_fee(5_000, Some(1_400_000))
-    .place_orders(vec![taker_message.signed_msg_order_params])
-    .build();
+    let t1 = SystemTime::now();
+    log::info!("fetch user: {:?}", SystemTime::now().duration_since(t0));
+    let state = drift.state_account().expect("state account");
 
-    let simulate_result_with_timeout = tokio::time::timeout(
-        SIMULATION_TIMEOUT,
-        drift.rpc().simulate_transaction_with_config(
-            &VersionedTransaction {
-                message,
-                // must provide a signature for the RPC call to work
-                signatures: vec![Signature::new_unique()],
-            },
-            RpcSimulateTransactionConfig {
-                sig_verify: false,
-                replace_recent_blockhash: true,
-                ..Default::default()
-            },
-        ),
-    )
-    .await;
-
-    if simulate_result_with_timeout.is_err() {
-        warn!("simulateTransaction degraded (timeout)");
-        return Ok(SimulationStatus::Timeout);
-    }
-    let simulate_result = simulate_result_with_timeout.unwrap();
-
-    // simulation did not execute e.g. network issues
-    if let Err(err) = simulate_result {
-        warn!("simulateTransaction degraded (network): {err:?}");
+    let mut accounts_builder = AccountsListBuilder::default();
+    let accounts = accounts_builder.try_build(
+        drift,
+        &user,
+        &[MarketId::perp(
+            taker_message.signed_msg_order_params.market_index,
+        )],
+    );
+    if let Err(err) = accounts {
+        warn!("couldn't build accounts for sim: {err:?}");
         return Ok(SimulationStatus::Degraded);
     }
 
     // simulation executed with error status
-    let simulate_result_value = simulate_result.unwrap().value;
-    if let Some(simulate_err) = &simulate_result_value.err {
-        log::info!(
-            "simulate tx failed: {simulate_err:?}, {:?}",
-            &simulate_result_value
-                .logs
-                .unwrap_or_else(|| vec!["no logs".into()])
-        );
-        let err = SdkError::Rpc(ClientError {
-            request: None,
-            kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
-        });
-        match err.to_anchor_error_code() {
-            Some(code) => {
-                return Err((
-                    axum::http::StatusCode::BAD_REQUEST,
-                    format!("invalid order. error code: {code:?}"),
-                ));
-            }
-            None => {
-                return Err((
-                    axum::http::StatusCode::BAD_REQUEST,
-                    format!("invalid order: {err:?}"),
-                ));
-            }
-        }
+    if let Err(err) = drift_rs::ffi::simulate_place_perp_order(
+        &user,
+        &mut accounts.unwrap(),
+        &state,
+        &taker_message.signed_msg_order_params,
+    ) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("invalid order: {:?}", err.to_anchor_error_code(),),
+        ));
     }
-    log::info!("simulate tx: {:?}", SystemTime::now().duration_since(t0));
+    log::info!("simulate tx: {:?}", SystemTime::now().duration_since(t1));
 
     Ok(SimulationStatus::Success)
 }
