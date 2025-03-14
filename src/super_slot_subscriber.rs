@@ -56,13 +56,15 @@ impl SuperSlotSubscriber {
                     let _ = interval.tick().await;
                     let current_slot = current_slot_ref.load(std::sync::atomic::Ordering::Acquire);
                     if current_slot <= last_check_slot {
+                        is_stale_ref.store(true, std::sync::atomic::Ordering::Release);
                         log::warn!("slot subscriber stale");
                         if let Ok(new_slot) = rpc.get_slot().await {
                             log::info!("polling slot RPC");
                             current_slot_ref.store(new_slot, std::sync::atomic::Ordering::Release);
-                        } else {
-                            is_stale_ref.store(true, std::sync::atomic::Ordering::Release);
+                            is_stale_ref.store(false, std::sync::atomic::Ordering::Release);
                         }
+                    } else {
+                        is_stale_ref.store(false, std::sync::atomic::Ordering::Release);
                     }
                     last_check_slot = current_slot;
                 }
