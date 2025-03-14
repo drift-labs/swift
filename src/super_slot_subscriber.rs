@@ -55,8 +55,8 @@ impl SuperSlotSubscriber {
                 loop {
                     let _ = interval.tick().await;
                     let current_slot = current_slot_ref.load(std::sync::atomic::Ordering::Acquire);
-                    log::warn!("slot subscriber stale");
                     if current_slot <= last_check_slot {
+                        log::warn!("slot subscriber stale");
                         if let Ok(new_slot) = rpc.get_slot().await {
                             log::info!("polling slot RPC");
                             current_slot_ref.store(new_slot, std::sync::atomic::Ordering::Release);
