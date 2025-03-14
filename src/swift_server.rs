@@ -106,9 +106,7 @@ pub async fn process_order(
     let taker_message = taker_message_and_prefix.message;
 
     // check the order's slot is reasonable
-    if !server_params.slot_subscriber.is_stale()
-        && taker_message.slot < server_params.slot_subscriber.current_slot() - 500
-    {
+    if taker_message.slot < server_params.slot_subscriber.current_slot() - 500 {
         log::warn!(
             target: "server",
             "{log_prefix}: Order slot too old: {}, current slot: {}",
@@ -294,9 +292,7 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
     }
 }
 
-pub async fn health_check(
-    State(server_params): State<&'static ServerParams>,
-) -> impl axum::response::IntoResponse {
+pub async fn health_check() -> impl axum::response::IntoResponse {
     axum::http::StatusCode::OK
 }
 
@@ -351,19 +347,6 @@ pub async fn start_server() {
         None
     };
 
-    // Slot subscriber
-    let mut ws_clients = vec![];
-    for (_k, ws_endpoint) in std::env::vars().filter(|(k, _v)| k.starts_with("WS_ENDPOINT")) {
-        ws_clients.push(Arc::new(PubsubClient::new(&ws_endpoint).await.unwrap()));
-    }
-    assert!(
-        !ws_clients.is_empty(),
-        "no slot subscribers provided: set WS_ENDPOINT_*"
-    );
-    let mut slot_subscriber = SuperSlotSubscriber::new(ws_clients);
-    slot_subscriber.subscribe();
-    let slot_subscriber = Arc::new(slot_subscriber);
-
     let rpc_endpoint =
         drift_rs::utils::get_http_url(&env::var("ENDPOINT").expect("valid rpc endpoint"))
             .expect("valid RPC endpoint");
@@ -386,9 +369,21 @@ pub async fn start_server() {
     .await
     .expect("initialized client");
 
+    // Slot subscriber
+    let mut ws_clients = vec![];
+    for (_k, ws_endpoint) in std::env::vars().filter(|(k, _v)| k.starts_with("WS_ENDPOINT")) {
+        ws_clients.push(Arc::new(PubsubClient::new(&ws_endpoint).await.unwrap()));
+    }
+    assert!(
+        !ws_clients.is_empty(),
+        "no slot subscribers provided: set WS_ENDPOINT_*"
+    );
+    let mut slot_subscriber = SuperSlotSubscriber::new(ws_clients, client.rpc());
+    slot_subscriber.subscribe();
+
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
-        slot_subscriber: Arc::clone(&slot_subscriber),
+        slot_subscriber: Arc::new(slot_subscriber),
         kafka_producer,
         host: env::var("HOST").unwrap_or("0.0.0.0".to_string()),
         port: env::var("PORT").unwrap_or("3000".to_string()),
