@@ -5,6 +5,7 @@ mod connection;
 mod super_slot_subscriber;
 mod swift_server;
 mod types;
+mod user_account_fetcher;
 mod util;
 mod ws_server;
 
