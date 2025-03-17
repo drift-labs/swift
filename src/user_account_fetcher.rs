@@ -60,8 +60,7 @@ impl UserAccountFetcher {
             log::error!("usermap redis pool: {err:?}");
         })?;
 
-        let redis_key = format!("usermap-server::{}", account);
-
+        let redis_key = format!("usermap-server:{}", account.to_string());
         match conn.get::<_, Option<String>>(&redis_key).await {
             Ok(Some(value)) => {
                 let value_vec: Vec<&str> = value.split("::").collect();
@@ -83,7 +82,7 @@ impl UserAccountFetcher {
                 })
             }
             Ok(None) => {
-                log::warn!("No value found for usermap key: {}", &redis_key);
+                log::warn!("No value found for usermap key: {redis_key:?}");
                 Err(())
             }
             Err(err) => {
