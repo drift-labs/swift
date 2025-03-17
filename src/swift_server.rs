@@ -45,7 +45,15 @@ use crate::{
     connection::kafka_connect::KafkaClientBuilder,
     super_slot_subscriber::SuperSlotSubscriber,
     types::{
-        messages::{IncomingSignedMessage, OrderMetadataAndMessage},
+        messages::{
+            IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
+            PROCESS_ORDER_RESPONSE_ERROR_INTERNAL_CONNECTION_ERROR,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
+            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+        },
         types::unix_now_ms,
     },
     user_account_fetcher::{UserAccountFetcher, UserAccountFetcherImpl, UserMapFetcher},
@@ -101,24 +109,32 @@ pub async fn process_order(
         Ok(taker_message_and_prefix) => taker_message_and_prefix,
         Err(e) => {
             log::error!("{log_prefix}: Error verifying signed message: {e:?}",);
-            return (axum::http::StatusCode::BAD_REQUEST, format!("Error: {e:?}"));
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
+                    error: Some(e.to_string()),
+                }),
+            );
         }
     };
     let taker_message = taker_message_and_prefix.message;
 
     // check the order's slot is reasonable
-    if !server_params.slot_subscriber.is_stale()
-        && taker_message.slot < server_params.slot_subscriber.current_slot() - 500
-    {
+    if taker_message.slot < server_params.slot_subscriber.current_slot() - 500 {
         log::warn!(
             target: "server",
             "{log_prefix}: Order slot too old: {}, current slot: {}",
             taker_message.slot,
             server_params.slot_subscriber.current_slot(),
         );
+        let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            "order slot too old".to_string(),
+            Json(ProcessOrderResponse {
+                message: err_str,
+                error: Some(err_str.to_string()),
+            }),
         );
     }
 
@@ -126,7 +142,10 @@ pub async fn process_order(
     if let Err(err) = validate_signed_order_params(&taker_message.signed_msg_order_params) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            format!("invalid order: {err:?}"),
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                error: Some(err.to_string()),
+            }),
         );
     }
     match simulate_taker_order_rpc(
@@ -145,16 +164,23 @@ pub async fn process_order(
                 .with_label_values(&[sim_res.as_str()])
                 .inc();
         }
-        Err(sim_err) => {
+        Err((status, sim_err_str)) => {
             server_params
                 .metrics
                 .rpc_simulation_status
                 .with_label_values(&["invalid"])
                 .inc();
-            return sim_err;
+            return (
+                status,
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                    error: Some(sim_err_str),
+                }),
+            );
         }
     }
 
+    // TODO: try new devnet rpc
     let slot = server_params.slot_subscriber.current_slot();
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
@@ -194,7 +220,13 @@ pub async fn process_order(
                     .metrics
                     .response_time_histogram
                     .observe((unix_now_ms() - process_order_time) as f64);
-                (axum::http::StatusCode::OK, "Order processed".to_string())
+                (
+                    axum::http::StatusCode::OK,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    }),
+                )
             }
             Err((e, _)) => {
                 log::error!(
@@ -204,17 +236,23 @@ pub async fn process_order(
                 server_params.metrics.kafka_forward_fail_counter.inc();
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to deliver message: {e}"),
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some(format!("kafka publish error: {e:?}")),
+                    }),
                 )
             }
         }
     } else {
         let mut conn = match server_params.redis_pool.as_ref().unwrap().get().await {
             Ok(conn) => conn,
-            Err(_) => {
+            Err(e) => {
                 return (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Redis connection failed".to_string(),
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_INTERNAL_CONNECTION_ERROR,
+                        error: Some(format!("redis connection error: {e:?}")),
+                    }),
                 )
             }
         };
@@ -234,11 +272,20 @@ pub async fn process_order(
                     .response_time_histogram
                     .observe((unix_now_ms() - process_order_time) as f64);
 
-                (axum::http::StatusCode::OK, "Order processed".to_string())
+                (
+                    axum::http::StatusCode::OK,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    }),
+                )
             }
             Err(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to deliver message: {e}"),
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                    error: Some(format!("redis publish error: {e:?}")),
+                }),
             ),
         }
     }
@@ -358,19 +405,6 @@ pub async fn start_server() {
         None
     };
 
-    // Slot subscriber
-    let mut ws_clients = vec![];
-    for (_k, ws_endpoint) in std::env::vars().filter(|(k, _v)| k.starts_with("WS_ENDPOINT")) {
-        ws_clients.push(Arc::new(PubsubClient::new(&ws_endpoint).await.unwrap()));
-    }
-    assert!(
-        !ws_clients.is_empty(),
-        "no slot subscribers provided: set WS_ENDPOINT_*"
-    );
-    let mut slot_subscriber = SuperSlotSubscriber::new(ws_clients);
-    slot_subscriber.subscribe();
-    let slot_subscriber = Arc::new(slot_subscriber);
-
     let rpc_endpoint =
         drift_rs::utils::get_http_url(&env::var("ENDPOINT").expect("valid rpc endpoint"))
             .expect("valid RPC endpoint");
@@ -407,9 +441,21 @@ pub async fn start_server() {
         UserAccountFetcherImpl::Rpc(client.clone())
     };
 
+    // Slot subscriber
+    let mut ws_clients = vec![];
+    for (_k, ws_endpoint) in std::env::vars().filter(|(k, _v)| k.starts_with("WS_ENDPOINT")) {
+        ws_clients.push(Arc::new(PubsubClient::new(&ws_endpoint).await.unwrap()));
+    }
+    assert!(
+        !ws_clients.is_empty(),
+        "no slot subscribers provided: set WS_ENDPOINT_*"
+    );
+    let mut slot_subscriber = SuperSlotSubscriber::new(ws_clients, client.rpc());
+    slot_subscriber.subscribe();
+
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
-        slot_subscriber: Arc::clone(&slot_subscriber),
+        slot_subscriber: Arc::new(slot_subscriber),
         kafka_producer,
         host: env::var("HOST").unwrap_or("0.0.0.0".to_string()),
         port: env::var("PORT").unwrap_or("3000".to_string()),
@@ -518,7 +564,7 @@ pub async fn start_server() {
 fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), ErrorCode> {
     if !matches!(
         taker_order_params.order_type,
-        OrderType::Market | OrderType::Oracle
+        OrderType::Market | OrderType::Oracle | OrderType::Limit
     ) {
         return Err(ErrorCode::InvalidOrderMarketType);
     }
@@ -527,11 +573,9 @@ fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), 
         return Err(ErrorCode::InvalidOrderMarketType);
     }
 
-    if taker_order_params
-        .auction_duration
-        .and(taker_order_params.auction_start_price)
-        .and(taker_order_params.auction_end_price)
-        .is_none()
+    if taker_order_params.auction_duration.is_none()
+        || taker_order_params.auction_start_price.is_none()
+        || taker_order_params.auction_end_price.is_none()
     {
         return Err(ErrorCode::InvalidOrderAuction);
     }
