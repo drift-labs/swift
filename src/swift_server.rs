@@ -471,17 +471,11 @@ pub async fn start_server() {
         log::info!("subscribing markets: {:?}", &all_markets);
         if let Err(err) = state.drift.subscribe_markets(&all_markets).await {
             log::error!("couldn't subscribe markets: {err:?}, RPC sim disabled!");
-            state
-                .config
-                .disable_rpc_sim
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            state.disable_rpc_sim();
         }
         if let Err(err) = state.drift.subscribe_oracles(&all_markets).await {
             log::error!("couldn't subscribe oracles: {err:?}, RPC sim disabled!");
-            state
-                .config
-                .disable_rpc_sim
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            state.disable_rpc_sim();
         }
     });
 
@@ -626,6 +620,12 @@ impl SimulationStatus {
 }
 
 impl ServerParams {
+    /// Toggle RPC simulation off
+    pub fn disable_rpc_sim(&self) {
+        self.config
+            .disable_rpc_sim
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     /// True if RPC simulation is set disabled
     pub fn is_rpc_sim_disabled(&self) -> bool {
         self.config
