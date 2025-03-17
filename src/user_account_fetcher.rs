@@ -5,42 +5,16 @@ use drift_rs::{types::accounts::User, DriftClient};
 use redis::AsyncCommands;
 use solana_sdk::{clock::Slot, pubkey::Pubkey};
 
-#[derive(Clone)]
-/// Provides drift User account fetching
-pub enum UserAccountFetcherImpl {
-    /// fetch by UserMap
-    UserMap(UserMapFetcher),
-    Rpc(DriftClient),
-}
-
-impl UserAccountFetcher for UserAccountFetcherImpl {
-    async fn get_user(&self, account: &Pubkey, slot: Slot) -> Result<User, ()> {
-        match self {
-            Self::UserMap(u) => u.get_user(account, slot).await,
-            Self::Rpc(r) => r.get_user_account(account).await.map_err(|err| {
-                log::warn!("failed to fetch user: {account}. {err:?}");
-            }),
-        }
-    }
-}
-
-/// Provides drift User account fetching
-pub trait UserAccountFetcher {
-    /// Fetch the `User` account data
-    ///
-    /// - `account` pubkey of the user subaccount
-    /// - `slot` current slot
-    async fn get_user(&self, account: &Pubkey, slot: Slot) -> Result<User, ()>;
-}
-
-#[derive(Clone)]
 /// Fetches users from UserMap server
-pub struct UserMapFetcher {
-    redis: Pool,
+#[derive(Clone)]
+pub struct UserAccountFetcher {
+    redis: Option<Pool>,
+    drift: DriftClient,
 }
 
-impl UserMapFetcher {
-    pub fn from_env() -> Self {
+impl UserAccountFetcher {
+    /// Create a new `UserAccountFetcher` from env vars
+    pub fn from_env(drift: DriftClient) -> Self {
         let redis = {
             let elasticache_host = std::env::var("USERMAP_ELASTICACHE_HOST")
                 .unwrap_or_else(|_| "localhost".to_string());
@@ -56,17 +30,33 @@ impl UserMapFetcher {
                 format!("redis://{}:{}", elasticache_host, elasticache_port)
             };
             let cfg = deadpool_redis::Config::from_url(connection_string);
-            cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))
-                .expect("Failed to create Redis pool")
+            match cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1)) {
+                Ok(r) => Some(r),
+                Err(err) => {
+                    log::warn!("usermap not connected: {err:?}. user queries will use RPC");
+                    None
+                }
+            }
         };
 
-        Self { redis }
+        Self { redis, drift }
     }
-}
 
-impl UserAccountFetcher for UserMapFetcher {
-    async fn get_user(&self, account: &Pubkey, slot: Slot) -> Result<User, ()> {
-        let mut conn = self.redis.get().await.map_err(|err| {
+    // Fetch a drift `User` from usermap, falling back to RPC
+    pub async fn get_user(&self, account: &Pubkey, slot: Slot) -> Result<User, ()> {
+        match self.usermap_lookup(account, slot).await {
+            Ok(res) => Ok(res),
+            Err(_) => self.drift.get_account_value(account).await.map_err(|_| ()),
+        }
+    }
+
+    pub async fn usermap_lookup(&self, account: &Pubkey, slot: Slot) -> Result<User, ()> {
+        // usermap server not connected
+        if self.redis.is_none() {
+            return Err(());
+        }
+
+        let mut conn = self.redis.as_ref().unwrap().get().await.map_err(|err| {
             log::error!("usermap redis pool: {err:?}");
         })?;
 

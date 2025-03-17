@@ -56,7 +56,7 @@ use crate::{
         },
         types::unix_now_ms,
     },
-    user_account_fetcher::{UserAccountFetcher, UserAccountFetcherImpl, UserMapFetcher},
+    user_account_fetcher::UserAccountFetcher,
     util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
 };
 
@@ -75,7 +75,7 @@ pub struct ServerParams {
     pub port: String,
     pub metrics: SwiftServerMetrics,
     pub redis_pool: Option<Pool>,
-    pub user_account_fetcher: UserAccountFetcherImpl,
+    pub user_account_fetcher: UserAccountFetcher,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -435,11 +435,7 @@ pub async fn start_server() {
         log::error!("couldn't subscribe oracles: {err:?}");
     }
 
-    let user_account_fetcher = if std::env::var("USE_USERMAP").is_ok_and(|v| v == "true") {
-        UserAccountFetcherImpl::UserMap(UserMapFetcher::from_env())
-    } else {
-        UserAccountFetcherImpl::Rpc(client.clone())
-    };
+    let user_account_fetcher = UserAccountFetcher::from_env(client.clone());
 
     // Slot subscriber
     let mut ws_clients = vec![];
@@ -607,7 +603,7 @@ async fn simulate_taker_order_rpc(
     drift: &DriftClient,
     taker_pubkey: &Pubkey,
     taker_message: &SignedMsgOrderParamsMessage,
-    user_account_fetcher: &UserAccountFetcherImpl,
+    user_account_fetcher: &UserAccountFetcher,
     slot: Slot,
 ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
     if *DISABLE_RPC_SIM {
