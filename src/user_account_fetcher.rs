@@ -107,8 +107,9 @@ mod tests {
 
     use super::*;
 
+    #[ignore]
     #[tokio::test]
-    async fn elastic_test() {
+    async fn usermap_lookups() {
         let _ = env_logger::try_init();
         let drift = DriftClient::new(
             Context::DevNet,
@@ -133,8 +134,7 @@ mod tests {
 
         for p in keys {
             let t0 = std::time::Instant::now();
-            let res = u.get_user(&p, slot).await;
-            dbg!(&res.is_ok());
+            assert!(u.get_user(&p, slot).await.is_ok());
             let time = (std::time::Instant::now() - t0).as_millis();
             dbg!(time);
         }
