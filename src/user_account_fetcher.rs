@@ -1,20 +1,19 @@
 use anchor_lang::AccountDeserialize;
 use base64::Engine;
-use deadpool_redis::Pool;
 use drift_rs::{types::accounts::User, DriftClient};
-use redis::AsyncCommands;
+use redis::{aio::MultiplexedConnection, AsyncCommands};
 use solana_sdk::{clock::Slot, pubkey::Pubkey};
 
 /// Fetches users from UserMap server
 #[derive(Clone)]
 pub struct UserAccountFetcher {
-    redis: Option<Pool>,
+    redis: Option<MultiplexedConnection>,
     drift: DriftClient,
 }
 
 impl UserAccountFetcher {
     /// Create a new `UserAccountFetcher` from env vars
-    pub fn from_env(drift: DriftClient) -> Self {
+    pub async fn from_env(drift: DriftClient) -> Self {
         let redis = {
             let elasticache_host = std::env::var("USERMAP_ELASTICACHE_HOST")
                 .unwrap_or_else(|_| "localhost".to_string());
@@ -25,13 +24,17 @@ impl UserAccountFetcher {
                 .to_lowercase()
                 == "true"
             {
-                format!("rediss://{}:{}", elasticache_host, elasticache_port)
+                format!(
+                    // "rediss://{}:{}/#insecure",
+                    "rediss://{}:{}",
+                    elasticache_host, elasticache_port
+                )
             } else {
                 format!("redis://{}:{}", elasticache_host, elasticache_port)
             };
-            let cfg = deadpool_redis::Config::from_url(connection_string);
-            match cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1)) {
-                Ok(r) => Some(r),
+            let conn = redis::Client::open(connection_string);
+            match conn {
+                Ok(r) => r.get_multiplexed_tokio_connection().await.ok(),
                 Err(err) => {
                     log::warn!("usermap not connected: {err:?}. user queries will use RPC");
                     None
@@ -56,30 +59,34 @@ impl UserAccountFetcher {
             return Err(());
         }
 
-        let mut conn = self.redis.as_ref().unwrap().get().await.map_err(|err| {
-            log::error!("usermap redis pool: {err:?}");
-        })?;
-
-        let redis_key = format!("usermap-server:{}", account.to_string());
-        match conn.get::<_, Option<String>>(&redis_key).await {
+        let conn = self.redis.clone();
+        let redis_key = format!("usermap-server:{account}");
+        match conn.unwrap().get::<_, Option<String>>(&redis_key).await {
             Ok(Some(value)) => {
-                let value_vec: Vec<&str> = value.split("::").collect();
-                let redis_slot = value_vec[0].parse::<u64>().unwrap();
+                let mut parts = value.split("::");
+                match (parts.next(), parts.next()) {
+                    (Some(redis_slot), Some(account)) => {
+                        let redis_slot = redis_slot.parse::<u64>().unwrap_or_default();
+                        if slot.saturating_sub(redis_slot) > (90_f64 * 2.5) as u64 {
+                            log::warn!("User found in redis is too old. redis: {redis_slot}, current: {slot}");
+                            return Err(());
+                        }
 
-                if slot.saturating_sub(redis_slot) > (90_f64 * 2.5) as u64 {
-                    log::warn!("User found in redis is too old");
-                    return Err(());
+                        let user = User::try_deserialize(
+                            &mut &base64::engine::general_purpose::STANDARD
+                                .decode(account)
+                                .unwrap()[..],
+                        );
+
+                        user.map_err(|err| {
+                            log::error!("Failed to deserialize user from redis: {err:?}");
+                        })
+                    }
+                    _ => {
+                        log::warn!("Invalid usermap value");
+                        Err(())
+                    }
                 }
-
-                let user = User::try_deserialize(
-                    &mut &base64::engine::general_purpose::STANDARD
-                        .decode(value_vec[1])
-                        .unwrap()[..],
-                );
-
-                user.map_err(|err| {
-                    log::error!("Failed to deserialize user from redis: {err:?}");
-                })
             }
             Ok(None) => {
                 log::warn!("No value found for usermap key: {redis_key:?}");
@@ -89,6 +96,47 @@ impl UserAccountFetcher {
                 log::error!("usermap query error: {err:?}");
                 Err(())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use drift_rs::{Context, RpcClient};
+    use solana_sdk::signature::Keypair;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn elastic_test() {
+        let _ = env_logger::try_init();
+        let drift = DriftClient::new(
+            Context::DevNet,
+            RpcClient::new("https://api.devnet.solana.com".into()),
+            Keypair::new().into(),
+        )
+        .await
+        .unwrap();
+        let u = UserAccountFetcher::from_env(drift.clone()).await;
+        let keys = [
+            solana_sdk::pubkey!("9wcC14v9n3YvGenSnAnsA8yTwnCyUg3ayTBGaJUNEnn6"),
+            solana_sdk::pubkey!("6nBSTpFpAqw32CKdauAL1FnSLvrtUpBgeXXjPEL2ooB7"),
+            solana_sdk::pubkey!("ECqYuYada7SCFyJKX8ieRWyy4rTYh9eiEiofbftwy12V"),
+            solana_sdk::pubkey!("FGHNtir5sfFyQfiGZ1cPxagCFLrBA1B9qdEQSkeqw3rP"),
+            solana_sdk::pubkey!("FdXRVMFkNEXf9uWmcYfkxRvLTDKeY3X9uxhxaQLuuVHR"),
+            solana_sdk::pubkey!("2tyhK1zxrMYRNDZX9EnPDSAqBNYz8MXRwLVE96g5ZKEw"),
+            solana_sdk::pubkey!("34gEWrhb9WQd16DhS2o28A4xmBnXgE5caWe6kYhzY2XA"),
+            solana_sdk::pubkey!("9TDcwUU43bbhGM8JDMY7FT8797foKA32ekSH9eieT3jX"),
+        ];
+
+        let slot = drift.rpc().get_slot().await.unwrap();
+
+        for p in keys {
+            let t0 = std::time::Instant::now();
+            let res = u.get_user(&p, slot).await;
+            dbg!(&res.is_ok());
+            let time = (std::time::Instant::now() - t0).as_millis();
+            dbg!(time);
         }
     }
 }
