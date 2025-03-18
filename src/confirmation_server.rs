@@ -7,17 +7,16 @@ use axum::{
     Router,
 };
 use axum_prometheus::PrometheusMetricLayer;
-use deadpool_redis::{redis::AsyncCommands, Config, Pool, Runtime};
 use dotenv::dotenv;
 use futures_util::StreamExt;
-use redis::ScanOptions;
+use redis::{aio::MultiplexedConnection, AsyncCommands, ScanOptions};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 pub struct ServerParams {
     pub host: String,
     pub port: String,
-    pub redis_pool: Pool,
+    pub redis_pool: MultiplexedConnection,
 }
 #[derive(serde::Deserialize)]
 pub struct HashQuery {
@@ -41,18 +40,10 @@ pub async fn health_check() -> impl axum::response::IntoResponse {
 pub async fn get_all_hashes(
     State(server_params): State<ServerParams>,
 ) -> impl axum::response::IntoResponse {
-    let mut conn = match server_params.redis_pool.get().await {
-        Ok(conn) => conn,
-        Err(_) => {
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Redis connection failed".to_string(),
-            )
-        }
-    };
-
     let pattern = "swift-hashes::*";
     let scan_opts = ScanOptions::default().with_pattern(pattern).with_count(100);
+    let mut conn = server_params.redis_pool.clone();
+
     let keys = match conn.scan_options::<String>(scan_opts).await {
         Ok(it) => it.collect::<Vec<String>>().await,
         Err(e) => {
@@ -124,16 +115,7 @@ pub async fn get_hash_status(
 
     let decoded_hash = decoded_hash_result.unwrap().to_string();
 
-    let mut conn = match server_params.redis_pool.get().await {
-        Ok(conn) => conn,
-        Err(_) => {
-            log::error!("Redis connection failed");
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Redis connection failed".to_string(),
-            );
-        }
-    };
+    let mut conn = server_params.redis_pool.clone();
 
     let redis_key = format!("swift-hashes::{}", decoded_hash);
     match conn.get::<_, Option<String>>(redis_key).await {
@@ -167,10 +149,11 @@ pub async fn start_server() {
         format!("redis://{}:{}", elasticache_host, elasticache_port)
     };
 
-    let cfg = Config::from_url(connection_string);
-    let redis_pool = cfg
-        .create_pool(Some(Runtime::Tokio1))
-        .expect("Failed to create Redis pool");
+    let redis_client = redis::Client::open(connection_string).expect("valid redis URL");
+    let redis_pool = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .expect("redis connects");
 
     println!("Connecting to Redis via pool");
 
@@ -234,8 +217,11 @@ mod tests {
     use super::*;
 
     async fn setup_test_server() -> ServerParams {
-        let cfg = Config::from_url("redis://localhost:6379");
-        let redis_pool = cfg.create_pool(Some(Runtime::Tokio1)).unwrap();
+        let cli = redis::Client::open("redis://localhost:6379").expect("valid redis URL");
+        let redis_pool = cli
+            .get_multiplexed_tokio_connection()
+            .await
+            .expect("redis connects");
 
         ServerParams {
             host: "127.0.0.1".to_string(),

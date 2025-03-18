@@ -11,16 +11,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use deadpool_redis::{Config as RedisConfig, Pool, Runtime};
 use dotenv::dotenv;
 use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     types::{
-        errors::ErrorCode, Context, MarketId, MarketType, OrderParams, OrderType,
+        errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType,
         SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
     },
-    DriftClient, RpcClient, Wallet,
+    Context, DriftClient, RpcClient, Wallet,
 };
 use log::warn;
 use prometheus::Registry;
@@ -28,7 +27,7 @@ use rdkafka::{
     producer::{FutureProducer, FutureRecord},
     util::Timeout,
 };
-use redis::AsyncCommands;
+use redis::{aio::MultiplexedConnection, AsyncCommands};
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_sdk::{
     clock::Slot,
@@ -46,7 +45,6 @@ use crate::{
     types::{
         messages::{
             IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
-            PROCESS_ORDER_RESPONSE_ERROR_INTERNAL_CONNECTION_ERROR,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
@@ -83,7 +81,7 @@ pub struct ServerParams {
     slot_subscriber: Arc<SuperSlotSubscriber>,
     kafka_producer: Option<FutureProducer>,
     metrics: SwiftServerMetrics,
-    redis_pool: Option<Pool>,
+    redis_pool: Option<MultiplexedConnection>,
     user_account_fetcher: UserAccountFetcher,
     config: Arc<Config>,
 }
@@ -248,19 +246,7 @@ pub async fn process_order(
             }
         }
     } else {
-        let mut conn = match server_params.redis_pool.as_ref().unwrap().get().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_ERROR_INTERNAL_CONNECTION_ERROR,
-                        error: Some(format!("redis connection error: {e:?}")),
-                    }),
-                )
-            }
-        };
-
+        let mut conn = server_params.redis_pool.clone().unwrap();
         match conn.publish::<String, String, i64>(topic, encoded).await {
             Ok(_) => {
                 log::trace!(target: "redis", "{log_prefix}: Sent redis message for order: {order_metadata:?}");
@@ -324,15 +310,9 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
             }
         }
     } else {
-        let mut conn = match server_params.redis_pool.as_ref().unwrap().get().await {
-            Ok(conn) => conn,
-            Err(_) => {
-                log::error!(target: "redis", "{log_prefix}: Obtaining redis connection failed");
-                return;
-            }
-        };
-
+        let conn = server_params.redis_pool.clone();
         match conn
+            .unwrap()
             .publish::<String, String, i64>("heartbeat".to_string(), "love you".to_string())
             .await
         {
@@ -410,10 +390,12 @@ pub async fn start_server() {
         } else {
             format!("redis://{}:{}", elasticache_host, elasticache_port)
         };
-        let cfg = RedisConfig::from_url(connection_string);
+        let client = redis::Client::open(connection_string).expect("valid redis URL");
         Some(
-            cfg.create_pool(Some(Runtime::Tokio1))
-                .expect("Failed to create Redis pool"),
+            client
+                .get_multiplexed_tokio_connection()
+                .await
+                .expect("redis connected"),
         )
     } else {
         None
@@ -441,7 +423,7 @@ pub async fn start_server() {
     .await
     .expect("initialized client");
 
-    let user_account_fetcher = UserAccountFetcher::from_env(client.clone());
+    let user_account_fetcher = UserAccountFetcher::from_env(client.clone()).await;
 
     // Slot subscriber
     let mut ws_clients = vec![];
