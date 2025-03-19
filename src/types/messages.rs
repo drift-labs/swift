@@ -325,6 +325,9 @@ where
 {
     let payload: &[u8] = serde::Deserialize::deserialize(deserializer)?;
     let mut buf = [0_u8; N];
+    if payload.len() % 2 != 0 {
+        return Err(serde::de::Error::custom("Hex string length must be even"));
+    }
     faster_hex::hex_decode(payload, &mut buf[..payload.len() / 2])
         .map_err(serde::de::Error::custom)?;
 
