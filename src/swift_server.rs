@@ -16,10 +16,10 @@ use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     types::{
-        errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType,
+        errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
         SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
     },
-    Context, DriftClient, RpcClient, Wallet,
+    Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
 use log::warn;
 use prometheus::Registry;
@@ -28,7 +28,7 @@ use rdkafka::{
     util::Timeout,
 };
 use redis::{aio::MultiplexedConnection, AsyncCommands};
-use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
+use solana_rpc_client_api::{client_error, config::RpcSimulateTransactionConfig};
 use solana_sdk::{
     clock::Slot,
     hash::Hash,
@@ -584,10 +584,13 @@ fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), 
 
 #[derive(Debug)]
 enum SimulationStatus {
+    /// Success sim'd locally
     Success,
     Degraded,
     Timeout,
     Disabled,
+    /// Success but sim'd over RPC
+    SuccessRpc,
 }
 
 impl SimulationStatus {
@@ -597,6 +600,7 @@ impl SimulationStatus {
             Self::Degraded => "degraded",
             Self::Timeout => "timeout",
             Self::Disabled => "disabled",
+            Self::SuccessRpc => "successRpc",
         }
     }
 }
@@ -614,7 +618,47 @@ impl ServerParams {
             .disable_rpc_sim
             .load(std::sync::atomic::Ordering::Relaxed)
     }
-    /// Simulate the taker placing a perp order via RPC
+    fn simulate_taker_order_local(
+        &self,
+        signed_msg: &SignedMsgOrderParamsMessage,
+        user: &drift_rs::types::accounts::User,
+    ) -> bool {
+        let state = match self.drift.state_account() {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!(target: "sim", "state account fetch failed: {err:?}");
+                return false;
+            }
+        };
+        let mut accounts_builder = AccountsListBuilder::default();
+        let accounts = accounts_builder.try_build(
+            &self.drift,
+            &user,
+            &[MarketId::new(
+                signed_msg.signed_msg_order_params.market_index,
+                signed_msg.signed_msg_order_params.market_type,
+            )],
+        );
+        if let Err(err) = accounts {
+            log::warn!(target: "sim", "couldn't build accounts for sim: {err:?}");
+            return false;
+        }
+
+        // simulation executed with error status
+        match drift_rs::ffi::simulate_place_perp_order(
+            &user,
+            &mut accounts.unwrap(),
+            &state,
+            &signed_msg.signed_msg_order_params,
+        ) {
+            Ok(_) => true,
+            Err(err) => {
+                log::debug!(target: "sim", "local sim failed: {err:?}");
+                false
+            }
+        }
+    }
+    /// Simulate the taker placing a perp order via RPC, tries local sim first
     async fn simulate_taker_order_rpc(
         &self,
         taker_authority: &Pubkey,
@@ -652,42 +696,74 @@ impl ServerParams {
 
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
-        let state = match self.drift.state_account() {
-            Ok(s) => s,
-            Err(err) => {
-                log::error!(target: "sim", "state account fetch failed: {err:?}");
+
+        if self.simulate_taker_order_local(taker_message, &user) {
+            log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
+            return Ok(SimulationStatus::Success);
+        }
+
+        // fallback to network sim
+        let message = TransactionBuilder::new(
+            self.drift.program_data(),
+            taker_subaccount_pubkey,
+            std::borrow::Cow::Owned(user),
+            false,
+        )
+        .with_priority_fee(5_000, Some(1_400_000))
+        .place_orders(vec![taker_message.signed_msg_order_params])
+        .build();
+
+        let simulate_result_with_timeout = tokio::time::timeout(
+            self.config.simulation_timeout,
+            self.drift.rpc().simulate_transaction_with_config(
+                &VersionedTransaction {
+                    message,
+                    // must provide a signature for the RPC call to work
+                    signatures: vec![Signature::new_unique()],
+                },
+                RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    replace_recent_blockhash: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+
+        match simulate_result_with_timeout {
+            Ok(Ok(res)) => {
+                if let Some(simulate_err) = res.value.err {
+                    log::warn!(target: "sim", "program sim error: {simulate_err:?}");
+                    let err = SdkError::Rpc(client_error::Error {
+                        request: None,
+                        kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
+                    });
+                    match err.to_anchor_error_code() {
+                        Some(code) => {
+                            return Err((
+                                axum::http::StatusCode::BAD_REQUEST,
+                                format!("invalid order. error code: {code:?}"),
+                            ));
+                        }
+                        None => {
+                            return Err((
+                                axum::http::StatusCode::BAD_REQUEST,
+                                format!("invalid order: {simulate_err:?}"),
+                            ));
+                        }
+                    }
+                } else {
+                    log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
+                    return Ok(SimulationStatus::SuccessRpc);
+                }
+            }
+            Ok(Err(err)) => {
+                log::warn!(target: "sim", "network sim error: {err:?}");
                 return Ok(SimulationStatus::Degraded);
             }
-        };
-
-        let mut accounts_builder = AccountsListBuilder::default();
-        let accounts = accounts_builder.try_build(
-            &self.drift,
-            &user,
-            &[MarketId::perp(
-                taker_message.signed_msg_order_params.market_index,
-            )],
-        );
-        if let Err(err) = accounts {
-            log::error!(target: "sim", "couldn't build accounts for sim: {err:?}");
-            return Ok(SimulationStatus::Degraded);
+            Err(_) => {
+                return Ok(SimulationStatus::Timeout);
+            }
         }
-
-        // simulation executed with error status
-        if let Err(err) = drift_rs::ffi::simulate_place_perp_order(
-            &user,
-            &mut accounts.unwrap(),
-            &state,
-            &taker_message.signed_msg_order_params,
-        ) {
-            log::warn!(target: "sim", "sim with error: {err:?}");
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                format!("invalid order: {:?}", err.to_anchor_error_code()),
-            ));
-        }
-        log::info!(target: "sim", "simulate tx: {:?}", SystemTime::now().duration_since(t1));
-
-        Ok(SimulationStatus::Success)
     }
 }
