@@ -121,6 +121,20 @@ impl OrderMetadataAndMessage {
     }
 }
 
+#[derive(serde::Serialize)]
+pub struct ProcessOrderResponse {
+    pub message: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+pub const PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS: &str = "Order processed";
+pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE: &str =
+    "Error verifying signed message";
+pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slot too old";
+pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
+pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
+
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum SubscribeActions {
