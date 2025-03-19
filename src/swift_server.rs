@@ -638,7 +638,7 @@ impl ServerParams {
         .await;
 
         if user_with_timeout.is_err() {
-            warn!("simulateTransaction degraded (timeout)");
+            warn!(target: "sim", "simulateTransaction degraded (timeout)");
             return Ok(SimulationStatus::Timeout);
         }
 
@@ -651,11 +651,11 @@ impl ServerParams {
         })?;
 
         let t1 = SystemTime::now();
-        log::info!("fetch user: {:?}", SystemTime::now().duration_since(t0));
+        log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
         let state = match self.drift.state_account() {
             Ok(s) => s,
             Err(err) => {
-                log::error!("state account fetch failed: {err:?}");
+                log::error!(target: "sim", "state account fetch failed: {err:?}");
                 return Ok(SimulationStatus::Degraded);
             }
         };
@@ -669,7 +669,7 @@ impl ServerParams {
             )],
         );
         if let Err(err) = accounts {
-            log::error!("couldn't build accounts for sim: {err:?}");
+            log::error!(target: "sim", "couldn't build accounts for sim: {err:?}");
             return Ok(SimulationStatus::Degraded);
         }
 
@@ -680,12 +680,13 @@ impl ServerParams {
             &state,
             &taker_message.signed_msg_order_params,
         ) {
+            log::warn!(target: "sim", "sim with error: {err:?}");
             return Err((
                 axum::http::StatusCode::BAD_REQUEST,
-                format!("invalid order: {:?}", err.to_anchor_error_code(),),
+                format!("invalid order: {:?}", err.to_anchor_error_code()),
             ));
         }
-        log::info!("simulate tx: {:?}", SystemTime::now().duration_since(t1));
+        log::info!(target: "sim", "simulate tx: {:?}", SystemTime::now().duration_since(t1));
 
         Ok(SimulationStatus::Success)
     }
