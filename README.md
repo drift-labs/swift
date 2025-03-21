@@ -1,6 +1,6 @@
 # Swift Server
 
-Infrastructure for the Server order pipeline.
+Infrastructure for the Swift order pipeline.
 
 ### Architecture
 
