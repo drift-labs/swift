@@ -17,7 +17,7 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     types::{
         errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
-        SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
+        VersionedMessage, VersionedTransaction,
     },
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
@@ -113,8 +113,8 @@ pub async fn process_order(
 
     let log_prefix = format!("[process_order {taker_pubkey}: {process_order_time}]");
 
-    let taker_message_and_prefix = match incoming_message.verify_and_get_signed_message() {
-        Ok(taker_message_and_prefix) => taker_message_and_prefix,
+    let taker_message = match incoming_message.verify_and_get_signed_message() {
+        Ok(m) => m,
         Err(e) => {
             log::error!("{log_prefix}: Error verifying signed message: {e:?}",);
             return (
@@ -126,14 +126,13 @@ pub async fn process_order(
             );
         }
     };
-    let taker_message = taker_message_and_prefix.message;
 
     // check the order's slot is reasonable
-    if taker_message.slot < server_params.slot_subscriber.current_slot() - 500 {
+    if taker_message.slot() < server_params.slot_subscriber.current_slot() - 500 {
         log::warn!(
             target: "server",
             "{log_prefix}: Order slot too old: {}, current slot: {}",
-            taker_message.slot,
+            taker_message.slot(),
             server_params.slot_subscriber.current_slot(),
         );
         let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
@@ -148,7 +147,8 @@ pub async fn process_order(
 
     // check the order is valid for execution by program
     let slot = server_params.slot_subscriber.current_slot();
-    if let Err(err) = validate_signed_order_params(&taker_message.signed_msg_order_params) {
+    let taker_order_params = taker_message.order_params();
+    if let Err(err) = validate_signed_order_params(taker_order_params) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -157,8 +157,14 @@ pub async fn process_order(
             }),
         );
     }
+    let taker_subaccount_pubkey = taker_message.taker_pubkey.unwrap_or_else(|| {
+        Wallet::derive_user_account(
+            taker_authority,
+            taker_message.sub_account_id.unwrap_or_default(),
+        )
+    });
     match server_params
-        .simulate_taker_order_rpc(&taker_pubkey, &taker_message, slot)
+        .simulate_taker_order_rpc(&taker_subaccount_pubkey, &taker_order_params, slot)
         .await
     {
         Ok(sim_res) => {
@@ -187,16 +193,16 @@ pub async fn process_order(
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority: taker_pubkey,
-        order_message: taker_message_and_prefix,
+        order_message: taker_message,
         order_signature: taker_signature,
         ts: process_order_time,
-        uuid: taker_message.uuid,
+        uuid: taker_message.uuid(),
     };
     let encoded = order_metadata.encode();
     log::trace!(target: "server", "base64 encoded message: {encoded:?}");
 
-    let market_index = taker_message.signed_msg_order_params.market_index;
-    let market_type = taker_message.signed_msg_order_params.market_type;
+    let market_index = taker_order_params.market_index;
+    let market_type = taker_order_params.market_type;
 
     let topic = format!("swift_orders_{}_{market_index}", market_type.as_str());
     log::trace!(target: "server", "{log_prefix}: Topic: {topic}");
@@ -620,7 +626,7 @@ impl ServerParams {
     }
     fn simulate_taker_order_local(
         &self,
-        signed_msg: &SignedMsgOrderParamsMessage,
+        order_params: &OrderParams,
         user: &drift_rs::types::accounts::User,
     ) -> bool {
         let state = match self.drift.state_account() {
@@ -635,8 +641,8 @@ impl ServerParams {
             &self.drift,
             &user,
             &[MarketId::new(
-                signed_msg.signed_msg_order_params.market_index,
-                signed_msg.signed_msg_order_params.market_type,
+                order_params.market_index,
+                order_params.market_type,
             )],
         );
         if let Err(err) = accounts {
@@ -649,7 +655,7 @@ impl ServerParams {
             &user,
             &mut accounts.unwrap(),
             &state,
-            &signed_msg.signed_msg_order_params,
+            &order_params,
         ) {
             Ok(_) => true,
             Err(err) => {
@@ -661,23 +667,20 @@ impl ServerParams {
     /// Simulate the taker placing a perp order via RPC, tries local sim first
     async fn simulate_taker_order_rpc(
         &self,
-        taker_authority: &Pubkey,
-        taker_message: &SignedMsgOrderParamsMessage,
+        taker_subaccount_pubkey: &Pubkey,
+        taker_order_params: &OrderParams,
         slot: Slot,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
         if self.is_rpc_sim_disabled() {
             return Ok(SimulationStatus::Disabled);
         }
 
-        let taker_subaccount_pubkey =
-            Wallet::derive_user_account(taker_authority, taker_message.sub_account_id);
-
         let t0 = SystemTime::now();
 
         let user_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
             self.user_account_fetcher
-                .get_user(&taker_subaccount_pubkey, slot),
+                .get_user(taker_subaccount_pubkey, slot),
         )
         .await;
 
@@ -697,7 +700,7 @@ impl ServerParams {
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
-        if self.simulate_taker_order_local(taker_message, &user) {
+        if self.simulate_taker_order_local(taker_order_params, &user) {
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
             return Ok(SimulationStatus::Success);
         }
@@ -705,12 +708,12 @@ impl ServerParams {
         // fallback to network sim
         let message = TransactionBuilder::new(
             self.drift.program_data(),
-            taker_subaccount_pubkey,
+            *taker_subaccount_pubkey,
             std::borrow::Cow::Owned(user),
             false,
         )
         .with_priority_fee(5_000, Some(1_400_000))
-        .place_orders(vec![taker_message.signed_msg_order_params])
+        .place_orders(vec![*taker_order_params])
         .build();
 
         let simulate_result_with_timeout = tokio::time::timeout(

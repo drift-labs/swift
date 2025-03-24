@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{io::Write, str::FromStr};
 
 use anchor_lang::{
     prelude::borsh::{self},
@@ -7,16 +7,58 @@ use anchor_lang::{
 use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
-use drift_rs::types::{MarketType, SignedMsgOrderParamsMessage};
+use drift_rs::types::{
+    MarketType, OrderParams, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+    SignedMsgTriggerOrderParams,
+};
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use solana_sdk::pubkey::Pubkey;
+use sha2::Digest;
+use solana_sdk::{clock::Slot, pubkey::Pubkey};
 
-#[derive(AnchorDeserialize, AnchorSerialize, Debug, Clone, InitSpace, Copy, Default, PartialEq)]
-pub struct SignedOrderParamsMessageWithPrefix {
-    // 8-byte discriminator manually added in drift client for message parsing
-    discriminator: [u8; 8],
-    pub message: SignedMsgOrderParamsMessage,
+mod discriminators {
+    use std::cell::LazyCell;
+
+    use super::sighash;
+
+    pub const SIGNED_MSG_ORDER_PARAMS_MESSAGE: LazyCell<[u8; 8]> =
+        LazyCell::new(|| sighash("SignedMsgOrderParamsMessage"));
+
+    pub const SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE: LazyCell<[u8; 8]> =
+        LazyCell::new(|| sighash("SignedMsgOrderParamsDelegateMessage"));
+}
+
+#[derive(Clone, Debug, PartialEq, AnchorSerialize, AnchorDeserialize, InitSpace)]
+pub enum SignedMsgType {
+    Authority(SignedMsgOrderParamsMessage),
+    Delegated(SignedMsgOrderParamsDelegateMessage),
+}
+
+impl SignedMsgType {
+    pub fn uuid(&self) -> [u8; 8] {
+        match self {
+            SignedMsgType::Authority(ref x) => x.uuid,
+            SignedMsgType::Delegated(ref x) => x.uuid,
+        }
+    }
+    pub fn slot(&self) -> Slot {
+        match self {
+            SignedMsgType::Authority(ref x) => x.slot,
+            SignedMsgType::Delegated(ref x) => x.slot,
+        }
+    }
+    pub fn order_params(&self) -> &OrderParams {
+        match self {
+            SignedMsgType::Authority(ref x) => &x.signed_msg_order_params,
+            SignedMsgType::Delegated(ref x) => &x.signed_msg_order_params,
+        }
+    }
+    pub fn data(&self) -> Vec<u8> {
+        match self {
+            SignedMsgType::Authority(ref x) => x.try_to_vec().unwrap(),
+            SignedMsgType::Delegated(ref x) => x.try_to_vec().unwrap(),
+        }
+    }
 }
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
@@ -25,8 +67,8 @@ pub struct IncomingSignedMessage {
     pub taker_pubkey: [u8; 32],
     #[serde(deserialize_with = "base64_to_array")]
     pub signature: [u8; 64],
-    #[serde(deserialize_with = "hex_to_borsh_buf")]
-    pub message: BorshBuf<{ SignedMsgOrderParamsMessage::INIT_SPACE + 8 }>,
+    #[serde(deserialize_with = "deser_signed_msg_type")]
+    pub message: SignedMsgType,
     #[serde(deserialize_with = "base58_to_array", default = "default_deserialize")]
     pub signing_authority: [u8; 32],
 }
@@ -47,17 +89,15 @@ impl IncomingSignedMessage {
         // client hex encodes msg before signing so we need to use that as comparison
         let msg_data = self.message.data();
         let mut hex_bytes = vec![0u8; msg_data.len() * 2]; // 2 hex bytes per msg byte
-        let _ = faster_hex::hex_encode(msg_data, &mut hex_bytes).expect("hexified");
+        let _ = faster_hex::hex_encode(&msg_data, &mut hex_bytes).expect("hexified");
 
         pubkey
             .verify(hex_bytes.as_ref(), &signature)
             .context("Signature did not verify")
     }
-    pub fn verify_and_get_signed_message(&self) -> Result<SignedOrderParamsMessageWithPrefix> {
+    pub fn verify_and_get_signed_message(&self) -> Result<SignedMsgType> {
         self.verify_signature()?;
-        self.message
-            .deserialize::<SignedOrderParamsMessageWithPrefix>()
-            .context("invalid SignedMsgOrderParamsMessage")
+        Ok(self.message.clone())
     }
 }
 
@@ -65,7 +105,7 @@ impl IncomingSignedMessage {
 pub struct OrderMetadataAndMessage {
     pub signing_authority: Pubkey,
     pub taker_authority: Pubkey,
-    pub order_message: SignedOrderParamsMessageWithPrefix,
+    pub order_message: SignedMsgType,
     pub order_signature: [u8; 64],
     pub uuid: [u8; 8],
     pub ts: u64,
@@ -98,7 +138,7 @@ impl OrderMetadataAndMessage {
     }
 
     pub fn jsonify(&self) -> serde_json::Value {
-        let taker_order_params = self.order_message.message.signed_msg_order_params;
+        let taker_order_params = self.order_message.order_params();
 
         let mut order_buf = ArrayVec::<u8, { SignedMsgOrderParamsMessage::INIT_SPACE }>::new();
         self.order_message
@@ -248,6 +288,8 @@ impl<'a> WsMessage<'a> {
 /// Fixed size, serialized borsh bytes
 #[derive(Clone, Debug, PartialEq)]
 pub struct BorshBuf<const N: usize> {
+    /// anchor type discriminator
+    discriminator: [u8; 8],
     /// number of bytes written in the buffer
     length: usize,
     /// underlying buffer, it should not be used directly
@@ -263,6 +305,22 @@ impl<const N: usize> BorshBuf<N> {
     pub fn data(&self) -> &[u8] {
         assert!(self.length < N);
         &self.data[..self.length]
+    }
+    pub fn discriminator(&self) -> [u8; 8] {
+        self.discriminator
+    }
+}
+
+impl<const N: usize> AnchorDeserialize for BorshBuf<N> {
+    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let discriminator = borsh::BorshDeserialize::deserialize_reader(reader)?;
+        let length = borsh::BorshDeserialize::deserialize_reader(reader)?;
+        let data = borsh::BorshDeserialize::deserialize_reader(reader)?;
+        Ok(Self {
+            discriminator,
+            length,
+            data,
+        })
     }
 }
 
@@ -299,42 +357,32 @@ where
     Ok(buf)
 }
 
-/// Deserialize base64 str as fixed size byte array with Borsh helpers
-pub fn _base64_to_borsh_buf<'de, D, const N: usize>(
-    deserializer: D,
-) -> Result<BorshBuf<N>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let payload: &str = serde::Deserialize::deserialize(deserializer)?;
-    let mut buf = [0u8; N];
-    let wrote = base64::prelude::BASE64_STANDARD
-        .decode_slice_unchecked(payload, &mut buf)
-        .map_err(serde::de::Error::custom)?;
-
-    Ok(BorshBuf {
-        data: buf,
-        length: wrote,
-    })
-}
-
-/// Deserialize hex str as fixed size byte array with Borsh helpers
-pub fn hex_to_borsh_buf<'de, D, const N: usize>(deserializer: D) -> Result<BorshBuf<N>, D::Error>
+/// Deserialize hex str into fixed size byte array with Borsh helpers
+pub fn deser_signed_msg_type<'de, D>(deserializer: D) -> Result<SignedMsgType, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let payload: &[u8] = serde::Deserialize::deserialize(deserializer)?;
-    let mut buf = [0_u8; N];
     if payload.len() % 2 != 0 {
         return Err(serde::de::Error::custom("Hex string length must be even"));
     }
-    faster_hex::hex_decode(payload, &mut buf[..payload.len() / 2])
-        .map_err(serde::de::Error::custom)?;
 
-    Ok(BorshBuf {
-        data: buf,
-        length: payload.len() / 2,
-    })
+    // decode expecting the largest possible variant
+    let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
+
+    faster_hex::hex_decode(payload, &mut borsh_buf).map_err(serde::de::Error::custom)?;
+
+    // this is basically the same as if we derived AnchorDeserialize on `SignedMsgType` _expect_ it does not
+    // add a u8 to distinguish the enum
+    if borsh_buf[..8] == *self::discriminators::SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE {
+        AnchorDeserialize::try_from_slice(&borsh_buf[8..])
+            .map(SignedMsgType::Delegated)
+            .map_err(serde::de::Error::custom)
+    } else {
+        AnchorDeserialize::try_from_slice(&borsh_buf[8..])
+            .map(SignedMsgType::Authority)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 pub fn deser_market_type<'de, D>(deserializer: D) -> Result<MarketType, D::Error>
@@ -343,6 +391,17 @@ where
 {
     let market_type: &str = serde::Deserialize::deserialize(deserializer)?;
     MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
+}
+
+fn sighash(name: &str) -> [u8; 8] {
+    let preimage = format!("global:{name}");
+    let mut hasher = sha2::Sha256::default();
+    let mut sighash = <[u8; 8]>::default();
+    hasher.write(preimage.as_bytes());
+    let digest = hasher.finalize();
+    sighash.copy_from_slice(&digest.as_slice()[..8]);
+
+    sighash
 }
 
 #[cfg(test)]
@@ -363,7 +422,7 @@ mod tests {
             }"#;
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
-        dbg!(actual.message.data);
+        dbg!(&actual.message);
         assert!(actual.verify_signature().is_ok());
         assert!(actual.signing_authority == [0u8; 32]);
     }
@@ -380,7 +439,7 @@ mod tests {
             }"#;
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
-        dbg!(actual.message.data);
+        dbg!(&actual.message);
         assert!(actual.verify_signature().is_ok());
     }
 
@@ -389,7 +448,7 @@ mod tests {
         let encoded = OrderMetadataAndMessage {
             signing_authority: Pubkey::new_unique(),
             taker_authority: Pubkey::new_unique(),
-            order_message: SignedOrderParamsMessageWithPrefix::default(),
+            order_message: SignedMsgType::Authority(Default::default()),
             order_signature: [1u8; 64],
             ts: 55555,
             uuid: nanoid!(8).as_bytes().try_into().unwrap(),
@@ -426,17 +485,14 @@ mod tests {
             ..Default::default()
         };
 
-        let signed_order_message = SignedOrderParamsMessageWithPrefix {
-            discriminator: [0u8; 8],
-            message: order_params,
-        };
+        let signed_order_message = SignedMsgType::Authority(order_params);
 
         let order_metadata_json = OrderMetadataAndMessage {
             signing_authority,
             taker_authority,
             order_signature,
             uuid: order_params.uuid,
-            order_message: signed_order_message,
+            order_message: signed_order_message.clone(),
             ts: 55555,
         }
         .jsonify();
