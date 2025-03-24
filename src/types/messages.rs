@@ -7,9 +7,11 @@ use anchor_lang::{
 use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
-use drift_rs::types::{
-    MarketType, OrderParams, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
-    SignedMsgTriggerOrderParams,
+use drift_rs::{
+    types::{
+        MarketType, OrderParams, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+    },
+    Wallet,
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
@@ -28,10 +30,20 @@ mod discriminators {
         LazyCell::new(|| sighash("SignedMsgOrderParamsDelegateMessage"));
 }
 
-#[derive(Clone, Debug, PartialEq, AnchorSerialize, AnchorDeserialize, InitSpace)]
+#[derive(Clone, Debug, PartialEq, AnchorSerialize, AnchorDeserialize)]
 pub enum SignedMsgType {
     Authority(SignedMsgOrderParamsMessage),
     Delegated(SignedMsgOrderParamsDelegateMessage),
+}
+
+impl Space for SignedMsgType {
+    const INIT_SPACE: usize = if SignedMsgOrderParamsMessage::INIT_SPACE
+        > SignedMsgOrderParamsDelegateMessage::INIT_SPACE
+    {
+        SignedMsgOrderParamsMessage::INIT_SPACE
+    } else {
+        SignedMsgOrderParamsDelegateMessage::INIT_SPACE
+    };
 }
 
 impl SignedMsgType {
@@ -57,6 +69,15 @@ impl SignedMsgType {
         match self {
             SignedMsgType::Authority(ref x) => x.try_to_vec().unwrap(),
             SignedMsgType::Delegated(ref x) => x.try_to_vec().unwrap(),
+        }
+    }
+
+    pub fn taker_pubkey(&self, taker_authority: &Pubkey) -> Pubkey {
+        match self {
+            SignedMsgType::Authority(ref x) => {
+                Wallet::derive_user_account(taker_authority, x.sub_account_id)
+            }
+            SignedMsgType::Delegated(ref x) => x.taker_pubkey,
         }
     }
 }
@@ -368,7 +389,7 @@ where
     }
 
     // decode expecting the largest possible variant
-    let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
+    let mut borsh_buf = [0u8; SignedMsgType::INIT_SPACE + 8];
 
     faster_hex::hex_decode(payload, &mut borsh_buf).map_err(serde::de::Error::custom)?;
 
@@ -379,6 +400,7 @@ where
             .map(SignedMsgType::Delegated)
             .map_err(serde::de::Error::custom)
     } else {
+        println!("Authority");
         AnchorDeserialize::try_from_slice(&borsh_buf[8..])
             .map(SignedMsgType::Authority)
             .map_err(serde::de::Error::custom)
@@ -397,7 +419,7 @@ fn sighash(name: &str) -> [u8; 8] {
     let preimage = format!("global:{name}");
     let mut hasher = sha2::Sha256::default();
     let mut sighash = <[u8; 8]>::default();
-    hasher.write(preimage.as_bytes());
+    let _ = hasher.write(preimage.as_bytes());
     let digest = hasher.finalize();
     sighash.copy_from_slice(&digest.as_slice()[..8]);
 
