@@ -19,7 +19,7 @@ use drift_rs::{
         errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
         VersionedMessage, VersionedTransaction,
     },
-    Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
+    Context, DriftClient, RpcClient, TransactionBuilder,
 };
 use log::warn;
 use prometheus::Registry;
@@ -128,76 +128,75 @@ pub async fn process_order(
     };
 
     // check the order's slot is reasonable
-    if taker_message.slot() < server_params.slot_subscriber.current_slot() - 500 {
-        log::warn!(
-            target: "server",
-            "{log_prefix}: Order slot too old: {}, current slot: {}",
-            taker_message.slot(),
-            server_params.slot_subscriber.current_slot(),
-        );
-        let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
-                message: err_str,
-                error: Some(err_str.to_string()),
-            }),
-        );
-    }
-
-    // check the order is valid for execution by program
-    let slot = server_params.slot_subscriber.current_slot();
-    let taker_order_params = taker_message.order_params();
-    if let Err(err) = validate_signed_order_params(taker_order_params) {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
-                message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-                error: Some(err.to_string()),
-            }),
-        );
-    }
-    let taker_subaccount_pubkey = taker_message.taker_pubkey.unwrap_or_else(|| {
-        Wallet::derive_user_account(
-            taker_authority,
-            taker_message.sub_account_id.unwrap_or_default(),
-        )
-    });
-    match server_params
-        .simulate_taker_order_rpc(&taker_subaccount_pubkey, &taker_order_params, slot)
-        .await
     {
-        Ok(sim_res) => {
-            server_params
-                .metrics
-                .rpc_simulation_status
-                .with_label_values(&[sim_res.as_str()])
-                .inc();
-        }
-        Err((status, sim_err_str)) => {
-            server_params
-                .metrics
-                .rpc_simulation_status
-                .with_label_values(&["invalid"])
-                .inc();
+        if taker_message.slot() < server_params.slot_subscriber.current_slot() - 500 {
+            log::warn!(
+                target: "server",
+                "{log_prefix}: Order slot too old: {}, current slot: {}",
+                taker_message.slot(),
+                server_params.slot_subscriber.current_slot(),
+            );
+            let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
             return (
-                status,
+                axum::http::StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
-                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-                    error: Some(sim_err_str),
+                    message: err_str,
+                    error: Some(err_str.to_string()),
                 }),
             );
+        }
+
+        // check the order is valid for execution by program
+        let slot = server_params.slot_subscriber.current_slot();
+        let taker_order_params = taker_message.order_params();
+        if let Err(err) = validate_signed_order_params(taker_order_params) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                    error: Some(err.to_string()),
+                }),
+            );
+        }
+        let taker_subaccount_pubkey = taker_message.taker_pubkey(&taker_pubkey);
+        match server_params
+            .simulate_taker_order_rpc(&taker_subaccount_pubkey, &taker_order_params, slot)
+            .await
+        {
+            Ok(sim_res) => {
+                server_params
+                    .metrics
+                    .rpc_simulation_status
+                    .with_label_values(&[sim_res.as_str()])
+                    .inc();
+            }
+            Err((status, sim_err_str)) => {
+                server_params
+                    .metrics
+                    .rpc_simulation_status
+                    .with_label_values(&["invalid"])
+                    .inc();
+                return (
+                    status,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                        error: Some(sim_err_str),
+                    }),
+                );
+            }
         }
     }
 
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority: taker_pubkey,
-        order_message: taker_message,
+        order_message: taker_message.clone(),
         order_signature: taker_signature,
         ts: process_order_time,
         uuid: taker_message.uuid(),
     };
+    let taker_order_params = taker_message.order_params();
+
     let encoded = order_metadata.encode();
     log::trace!(target: "server", "base64 encoded message: {encoded:?}");
 
@@ -217,7 +216,6 @@ pub async fn process_order(
         {
             Ok(_) => {
                 log::trace!(target: "kafka", "{log_prefix}: Sent message for order: {order_metadata:?}");
-                server_params.metrics.current_slot_gauge.add(slot as f64);
                 server_params
                     .metrics
                     .order_type_counter
@@ -256,7 +254,6 @@ pub async fn process_order(
         match conn.publish::<String, String, i64>(topic, encoded).await {
             Ok(_) => {
                 log::trace!(target: "redis", "{log_prefix}: Sent redis message for order: {order_metadata:?}");
-                server_params.metrics.current_slot_gauge.add(slot as f64);
                 server_params
                     .metrics
                     .order_type_counter
