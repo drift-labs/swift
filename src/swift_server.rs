@@ -104,14 +104,14 @@ pub async fn process_order(
         signing_authority,
     } = incoming_message;
 
-    let taker_pubkey = Pubkey::new_from_array(taker_pubkey);
+    let taker_authority = Pubkey::new_from_array(taker_pubkey);
     let signing_pubkey = if signing_authority == [0u8; 32] {
-        taker_pubkey
+        taker_authority
     } else {
         Pubkey::new_from_array(signing_authority)
     };
 
-    let log_prefix = format!("[process_order {taker_pubkey}: {process_order_time}]");
+    let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
 
     let signed_msg = match incoming_message.verify_and_get_signed_message() {
         Ok(m) => m,
@@ -189,7 +189,7 @@ pub async fn process_order(
 
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
-        taker_authority: taker_pubkey,
+        taker_authority,
         order_message: signed_msg.clone(),
         order_signature: taker_signature,
         ts: process_order_time,
