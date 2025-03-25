@@ -17,9 +17,9 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     types::{
         errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
-        SignedMsgOrderParamsMessage, VersionedMessage, VersionedTransaction,
+        VersionedMessage, VersionedTransaction,
     },
-    Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
+    Context, DriftClient, RpcClient, TransactionBuilder,
 };
 use log::warn;
 use prometheus::Registry;
@@ -45,7 +45,7 @@ use crate::{
     types::{
         messages::{
             IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            SignedMessageInfo, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
@@ -113,8 +113,8 @@ pub async fn process_order(
 
     let log_prefix = format!("[process_order {taker_pubkey}: {process_order_time}]");
 
-    let taker_message_and_prefix = match incoming_message.verify_and_get_signed_message() {
-        Ok(taker_message_and_prefix) => taker_message_and_prefix,
+    let signed_msg = match incoming_message.verify_and_get_signed_message() {
+        Ok(m) => m,
         Err(e) => {
             log::error!("{log_prefix}: Error verifying signed message: {e:?}",);
             return (
@@ -126,15 +126,19 @@ pub async fn process_order(
             );
         }
     };
-    let taker_message = taker_message_and_prefix.message;
+    let SignedMessageInfo {
+        slot: taker_slot,
+        taker_pubkey,
+        uuid,
+        order_params,
+    } = signed_msg.info(&signing_pubkey);
 
     // check the order's slot is reasonable
-    if taker_message.slot < server_params.slot_subscriber.current_slot() - 500 {
+    let current_slot = server_params.slot_subscriber.current_slot();
+    if taker_slot < current_slot - 500 {
         log::warn!(
             target: "server",
-            "{log_prefix}: Order slot too old: {}, current slot: {}",
-            taker_message.slot,
-            server_params.slot_subscriber.current_slot(),
+            "{log_prefix}: Order slot too old: {taker_slot}, current slot: {current_slot}",
         );
         let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
         return (
@@ -147,8 +151,7 @@ pub async fn process_order(
     }
 
     // check the order is valid for execution by program
-    let slot = server_params.slot_subscriber.current_slot();
-    if let Err(err) = validate_signed_order_params(&taker_message.signed_msg_order_params) {
+    if let Err(err) = validate_signed_order_params(&order_params) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -158,7 +161,7 @@ pub async fn process_order(
         );
     }
     match server_params
-        .simulate_taker_order_rpc(&taker_pubkey, &taker_message, slot)
+        .simulate_taker_order_rpc(&taker_pubkey, &order_params, current_slot)
         .await
     {
         Ok(sim_res) => {
@@ -187,16 +190,16 @@ pub async fn process_order(
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority: taker_pubkey,
-        order_message: taker_message_and_prefix,
+        order_message: signed_msg.clone(),
         order_signature: taker_signature,
         ts: process_order_time,
-        uuid: taker_message.uuid,
+        uuid,
     };
     let encoded = order_metadata.encode();
     log::trace!(target: "server", "base64 encoded message: {encoded:?}");
 
-    let market_index = taker_message.signed_msg_order_params.market_index;
-    let market_type = taker_message.signed_msg_order_params.market_type;
+    let market_index = order_params.market_index;
+    let market_type = order_params.market_type;
 
     let topic = format!("swift_orders_{}_{market_index}", market_type.as_str());
     log::trace!(target: "server", "{log_prefix}: Topic: {topic}");
@@ -211,7 +214,10 @@ pub async fn process_order(
         {
             Ok(_) => {
                 log::trace!(target: "kafka", "{log_prefix}: Sent message for order: {order_metadata:?}");
-                server_params.metrics.current_slot_gauge.add(slot as f64);
+                server_params
+                    .metrics
+                    .current_slot_gauge
+                    .add(current_slot as f64);
                 server_params
                     .metrics
                     .order_type_counter
@@ -250,7 +256,10 @@ pub async fn process_order(
         match conn.publish::<String, String, i64>(topic, encoded).await {
             Ok(_) => {
                 log::trace!(target: "redis", "{log_prefix}: Sent redis message for order: {order_metadata:?}");
-                server_params.metrics.current_slot_gauge.add(slot as f64);
+                server_params
+                    .metrics
+                    .current_slot_gauge
+                    .add(current_slot as f64);
                 server_params
                     .metrics
                     .order_type_counter
@@ -620,7 +629,7 @@ impl ServerParams {
     }
     fn simulate_taker_order_local(
         &self,
-        signed_msg: &SignedMsgOrderParamsMessage,
+        order_params: &OrderParams,
         user: &drift_rs::types::accounts::User,
     ) -> bool {
         let state = match self.drift.state_account() {
@@ -633,10 +642,10 @@ impl ServerParams {
         let mut accounts_builder = AccountsListBuilder::default();
         let accounts = accounts_builder.try_build(
             &self.drift,
-            &user,
+            user,
             &[MarketId::new(
-                signed_msg.signed_msg_order_params.market_index,
-                signed_msg.signed_msg_order_params.market_type,
+                order_params.market_index,
+                order_params.market_type,
             )],
         );
         if let Err(err) = accounts {
@@ -646,10 +655,10 @@ impl ServerParams {
 
         // simulation executed with error status
         match drift_rs::ffi::simulate_place_perp_order(
-            &user,
+            user,
             &mut accounts.unwrap(),
             &state,
-            &signed_msg.signed_msg_order_params,
+            order_params,
         ) {
             Ok(_) => true,
             Err(err) => {
@@ -661,23 +670,20 @@ impl ServerParams {
     /// Simulate the taker placing a perp order via RPC, tries local sim first
     async fn simulate_taker_order_rpc(
         &self,
-        taker_authority: &Pubkey,
-        taker_message: &SignedMsgOrderParamsMessage,
+        taker_subaccount_pubkey: &Pubkey,
+        taker_order_params: &OrderParams,
         slot: Slot,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
         if self.is_rpc_sim_disabled() {
             return Ok(SimulationStatus::Disabled);
         }
 
-        let taker_subaccount_pubkey =
-            Wallet::derive_user_account(taker_authority, taker_message.sub_account_id);
-
         let t0 = SystemTime::now();
 
         let user_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
             self.user_account_fetcher
-                .get_user(&taker_subaccount_pubkey, slot),
+                .get_user(taker_subaccount_pubkey, slot),
         )
         .await;
 
@@ -697,7 +703,7 @@ impl ServerParams {
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
-        if self.simulate_taker_order_local(taker_message, &user) {
+        if self.simulate_taker_order_local(taker_order_params, &user) {
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
             return Ok(SimulationStatus::Success);
         }
@@ -705,12 +711,12 @@ impl ServerParams {
         // fallback to network sim
         let message = TransactionBuilder::new(
             self.drift.program_data(),
-            taker_subaccount_pubkey,
+            *taker_subaccount_pubkey,
             std::borrow::Cow::Owned(user),
             false,
         )
         .with_priority_fee(5_000, Some(1_400_000))
-        .place_orders(vec![taker_message.signed_msg_order_params])
+        .place_orders(vec![*taker_order_params])
         .build();
 
         let simulate_result_with_timeout = tokio::time::timeout(
@@ -739,31 +745,25 @@ impl ServerParams {
                         kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
                     });
                     match err.to_anchor_error_code() {
-                        Some(code) => {
-                            return Err((
-                                axum::http::StatusCode::BAD_REQUEST,
-                                format!("invalid order. error code: {code:?}"),
-                            ));
-                        }
-                        None => {
-                            return Err((
-                                axum::http::StatusCode::BAD_REQUEST,
-                                format!("invalid order: {simulate_err:?}"),
-                            ));
-                        }
+                        Some(code) => Err((
+                            axum::http::StatusCode::BAD_REQUEST,
+                            format!("invalid order. error code: {code:?}"),
+                        )),
+                        None => Err((
+                            axum::http::StatusCode::BAD_REQUEST,
+                            format!("invalid order: {simulate_err:?}"),
+                        )),
                     }
                 } else {
                     log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
-                    return Ok(SimulationStatus::SuccessRpc);
+                    Ok(SimulationStatus::SuccessRpc)
                 }
             }
             Ok(Err(err)) => {
                 log::warn!(target: "sim", "network sim error: {err:?}");
-                return Ok(SimulationStatus::Degraded);
+                Ok(SimulationStatus::Degraded)
             }
-            Err(_) => {
-                return Ok(SimulationStatus::Timeout);
-            }
+            Err(_) => Ok(SimulationStatus::Timeout),
         }
     }
 }
