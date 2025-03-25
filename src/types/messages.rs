@@ -1,4 +1,4 @@
-use std::{io::Write, str::FromStr};
+use std::str::FromStr;
 
 use anchor_lang::{
     prelude::borsh::{self},
@@ -7,9 +7,11 @@ use anchor_lang::{
 use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
-use drift_rs::types::{
-    MarketType, OrderParams, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
-    SignedMsgTriggerOrderParams,
+use drift_rs::{
+    types::{
+        MarketType, OrderParams, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+    },
+    Wallet,
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
@@ -28,6 +30,8 @@ mod discriminators {
         LazyCell::new(|| sighash("SignedMsgOrderParamsDelegateMessage"));
 }
 
+// TODO: switch to use bytemuck
+/// Wrapper for SignedMsg types
 #[derive(Clone, Debug, PartialEq, AnchorSerialize, AnchorDeserialize, InitSpace)]
 pub enum SignedMsgType {
     Authority(SignedMsgOrderParamsMessage),
@@ -35,30 +39,51 @@ pub enum SignedMsgType {
 }
 
 impl SignedMsgType {
-    pub fn uuid(&self) -> [u8; 8] {
+    /// Get common info fields of the signed msg
+    pub fn info(&self, taker_authority: &Pubkey) -> SignedMessageInfo {
         match self {
-            SignedMsgType::Authority(ref x) => x.uuid,
-            SignedMsgType::Delegated(ref x) => x.uuid,
+            SignedMsgType::Authority(x) => SignedMessageInfo {
+                taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            },
+            SignedMsgType::Delegated(x) => SignedMessageInfo {
+                taker_pubkey: x.taker_pubkey,
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            },
         }
     }
-    pub fn slot(&self) -> Slot {
+    /// Serialize as a borsh buffer
+    pub fn to_borsh(&self) -> ArrayVec<u8, { SignedMsgType::INIT_SPACE + 8 }> {
+        let mut buf = ArrayVec::new();
         match self {
-            SignedMsgType::Authority(ref x) => x.slot,
-            SignedMsgType::Delegated(ref x) => x.slot,
+            SignedMsgType::Authority(ref x) => {
+                (*self::discriminators::SIGNED_MSG_ORDER_PARAMS_MESSAGE)
+                    .serialize(&mut buf)
+                    .unwrap();
+                x.serialize(&mut buf).unwrap();
+            }
+            SignedMsgType::Delegated(ref x) => {
+                (*self::discriminators::SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE)
+                    .serialize(&mut buf)
+                    .unwrap();
+                x.serialize(&mut buf).unwrap();
+            }
         }
+
+        buf
     }
-    pub fn order_params(&self) -> &OrderParams {
-        match self {
-            SignedMsgType::Authority(ref x) => &x.signed_msg_order_params,
-            SignedMsgType::Delegated(ref x) => &x.signed_msg_order_params,
-        }
-    }
-    pub fn data(&self) -> Vec<u8> {
-        match self {
-            SignedMsgType::Authority(ref x) => x.try_to_vec().unwrap(),
-            SignedMsgType::Delegated(ref x) => x.try_to_vec().unwrap(),
-        }
-    }
+}
+
+/// Common fields of signed message types
+pub struct SignedMessageInfo {
+    pub taker_pubkey: Pubkey,
+    pub order_params: OrderParams,
+    pub uuid: [u8; 8],
+    pub slot: Slot,
 }
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
@@ -74,7 +99,7 @@ pub struct IncomingSignedMessage {
 }
 
 impl IncomingSignedMessage {
-    /// Verify taker signature against sha256 digest of `message`
+    /// Verify taker signature against hex encoded `message`
     pub fn verify_signature(&self) -> Result<()> {
         let pubkey = if self.signing_authority != [0u8; 32] {
             PublicKey::from_bytes(self.signing_authority.as_ref())
@@ -86,13 +111,13 @@ impl IncomingSignedMessage {
         let signature =
             Signature::from_bytes(self.signature.as_slice()).context("Invalid signature")?;
 
-        // client hex encodes msg before signing so we need to use that as comparison
-        let msg_data = self.message.data();
-        let mut hex_bytes = vec![0u8; msg_data.len() * 2]; // 2 hex bytes per msg byte
-        let _ = faster_hex::hex_encode(&msg_data, &mut hex_bytes).expect("hexified");
+        // client hex encodes msg before signing so use that as comparison
+        let msg_data = &self.message.to_borsh();
+        let mut hex_bytes = vec![0; msg_data.len() * 2]; // 2 hex bytes per msg byte
+        let _ = faster_hex::hex_encode(msg_data, &mut hex_bytes).expect("hexified");
 
         pubkey
-            .verify(hex_bytes.as_ref(), &signature)
+            .verify(&hex_bytes, &signature)
             .context("Signature did not verify")
     }
     pub fn verify_and_get_signed_message(&self) -> Result<SignedMsgType> {
@@ -138,12 +163,8 @@ impl OrderMetadataAndMessage {
     }
 
     pub fn jsonify(&self) -> serde_json::Value {
-        let taker_order_params = self.order_message.order_params();
-
-        let mut order_buf = ArrayVec::<u8, { SignedMsgOrderParamsMessage::INIT_SPACE }>::new();
-        self.order_message
-            .serialize(&mut order_buf)
-            .expect("serialize SignedOrderParams");
+        let taker_order_params = self.order_message.info(&self.taker_authority).order_params;
+        let signed_msg_borsh = self.order_message.to_borsh();
 
         json!({
             "market_type": match taker_order_params.market_type {
@@ -151,7 +172,7 @@ impl OrderMetadataAndMessage {
                 MarketType::Spot => "spot",
             },
             "market_index": taker_order_params.market_index,
-            "order_message": faster_hex::hex_string(order_buf.as_slice()),
+            "order_message": faster_hex::hex_string(signed_msg_borsh.as_slice()),
             "order_signature": base64::prelude::BASE64_STANDARD.encode(self.order_signature),
             "taker_authority": self.taker_authority.to_string(),
             "signing_authority": self.signing_authority.to_string(),
@@ -285,45 +306,6 @@ impl<'a> WsMessage<'a> {
     }
 }
 
-/// Fixed size, serialized borsh bytes
-#[derive(Clone, Debug, PartialEq)]
-pub struct BorshBuf<const N: usize> {
-    /// anchor type discriminator
-    discriminator: [u8; 8],
-    /// number of bytes written in the buffer
-    length: usize,
-    /// underlying buffer, it should not be used directly
-    data: [u8; N],
-}
-
-impl<const N: usize> BorshBuf<N> {
-    /// Deserialize the buffer as `T`
-    pub fn deserialize<T: anchor_lang::AnchorDeserialize>(&self) -> Result<T, std::io::Error> {
-        T::deserialize(&mut self.data())
-    }
-    /// Return the encoded buffer data
-    pub fn data(&self) -> &[u8] {
-        assert!(self.length < N);
-        &self.data[..self.length]
-    }
-    pub fn discriminator(&self) -> [u8; 8] {
-        self.discriminator
-    }
-}
-
-impl<const N: usize> AnchorDeserialize for BorshBuf<N> {
-    fn deserialize_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let discriminator = borsh::BorshDeserialize::deserialize_reader(reader)?;
-        let length = borsh::BorshDeserialize::deserialize_reader(reader)?;
-        let data = borsh::BorshDeserialize::deserialize_reader(reader)?;
-        Ok(Self {
-            discriminator,
-            length,
-            data,
-        })
-    }
-}
-
 /// Deserialize base58 str as fixed size byte array
 pub fn base58_to_array<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
 where
@@ -370,16 +352,17 @@ where
     // decode expecting the largest possible variant
     let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
 
-    faster_hex::hex_decode(payload, &mut borsh_buf).map_err(serde::de::Error::custom)?;
+    faster_hex::hex_decode(payload, &mut borsh_buf[..payload.len() / 2])
+        .map_err(serde::de::Error::custom)?;
 
     // this is basically the same as if we derived AnchorDeserialize on `SignedMsgType` _expect_ it does not
     // add a u8 to distinguish the enum
     if borsh_buf[..8] == *self::discriminators::SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE {
-        AnchorDeserialize::try_from_slice(&borsh_buf[8..])
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
             .map(SignedMsgType::Delegated)
             .map_err(serde::de::Error::custom)
     } else {
-        AnchorDeserialize::try_from_slice(&borsh_buf[8..])
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
             .map(SignedMsgType::Authority)
             .map_err(serde::de::Error::custom)
     }
@@ -396,17 +379,19 @@ where
 fn sighash(name: &str) -> [u8; 8] {
     let preimage = format!("global:{name}");
     let mut hasher = sha2::Sha256::default();
-    let mut sighash = <[u8; 8]>::default();
-    hasher.write(preimage.as_bytes());
+    hasher.update(preimage.as_bytes());
     let digest = hasher.finalize();
-    sighash.copy_from_slice(&digest.as_slice()[..8]);
 
-    sighash
+    let mut buf = [0_u8; 8];
+    buf.copy_from_slice(&digest.as_slice()[..8]);
+    buf
 }
 
 #[cfg(test)]
 mod tests {
-    use drift_rs::types::{OrderParams, OrderType};
+    use drift_rs::types::{
+        OrderParams, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
+    };
     use nanoid::nanoid;
 
     use super::*;
@@ -414,15 +399,14 @@ mod tests {
     #[test]
     fn deserialize_incoming_signed_message() {
         let message = r#"{
-            "market_index":6,
-            "market_type":"perp",
-            "message": "39656134656332650001010000f2052a01000000000000000000000006000000000000000001c8016fe90b0000000000013ecb0b0000000000000085d02c150000000034525a62354259710000",
-            "signature": "z2fOUSo9R4+zYWLXO+JgQL1XLlEmzKOGkgFVwsGs8sEI42mbe1U8saBv2jsUazuHB5ENe/maGLl50YyUzNDMBA==",
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001000080841e00000000000000000000000000020000000000000000013201abe72e7c000000000162d06c7d00000000000066190816000000005a645349472d634c0000",
+            "signature": "LiwPgg6VXxOWfCI/PGQpv2c2PqDs11zgSrqDCOvHq1S0yvE0KZeQa84u7Pb0tanN2KO4Ac8laT7odaAyWxRDBA==",
             "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
-            }"#;
+        }"#;
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
-        dbg!(&actual.message);
         assert!(actual.verify_signature().is_ok());
         assert!(actual.signing_authority == [0u8; 32]);
     }
@@ -430,17 +414,49 @@ mod tests {
     #[test]
     fn deserialize_incoming_signed_message_with_signing_authority() {
         let message = r#"{
-            "market_index":6,
-            "market_type":"perp",
-            "message": "39656134656332650001010000f2052a01000000000000000000000006000000000000000001c8016fe90b0000000000013ecb0b0000000000000085d02c150000000034525a62354259710000",
-            "signature": "z2fOUSo9R4+zYWLXO+JgQL1XLlEmzKOGkgFVwsGs8sEI42mbe1U8saBv2jsUazuHB5ENe/maGLl50YyUzNDMBA==",
-            "taker_pubkey": "8YLKoCu7NwqHNS8GzuvA2ibsvLrsg22YMfMDafxh1B15",
-            "signing_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
-            }"#;
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001010080841e00000000000000000000000000020000000000000000013201bb60507d000000000117c0127c000000000000272108160000000073386c754a4c5a650000",
+            "signature": "H8HRloc2vBdhHyiNK5W/Shv3kVKmIYsHTBzlD2ecyxyOUh7EuysU/Y5AOXZ3IpsMxRyLn6OSAHKEgCIQX4OpDQ==",
+            "signing_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE",
+            "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+        }"#;
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
         dbg!(&actual.message);
         assert!(actual.verify_signature().is_ok());
+
+        if let SignedMsgType::Authority(signed_msg) = actual.message {
+            let expected = SignedMsgOrderParamsMessage {
+                signed_msg_order_params: OrderParams {
+                    order_type: OrderType::Market,
+                    market_type: MarketType::Perp,
+                    direction: PositionDirection::Short,
+                    user_order_id: 0,
+                    base_asset_amount: 2000000,
+                    price: 0,
+                    market_index: 2,
+                    reduce_only: false,
+                    post_only: PostOnlyParam::None,
+                    immediate_or_cancel: false,
+                    max_ts: None,
+                    trigger_price: None,
+                    trigger_condition: OrderTriggerCondition::Above,
+                    oracle_price_offset: None,
+                    auction_duration: Some(50),
+                    auction_start_price: Some(2102419643),
+                    auction_end_price: Some(2081603607),
+                },
+                sub_account_id: 0,
+                slot: 369631527,
+                uuid: [115, 56, 108, 117, 74, 76, 90, 101],
+                take_profit_order_params: None,
+                stop_loss_order_params: None,
+            };
+            assert_eq!(signed_msg, expected);
+        } else {
+            assert!(false, "unexpected variant");
+        }
     }
 
     #[test]
@@ -512,7 +528,7 @@ mod tests {
 
         assert_eq!(
             order_metadata_json["order_message"],
-            faster_hex::hex_string(signed_order_message.try_to_vec().unwrap().as_slice()),
+            faster_hex::hex_string(signed_order_message.to_borsh().as_slice()),
         );
 
         assert_eq!(order_metadata_json["ts"], 55555);
