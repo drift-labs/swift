@@ -56,6 +56,7 @@ impl SignedMsgType {
         }
     }
     /// Serialize as a borsh buffer
+    /// This differs from AnchorSerialize as it does _not_ encode the enum byte
     pub fn to_borsh(&self) -> ArrayVec<u8, { SignedMsgType::INIT_SPACE + 8 }> {
         let mut buf = ArrayVec::new();
         match self {
@@ -389,6 +390,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deserialize_incoming_signed_message_delegated() {
+        let message = r#"{
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "42656638c7259e230001010080841e00000000000000000000000000020000000000000000013201bb60507d000000000117c0127c00000000395311d51c1b87fd56c3b5872d1041111e51f399b12d291d981a0ea383407295272108160000000073386c754a4c5a650000",
+            "signature": "9G8luwFfeAc25HwXCgaUjrKv6yJHcMFDq4Z4uPXqom5mhwZ63YU5g7p07Kxe/AKSt5A/9OPDh3nN/c9IHjkCDA==",
+            "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE",
+            "signing_authority": "GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf"
+        }"#;
+
+        let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
+        assert!(actual.verify_signature().is_ok());
+        assert!(
+            actual.signing_authority
+                == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf").to_bytes()
+        );
+        if let SignedMsgType::Delegated(signed_msg) = actual.message {
+            let expected = SignedMsgOrderParamsDelegateMessage {
+                signed_msg_order_params: OrderParams {
+                    order_type: OrderType::Market,
+                    market_type: MarketType::Perp,
+                    direction: PositionDirection::Short,
+                    user_order_id: 0,
+                    base_asset_amount: 2000000,
+                    price: 0,
+                    market_index: 2,
+                    reduce_only: false,
+                    post_only: PostOnlyParam::None,
+                    immediate_or_cancel: false,
+                    max_ts: None,
+                    trigger_price: None,
+                    trigger_condition: OrderTriggerCondition::Above,
+                    oracle_price_offset: None,
+                    auction_duration: Some(50),
+                    auction_start_price: Some(2102419643),
+                    auction_end_price: Some(2081603607),
+                },
+                taker_pubkey: solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"),
+                slot: 369631527,
+                uuid: [115, 56, 108, 117, 74, 76, 90, 101],
+                take_profit_order_params: None,
+                stop_loss_order_params: None,
+            };
+            assert_eq!(signed_msg, expected);
+        } else {
+            assert!(false, "unexpected variant");
+        }
+    }
+
+    #[test]
     fn deserialize_incoming_signed_message() {
         let message = r#"{
             "market_index": 2,
@@ -417,6 +468,10 @@ mod tests {
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
         dbg!(&actual.message);
         assert!(actual.verify_signature().is_ok());
+        assert!(
+            actual.signing_authority
+                == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE").to_bytes()
+        );
 
         if let SignedMsgType::Authority(signed_msg) = actual.message {
             let expected = SignedMsgOrderParamsMessage {
