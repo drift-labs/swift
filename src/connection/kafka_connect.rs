@@ -32,11 +32,11 @@ async fn _assume_role(config: &SdkConfig, role_name: String, session_name: Optio
     let resp = req.send().await;
     match resp {
         Ok(e) => {
-            println!("UserID :               {}", e.user_id().unwrap_or_default());
-            println!("Account:               {}", e.account().unwrap_or_default());
-            println!("Arn    :               {}", e.arn().unwrap_or_default());
+            log::info!(target: "kafka", "UserID :               {}", e.user_id().unwrap_or_default());
+            log::info!(target: "kafka", "Account:               {}", e.account().unwrap_or_default());
+            log::info!(target: "kafka", "Arn    :               {}", e.arn().unwrap_or_default());
         }
-        Err(e) => println!("{:?}", e),
+        Err(e) => log::error!(target: "kafka", "{e:?}"),
     }
 }
 
