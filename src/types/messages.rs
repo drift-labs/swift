@@ -15,7 +15,6 @@ use drift_rs::{
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use sha2::Digest;
 use solana_sdk::{clock::Slot, pubkey::Pubkey};
 
 mod discriminators {
@@ -94,7 +93,7 @@ pub struct IncomingSignedMessage {
     pub signature: [u8; 64],
     #[serde(deserialize_with = "deser_signed_msg_type")]
     pub message: SignedMsgType,
-    #[serde(deserialize_with = "base58_to_array", default = "default_deserialize")]
+    #[serde(deserialize_with = "base58_to_array", default = "Default::default")]
     pub signing_authority: [u8; 32],
 }
 
@@ -120,9 +119,9 @@ impl IncomingSignedMessage {
             .verify(&hex_bytes, &signature)
             .context("Signature did not verify")
     }
-    pub fn verify_and_get_signed_message(&self) -> Result<SignedMsgType> {
+    pub fn verify_and_get_signed_message(&self) -> Result<&SignedMsgType> {
         self.verify_signature()?;
-        Ok(self.message.clone())
+        Ok(&self.message)
     }
 }
 
@@ -214,7 +213,7 @@ pub struct WsSubscribeMessage {
 
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct WsAuthMessage {
-    #[serde(deserialize_with = "base58_to_array", default = "default_deserialize")]
+    #[serde(deserialize_with = "base58_to_array", default = "Default::default")]
     pub stake_pubkey: [u8; 32],
     #[serde(deserialize_with = "base58_to_array")]
     pub pubkey: [u8; 32],
@@ -320,11 +319,6 @@ where
     Ok(buf)
 }
 
-/// Deserialize base58 str as fixed size byte array
-pub fn default_deserialize() -> [u8; 32] {
-    [0u8; 32]
-}
-
 /// Deserialize base64 str as fixed size byte array
 pub fn base64_to_array<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
 where
@@ -376,15 +370,13 @@ where
     MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
 }
 
+/// Calculate anchor type sighash
 fn sighash(name: &str) -> [u8; 8] {
     let preimage = format!("global:{name}");
-    let mut hasher = sha2::Sha256::default();
-    hasher.update(preimage.as_bytes());
-    let digest = hasher.finalize();
-
-    let mut buf = [0_u8; 8];
-    buf.copy_from_slice(&digest.as_slice()[..8]);
-    buf
+    let mut hasher = anchor_lang::solana_program::hash::Hasher::default();
+    hasher.hash(preimage.as_bytes());
+    let digest = hasher.result().to_bytes();
+    digest[..8].try_into().unwrap()
 }
 
 #[cfg(test)]

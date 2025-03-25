@@ -127,19 +127,18 @@ pub async fn process_order(
         }
     };
     let SignedMessageInfo {
-        slot,
+        slot: taker_slot,
         taker_pubkey,
         uuid,
         order_params,
     } = signed_msg.info(&signing_pubkey);
 
     // check the order's slot is reasonable
-    if slot < server_params.slot_subscriber.current_slot() - 500 {
+    let current_slot = server_params.slot_subscriber.current_slot();
+    if taker_slot < current_slot - 500 {
         log::warn!(
             target: "server",
-            "{log_prefix}: Order slot too old: {}, current slot: {}",
-            slot,
-            server_params.slot_subscriber.current_slot(),
+            "{log_prefix}: Order slot too old: {taker_slot}, current slot: {current_slot}",
         );
         let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
         return (
@@ -152,7 +151,6 @@ pub async fn process_order(
     }
 
     // check the order is valid for execution by program
-    let slot = server_params.slot_subscriber.current_slot();
     if let Err(err) = validate_signed_order_params(&order_params) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -163,7 +161,7 @@ pub async fn process_order(
         );
     }
     match server_params
-        .simulate_taker_order_rpc(&taker_pubkey, &order_params, slot)
+        .simulate_taker_order_rpc(&taker_pubkey, &order_params, current_slot)
         .await
     {
         Ok(sim_res) => {
@@ -192,7 +190,7 @@ pub async fn process_order(
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority: taker_pubkey,
-        order_message: signed_msg,
+        order_message: signed_msg.clone(),
         order_signature: taker_signature,
         ts: process_order_time,
         uuid,
@@ -216,7 +214,10 @@ pub async fn process_order(
         {
             Ok(_) => {
                 log::trace!(target: "kafka", "{log_prefix}: Sent message for order: {order_metadata:?}");
-                server_params.metrics.current_slot_gauge.add(slot as f64);
+                server_params
+                    .metrics
+                    .current_slot_gauge
+                    .add(current_slot as f64);
                 server_params
                     .metrics
                     .order_type_counter
@@ -255,7 +256,10 @@ pub async fn process_order(
         match conn.publish::<String, String, i64>(topic, encoded).await {
             Ok(_) => {
                 log::trace!(target: "redis", "{log_prefix}: Sent redis message for order: {order_metadata:?}");
-                server_params.metrics.current_slot_gauge.add(slot as f64);
+                server_params
+                    .metrics
+                    .current_slot_gauge
+                    .add(current_slot as f64);
                 server_params
                     .metrics
                     .order_type_counter
