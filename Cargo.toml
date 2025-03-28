@@ -24,7 +24,7 @@ base64 = "0.22.1"
 clap = { version = "4.0", features = ["derive"] }
 dashmap = "6.1.0"
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs.git" , tag = "v1.0.0-alpha.12" }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs.git" , rev = "da645a53" }
 ed25519-dalek = "1.0.1"
 env_logger = "0.11"
 faster-hex = "0.10.0"
