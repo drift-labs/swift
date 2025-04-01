@@ -15,9 +15,11 @@ use dotenv::dotenv;
 use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
+    priority_fee_subscriber::{PriorityFeeSubscriber, PriorityFeeSubscriberConfig},
+    swift_order_subscriber::SignedOrderInfo,
     types::{
-        errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
-        VersionedMessage, VersionedTransaction,
+        accounts::User, errors::ErrorCode, CommitmentConfig, MarketId, MarketType, OrderParams,
+        OrderType, SdkError, VersionedMessage, VersionedTransaction,
     },
     Context, DriftClient, RpcClient, TransactionBuilder,
 };
@@ -49,7 +51,7 @@ use crate::{
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
-            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+            PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
         },
         types::unix_now_ms,
     },
@@ -83,6 +85,7 @@ pub struct ServerParams {
     metrics: SwiftServerMetrics,
     redis_pool: Option<MultiplexedConnection>,
     user_account_fetcher: UserAccountFetcher,
+    priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     config: Arc<Config>,
 }
 
@@ -160,7 +163,8 @@ pub async fn process_order(
             }),
         );
     }
-    match server_params
+
+    let user: Option<User> = match server_params
         .simulate_taker_order_rpc(&taker_pubkey, &order_params, current_slot)
         .await
     {
@@ -168,8 +172,9 @@ pub async fn process_order(
             server_params
                 .metrics
                 .rpc_simulation_status
-                .with_label_values(&[sim_res.as_str()])
+                .with_label_values(&[sim_res.status.as_str()])
                 .inc();
+            sim_res.user
         }
         Err((status, sim_err_str)) => {
             server_params
@@ -185,6 +190,54 @@ pub async fn process_order(
                 }),
             );
         }
+    };
+
+    if user.is_none() {
+        log::warn!(
+            target: "server",
+            "{log_prefix}: Error simulating order, user not found"
+        );
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND,
+                error: Some("user not found".to_string()),
+            }),
+        );
+    }
+
+    // If fat fingered order that requires sanitization, then just send the order
+    let mut order_params = order_params.clone();
+    if server_params
+        .simulate_will_auction_params_sanitize(&mut order_params)
+        .await
+    {
+        /// TODO: clean this up. surely there's a better way to do this
+        let signature = Signature::from(taker_signature);
+        let signed_order_info = SignedOrderInfo::new(
+            String::from_utf8(uuid.to_vec()).unwrap(),
+            unix_now_ms(),
+            taker_authority,
+            signing_pubkey,
+            order_params.clone(),
+            signature,
+        );
+
+        TransactionBuilder::place_swift_order(self, &signed_order_info, &user.unwrap())
+            .with_priority_fee(
+                server_params
+                    .priority_fee_subscriber
+                    .get_priority_fee(order_params.market_index)
+                    .await,
+                Some(1_400_000),
+            );
+        return (
+            axum::http::StatusCode::OK,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                error: None,
+            }),
+        );
     }
 
     let order_metadata = OrderMetadataAndMessage {
@@ -446,6 +499,21 @@ pub async fn start_server() {
     let mut slot_subscriber = SuperSlotSubscriber::new(ws_clients, client.rpc());
     slot_subscriber.subscribe();
 
+    let pubkeys: Vec<Pubkey> = client
+        .program_data()
+        .perp_market_configs()
+        .iter()
+        .map(|config| config.pubkey)
+        .collect();
+    let priority_fee_subscriber = PriorityFeeSubscriber::with_config(
+        RpcClient::new_with_commitment(rpc_endpoint.into(), CommitmentConfig::confirmed()),
+        &pubkeys[..],
+        PriorityFeeSubscriberConfig {
+            refresh_frequency: Some(Duration::from_millis(400 * 10)),
+            window: None,
+        },
+    );
+
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::new(slot_subscriber),
@@ -453,6 +521,7 @@ pub async fn start_server() {
         metrics,
         redis_pool,
         user_account_fetcher,
+        priority_fee_subscriber: Arc::new(priority_fee_subscriber),
         config: Arc::new(Config::from_env()),
     }));
 
@@ -614,6 +683,12 @@ impl SimulationStatus {
     }
 }
 
+// Can we get compute units from local sim?
+pub struct SimulationResult {
+    pub status: SimulationStatus,
+    pub user: Option<drift_rs::types::accounts::User>,
+}
+
 impl ServerParams {
     /// Toggle RPC simulation off
     pub fn disable_rpc_sim(&self) {
@@ -660,7 +735,7 @@ impl ServerParams {
             &state,
             order_params,
         ) {
-            Ok(_) => true,
+            Ok() => true,
             Err(err) => {
                 log::debug!(target: "sim", "local sim failed: {err:?}");
                 false
@@ -673,9 +748,14 @@ impl ServerParams {
         taker_subaccount_pubkey: &Pubkey,
         taker_order_params: &OrderParams,
         slot: Slot,
-    ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
+    ) -> Result<SimulationResult, (axum::http::StatusCode, String)> {
+        let mut sim_result = SimulationResult {
+            status: SimulationStatus::Disabled,
+            user: None,
+        };
+
         if self.is_rpc_sim_disabled() {
-            return Ok(SimulationStatus::Disabled);
+            return Ok(sim_result);
         }
 
         let t0 = SystemTime::now();
@@ -688,8 +768,9 @@ impl ServerParams {
         .await;
 
         if user_with_timeout.is_err() {
+            sim_result.status = SimulationStatus::Timeout;
             warn!(target: "sim", "simulateTransaction degraded (timeout)");
-            return Ok(SimulationStatus::Timeout);
+            return Ok(sim_result);
         }
 
         let user_result = user_with_timeout.unwrap();
@@ -700,12 +781,15 @@ impl ServerParams {
             )
         })?;
 
+        sim_result.user = Some(user);
+
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
         if self.simulate_taker_order_local(taker_order_params, &user) {
+            sim_result.status = SimulationStatus::Success;
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
-            return Ok(SimulationStatus::Success);
+            return Ok(sim_result);
         }
 
         // fallback to network sim
@@ -756,14 +840,55 @@ impl ServerParams {
                     }
                 } else {
                     log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
-                    Ok(SimulationStatus::SuccessRpc)
+                    sim_result.status = SimulationStatus::SuccessRpc;
+                    Ok(sim_result)
                 }
             }
             Ok(Err(err)) => {
                 log::warn!(target: "sim", "network sim error: {err:?}");
-                Ok(SimulationStatus::Degraded)
+                sim_result.status = SimulationStatus::Degraded;
+                Ok(sim_result)
             }
-            Err(_) => Ok(SimulationStatus::Timeout),
+            Err(_) => {
+                sim_result.status = SimulationStatus::Timeout;
+                Ok(sim_result)
+            }
+        }
+    }
+
+    /// Simulate if auction params will be sanitized
+    async fn simulate_will_auction_params_sanitize(&self, order_params: &mut OrderParams) -> bool {
+        let perp_market = match self
+            .drift
+            .get_perp_market_account(order_params.market_index)
+            .await
+        {
+            Ok(m) => m,
+            Err(err) => {
+                log::debug!(target: "sim", "couldn't get perp market: {err:?}");
+                return false;
+            }
+        };
+
+        let market_id = MarketId::new(order_params.market_index, order_params.market_type);
+        let oracle_data = match self.drift.get_oracle_price_data_and_slot(market_id).await {
+            Ok(p) => p,
+            Err(err) => {
+                log::debug!(target: "sim", "couldn't get oracle price: {err:?}");
+                return false;
+            }
+        };
+
+        match drift_rs::ffi::simulate_will_auction_params_sanitize(
+            order_params,
+            &perp_market,
+            oracle_data.data.price,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                log::debug!(target: "sim", "local sim failed: {err:?}");
+                true
+            }
         }
     }
 }

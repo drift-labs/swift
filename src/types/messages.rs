@@ -195,6 +195,7 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE: &str =
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slot too old";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
+pub const PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND: &str = "User not found";
 
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
