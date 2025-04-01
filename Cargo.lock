@@ -6664,6 +6664,7 @@ dependencies = [
  "solana-rpc-client-api",
  "solana-sdk",
  "strum_macros",
+ "thiserror 2.0.12",
  "tokio",
  "tokio-tungstenite 0.24.0 (git+https://github.com/drift-labs/tokio-tungstenite)",
  "tower-http 0.6.2",

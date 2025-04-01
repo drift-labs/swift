@@ -196,6 +196,7 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slo
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
 pub const PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND: &str = "User not found";
+pub const PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT: &str = "Placing sanitizing tx timeout failed";
 
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]

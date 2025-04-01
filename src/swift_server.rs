@@ -16,6 +16,7 @@ use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     priority_fee_subscriber::{PriorityFeeSubscriber, PriorityFeeSubscriberConfig},
+    swift_order_subscriber::{SignedDelegateOrderInfo, SignedOrderInfo},
     types::{
         accounts::User, errors::ErrorCode, CommitmentConfig, MarketId, MarketType, OrderParams,
         OrderType, SdkError, VersionedMessage, VersionedTransaction,
@@ -47,16 +48,20 @@ use crate::{
     types::{
         messages::{
             IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
-            SignedMessageInfo, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            SignedMessageInfo, SignedMsgType, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
             PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+            PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
         },
         types::unix_now_ms,
     },
     user_account_fetcher::UserAccountFetcher,
-    util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+    util::{
+        metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+        tx::send_tx,
+    },
 };
 
 struct Config {
@@ -205,6 +210,7 @@ pub async fn process_order(
             }),
         );
     }
+    let user = user.unwrap();
 
     // If fat fingered order that requires sanitization, then just send the order
     let mut order_params = order_params.clone();
@@ -212,14 +218,85 @@ pub async fn process_order(
         .simulate_will_auction_params_sanitize(&mut order_params)
         .await
     {
-        /// TODO: Send the transaction here
-        return (
-            axum::http::StatusCode::OK,
-            Json(ProcessOrderResponse {
-                message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                error: None,
-            }),
+        let uuid = String::from_utf8(uuid.to_vec()).expect("invalid utf8 uuid");
+        let tx_builder = TransactionBuilder::new(
+            server_params.drift.program_data(),
+            taker_pubkey,
+            std::borrow::Cow::Owned(user),
+            false,
+        )
+        .with_priority_fee(
+            server_params.priority_fee_subscriber.priority_fee(),
+            Some(1_400_000),
         );
+
+        let versioned_message = match *signed_msg {
+            SignedMsgType::Authority(signed_order) => {
+                let signed_order_info = SignedOrderInfo::new(
+                    uuid,
+                    taker_authority,
+                    signing_pubkey,
+                    signed_order,
+                    Signature::from(taker_signature),
+                );
+                tx_builder
+                    .place_swift_order(&signed_order_info, &user)
+                    .build()
+            }
+            SignedMsgType::Delegated(signed_order) => {
+                let signed_order_info = SignedDelegateOrderInfo::new(
+                    uuid,
+                    taker_authority,
+                    signing_pubkey,
+                    signed_order,
+                    Signature::from(taker_signature),
+                );
+                tx_builder
+                    .place_swift_delegate_order(&signed_order_info, &user)
+                    .build()
+            }
+        };
+
+        let place_tx_with_timeout = tokio::time::timeout(
+            Duration::from_secs(35),
+            send_tx(
+                &server_params.drift,
+                versioned_message,
+                "place swift order",
+                Some(30),
+                log_prefix.clone(),
+            ),
+        )
+        .await;
+
+        match place_tx_with_timeout {
+            Ok(Ok(_)) => {
+                log::trace!(target: "server", "{log_prefix}: Order sent successfully");
+            }
+            Ok(Err(err)) => {
+                log::error!(
+                    target: "server",
+                    "{log_prefix}: Error sending order: {err:?}"
+                );
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some(format!("tx send error: {err:?}")),
+                    }),
+                );
+            }
+            Err(_) => {
+                log::error!(target: "server", "{log_prefix}: Order send timeout");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
+                        error: Some("tx send timeout".to_string()),
+                    }),
+                );
+            }
+        }
     }
 
     let order_metadata = OrderMetadataAndMessage {
@@ -508,7 +585,7 @@ pub async fn start_server() {
         metrics,
         redis_pool,
         user_account_fetcher,
-        priority_fee_subscriber: Arc::new(priority_fee_subscriber),
+        priority_fee_subscriber: priority_fee_subscriber.subscribe(),
         config: Arc::new(Config::from_env()),
     }));
 
@@ -847,8 +924,7 @@ impl ServerParams {
     async fn simulate_will_auction_params_sanitize(&self, order_params: &mut OrderParams) -> bool {
         let perp_market = match self
             .drift
-            .get_perp_market_account(order_params.market_index)
-            .await
+            .try_get_perp_market_account(order_params.market_index)
         {
             Ok(m) => m,
             Err(err) => {
@@ -858,10 +934,10 @@ impl ServerParams {
         };
 
         let market_id = MarketId::new(order_params.market_index, order_params.market_type);
-        let oracle_data = match self.drift.get_oracle_price_data_and_slot(market_id).await {
-            Ok(p) => p,
-            Err(err) => {
-                log::debug!(target: "sim", "couldn't get oracle price: {err:?}");
+        let oracle_data = match self.drift.try_get_oracle_price_data_and_slot(market_id) {
+            Some(p) => p,
+            None => {
+                log::debug!(target: "sim", "orace price is None");
                 return false;
             }
         };
