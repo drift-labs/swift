@@ -16,12 +16,12 @@ use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     priority_fee_subscriber::{PriorityFeeSubscriber, PriorityFeeSubscriberConfig},
-    swift_order_subscriber::SignedOrderInfo,
     types::{
         accounts::User, errors::ErrorCode, CommitmentConfig, MarketId, MarketType, OrderParams,
         OrderType, SdkError, VersionedMessage, VersionedTransaction,
     },
-    Context, DriftClient, RpcClient, TransactionBuilder,
+    utils::load_keypair_multi_format,
+    Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
 use log::warn;
 use prometheus::Registry;
@@ -212,25 +212,7 @@ pub async fn process_order(
         .simulate_will_auction_params_sanitize(&mut order_params)
         .await
     {
-        /// TODO: clean this up. surely there's a better way to do this
-        let signature = Signature::from(taker_signature);
-        let signed_order_info = SignedOrderInfo::new(
-            String::from_utf8(uuid.to_vec()).unwrap(),
-            unix_now_ms(),
-            taker_authority,
-            signing_pubkey,
-            order_params.clone(),
-            signature,
-        );
-
-        TransactionBuilder::place_swift_order(self, &signed_order_info, &user.unwrap())
-            .with_priority_fee(
-                server_params
-                    .priority_fee_subscriber
-                    .get_priority_fee(order_params.market_index)
-                    .await,
-                Some(1_400_000),
-            );
+        /// TODO: Send the transaction here
         return (
             axum::http::StatusCode::OK,
             Json(ProcessOrderResponse {
@@ -413,6 +395,13 @@ pub async fn health_check(
 pub async fn start_server() {
     dotenv().ok();
 
+    let keypair =
+        load_keypair_multi_format(env::var("PRIVATE_KEY").expect("PRIVATE_KEY set").as_str());
+    if let Err(err) = keypair {
+        log::error!("Failed to load swift private key: {err:?}");
+        return;
+    }
+
     let use_kafka: bool = env::var("USE_KAFKA").unwrap_or_else(|_| "false".to_string()) == "true";
     let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string()) == "true";
     let drift_env = env::var("ENV").unwrap_or("devnet".to_string());
@@ -466,6 +455,7 @@ pub async fn start_server() {
     let rpc_endpoint =
         drift_rs::utils::get_http_url(&env::var("ENDPOINT").expect("valid rpc endpoint"))
             .expect("valid RPC endpoint");
+    let rpc_endpoint_cloned = rpc_endpoint.clone(); // for the priority fee subscriber
 
     // Registry for metrics
     let registry = Registry::new();
@@ -477,13 +467,10 @@ pub async fn start_server() {
         "mainnet-beta" => Context::MainNet,
         _ => panic!("Invalid drift environment: {drift_env}"),
     };
-    let client = DriftClient::new(
-        context,
-        RpcClient::new(rpc_endpoint),
-        Keypair::new().into(), // not sending txs
-    )
-    .await
-    .expect("initialized client");
+    let wallet = Wallet::new(keypair.unwrap());
+    let client = DriftClient::new(context, RpcClient::new(rpc_endpoint), wallet)
+        .await
+        .expect("initialized client");
 
     let user_account_fetcher = UserAccountFetcher::from_env(client.clone()).await;
 
@@ -506,7 +493,7 @@ pub async fn start_server() {
         .map(|config| config.pubkey)
         .collect();
     let priority_fee_subscriber = PriorityFeeSubscriber::with_config(
-        RpcClient::new_with_commitment(rpc_endpoint.into(), CommitmentConfig::confirmed()),
+        RpcClient::new_with_commitment(rpc_endpoint_cloned.into(), CommitmentConfig::confirmed()),
         &pubkeys[..],
         PriorityFeeSubscriberConfig {
             refresh_frequency: Some(Duration::from_millis(400 * 10)),
@@ -735,7 +722,7 @@ impl ServerParams {
             &state,
             order_params,
         ) {
-            Ok() => true,
+            Ok(_) => true,
             Err(err) => {
                 log::debug!(target: "sim", "local sim failed: {err:?}");
                 false
