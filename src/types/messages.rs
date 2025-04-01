@@ -7,16 +7,83 @@ use anchor_lang::{
 use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
-use drift_rs::types::{MarketType, SignedMsgOrderParamsMessage};
+use drift_rs::{
+    types::{
+        MarketType, OrderParams, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+    },
+    Wallet,
+};
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{clock::Slot, pubkey::Pubkey};
 
-#[derive(AnchorDeserialize, AnchorSerialize, Debug, Clone, InitSpace, Copy, Default, PartialEq)]
-pub struct SignedOrderParamsMessageWithPrefix {
-    // 8-byte discriminator manually added in drift client for message parsing
-    discriminator: [u8; 8],
-    pub message: SignedMsgOrderParamsMessage,
+mod discriminators {
+    use std::cell::LazyCell;
+
+    use super::sighash;
+
+    pub const SIGNED_MSG_ORDER_PARAMS_MESSAGE: LazyCell<[u8; 8]> =
+        LazyCell::new(|| sighash("SignedMsgOrderParamsMessage"));
+
+    pub const SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE: LazyCell<[u8; 8]> =
+        LazyCell::new(|| sighash("SignedMsgOrderParamsDelegateMessage"));
+}
+
+// TODO: switch to use bytemuck
+/// Wrapper for SignedMsg types
+#[derive(Clone, Debug, PartialEq, AnchorSerialize, AnchorDeserialize, InitSpace)]
+pub enum SignedMsgType {
+    Authority(SignedMsgOrderParamsMessage),
+    Delegated(SignedMsgOrderParamsDelegateMessage),
+}
+
+impl SignedMsgType {
+    /// Get common info fields of the signed msg
+    pub fn info(&self, taker_authority: &Pubkey) -> SignedMessageInfo {
+        match self {
+            SignedMsgType::Authority(x) => SignedMessageInfo {
+                taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            },
+            SignedMsgType::Delegated(x) => SignedMessageInfo {
+                taker_pubkey: x.taker_pubkey,
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            },
+        }
+    }
+    /// Serialize as a borsh buffer
+    /// This differs from AnchorSerialize as it does _not_ encode the enum byte
+    pub fn to_borsh(&self) -> ArrayVec<u8, { SignedMsgType::INIT_SPACE + 8 }> {
+        let mut buf = ArrayVec::new();
+        match self {
+            SignedMsgType::Authority(ref x) => {
+                (*self::discriminators::SIGNED_MSG_ORDER_PARAMS_MESSAGE)
+                    .serialize(&mut buf)
+                    .unwrap();
+                x.serialize(&mut buf).unwrap();
+            }
+            SignedMsgType::Delegated(ref x) => {
+                (*self::discriminators::SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE)
+                    .serialize(&mut buf)
+                    .unwrap();
+                x.serialize(&mut buf).unwrap();
+            }
+        }
+
+        buf
+    }
+}
+
+/// Common fields of signed message types
+pub struct SignedMessageInfo {
+    pub taker_pubkey: Pubkey,
+    pub order_params: OrderParams,
+    pub uuid: [u8; 8],
+    pub slot: Slot,
 }
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
@@ -25,14 +92,14 @@ pub struct IncomingSignedMessage {
     pub taker_pubkey: [u8; 32],
     #[serde(deserialize_with = "base64_to_array")]
     pub signature: [u8; 64],
-    #[serde(deserialize_with = "hex_to_borsh_buf")]
-    pub message: BorshBuf<{ SignedMsgOrderParamsMessage::INIT_SPACE + 8 }>,
-    #[serde(deserialize_with = "base58_to_array", default = "default_deserialize")]
+    #[serde(deserialize_with = "deser_signed_msg_type")]
+    pub message: SignedMsgType,
+    #[serde(deserialize_with = "base58_to_array", default = "Default::default")]
     pub signing_authority: [u8; 32],
 }
 
 impl IncomingSignedMessage {
-    /// Verify taker signature against sha256 digest of `message`
+    /// Verify taker signature against hex encoded `message`
     pub fn verify_signature(&self) -> Result<()> {
         let pubkey = if self.signing_authority != [0u8; 32] {
             PublicKey::from_bytes(self.signing_authority.as_ref())
@@ -44,20 +111,18 @@ impl IncomingSignedMessage {
         let signature =
             Signature::from_bytes(self.signature.as_slice()).context("Invalid signature")?;
 
-        // client hex encodes msg before signing so we need to use that as comparison
-        let msg_data = self.message.data();
-        let mut hex_bytes = vec![0u8; msg_data.len() * 2]; // 2 hex bytes per msg byte
+        // client hex encodes msg before signing so use that as comparison
+        let msg_data = &self.message.to_borsh();
+        let mut hex_bytes = vec![0; msg_data.len() * 2]; // 2 hex bytes per msg byte
         let _ = faster_hex::hex_encode(msg_data, &mut hex_bytes).expect("hexified");
 
         pubkey
-            .verify(hex_bytes.as_ref(), &signature)
+            .verify(&hex_bytes, &signature)
             .context("Signature did not verify")
     }
-    pub fn verify_and_get_signed_message(&self) -> Result<SignedOrderParamsMessageWithPrefix> {
+    pub fn verify_and_get_signed_message(&self) -> Result<&SignedMsgType> {
         self.verify_signature()?;
-        self.message
-            .deserialize::<SignedOrderParamsMessageWithPrefix>()
-            .context("invalid SignedMsgOrderParamsMessage")
+        Ok(&self.message)
     }
 }
 
@@ -65,7 +130,7 @@ impl IncomingSignedMessage {
 pub struct OrderMetadataAndMessage {
     pub signing_authority: Pubkey,
     pub taker_authority: Pubkey,
-    pub order_message: SignedOrderParamsMessageWithPrefix,
+    pub order_message: SignedMsgType,
     pub order_signature: [u8; 64],
     pub uuid: [u8; 8],
     pub ts: u64,
@@ -98,12 +163,8 @@ impl OrderMetadataAndMessage {
     }
 
     pub fn jsonify(&self) -> serde_json::Value {
-        let taker_order_params = self.order_message.message.signed_msg_order_params;
-
-        let mut order_buf = ArrayVec::<u8, { SignedMsgOrderParamsMessage::INIT_SPACE }>::new();
-        self.order_message
-            .serialize(&mut order_buf)
-            .expect("serialize SignedOrderParams");
+        let taker_order_params = self.order_message.info(&self.taker_authority).order_params;
+        let signed_msg_borsh = self.order_message.to_borsh();
 
         json!({
             "market_type": match taker_order_params.market_type {
@@ -111,7 +172,7 @@ impl OrderMetadataAndMessage {
                 MarketType::Spot => "spot",
             },
             "market_index": taker_order_params.market_index,
-            "order_message": faster_hex::hex_string(order_buf.as_slice()),
+            "order_message": faster_hex::hex_string(signed_msg_borsh.as_slice()),
             "order_signature": base64::prelude::BASE64_STANDARD.encode(self.order_signature),
             "taker_authority": self.taker_authority.to_string(),
             "signing_authority": self.signing_authority.to_string(),
@@ -153,7 +214,7 @@ pub struct WsSubscribeMessage {
 
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct WsAuthMessage {
-    #[serde(deserialize_with = "base58_to_array", default = "default_deserialize")]
+    #[serde(deserialize_with = "base58_to_array", default = "Default::default")]
     pub stake_pubkey: [u8; 32],
     #[serde(deserialize_with = "base58_to_array")]
     pub pubkey: [u8; 32],
@@ -245,27 +306,6 @@ impl<'a> WsMessage<'a> {
     }
 }
 
-/// Fixed size, serialized borsh bytes
-#[derive(Clone, Debug, PartialEq)]
-pub struct BorshBuf<const N: usize> {
-    /// number of bytes written in the buffer
-    length: usize,
-    /// underlying buffer, it should not be used directly
-    data: [u8; N],
-}
-
-impl<const N: usize> BorshBuf<N> {
-    /// Deserialize the buffer as `T`
-    pub fn deserialize<T: anchor_lang::AnchorDeserialize>(&self) -> Result<T, std::io::Error> {
-        T::deserialize(&mut self.data())
-    }
-    /// Return the encoded buffer data
-    pub fn data(&self) -> &[u8] {
-        assert!(self.length < N);
-        &self.data[..self.length]
-    }
-}
-
 /// Deserialize base58 str as fixed size byte array
 pub fn base58_to_array<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
 where
@@ -278,11 +318,6 @@ where
         .map_err(serde::de::Error::custom)?;
 
     Ok(buf)
-}
-
-/// Deserialize base58 str as fixed size byte array
-pub fn default_deserialize() -> [u8; 32] {
-    [0u8; 32]
 }
 
 /// Deserialize base64 str as fixed size byte array
@@ -299,42 +334,33 @@ where
     Ok(buf)
 }
 
-/// Deserialize base64 str as fixed size byte array with Borsh helpers
-pub fn _base64_to_borsh_buf<'de, D, const N: usize>(
-    deserializer: D,
-) -> Result<BorshBuf<N>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let payload: &str = serde::Deserialize::deserialize(deserializer)?;
-    let mut buf = [0u8; N];
-    let wrote = base64::prelude::BASE64_STANDARD
-        .decode_slice_unchecked(payload, &mut buf)
-        .map_err(serde::de::Error::custom)?;
-
-    Ok(BorshBuf {
-        data: buf,
-        length: wrote,
-    })
-}
-
-/// Deserialize hex str as fixed size byte array with Borsh helpers
-pub fn hex_to_borsh_buf<'de, D, const N: usize>(deserializer: D) -> Result<BorshBuf<N>, D::Error>
+/// Deserialize hex str into fixed size byte array with Borsh helpers
+pub fn deser_signed_msg_type<'de, D>(deserializer: D) -> Result<SignedMsgType, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let payload: &[u8] = serde::Deserialize::deserialize(deserializer)?;
-    let mut buf = [0_u8; N];
     if payload.len() % 2 != 0 {
         return Err(serde::de::Error::custom("Hex string length must be even"));
     }
-    faster_hex::hex_decode(payload, &mut buf[..payload.len() / 2])
+
+    // decode expecting the largest possible variant
+    let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
+
+    faster_hex::hex_decode(payload, &mut borsh_buf[..payload.len() / 2])
         .map_err(serde::de::Error::custom)?;
 
-    Ok(BorshBuf {
-        data: buf,
-        length: payload.len() / 2,
-    })
+    // this is basically the same as if we derived AnchorDeserialize on `SignedMsgType` _expect_ it does not
+    // add a u8 to distinguish the enum
+    if borsh_buf[..8] == *self::discriminators::SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE {
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
+            .map(SignedMsgType::Delegated)
+            .map_err(serde::de::Error::custom)
+    } else {
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
+            .map(SignedMsgType::Authority)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 pub fn deser_market_type<'de, D>(deserializer: D) -> Result<MarketType, D::Error>
@@ -345,25 +371,85 @@ where
     MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
 }
 
+/// Calculate anchor type sighash
+fn sighash(name: &str) -> [u8; 8] {
+    let preimage = format!("global:{name}");
+    let mut hasher = anchor_lang::solana_program::hash::Hasher::default();
+    hasher.hash(preimage.as_bytes());
+    let digest = hasher.result().to_bytes();
+    digest[..8].try_into().unwrap()
+}
+
 #[cfg(test)]
 mod tests {
-    use drift_rs::types::{OrderParams, OrderType};
+    use drift_rs::types::{
+        OrderParams, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
+    };
     use nanoid::nanoid;
 
     use super::*;
 
     #[test]
-    fn deserialize_incoming_signed_message() {
+    fn deserialize_incoming_signed_message_delegated() {
         let message = r#"{
-            "market_index":6,
-            "market_type":"perp",
-            "message": "39656134656332650001010000f2052a01000000000000000000000006000000000000000001c8016fe90b0000000000013ecb0b0000000000000085d02c150000000034525a62354259710000",
-            "signature": "z2fOUSo9R4+zYWLXO+JgQL1XLlEmzKOGkgFVwsGs8sEI42mbe1U8saBv2jsUazuHB5ENe/maGLl50YyUzNDMBA==",
-            "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
-            }"#;
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "42656638c7259e230001010080841e00000000000000000000000000020000000000000000013201bb60507d000000000117c0127c00000000395311d51c1b87fd56c3b5872d1041111e51f399b12d291d981a0ea383407295272108160000000073386c754a4c5a650000",
+            "signature": "9G8luwFfeAc25HwXCgaUjrKv6yJHcMFDq4Z4uPXqom5mhwZ63YU5g7p07Kxe/AKSt5A/9OPDh3nN/c9IHjkCDA==",
+            "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE",
+            "signing_authority": "GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf"
+        }"#;
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
-        dbg!(actual.message.data);
+        assert!(actual.verify_signature().is_ok());
+        assert!(
+            actual.signing_authority
+                == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf").to_bytes()
+        );
+        if let SignedMsgType::Delegated(signed_msg) = actual.message {
+            let expected = SignedMsgOrderParamsDelegateMessage {
+                signed_msg_order_params: OrderParams {
+                    order_type: OrderType::Market,
+                    market_type: MarketType::Perp,
+                    direction: PositionDirection::Short,
+                    user_order_id: 0,
+                    base_asset_amount: 2000000,
+                    price: 0,
+                    market_index: 2,
+                    reduce_only: false,
+                    post_only: PostOnlyParam::None,
+                    immediate_or_cancel: false,
+                    max_ts: None,
+                    trigger_price: None,
+                    trigger_condition: OrderTriggerCondition::Above,
+                    oracle_price_offset: None,
+                    auction_duration: Some(50),
+                    auction_start_price: Some(2102419643),
+                    auction_end_price: Some(2081603607),
+                },
+                taker_pubkey: solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"),
+                slot: 369631527,
+                uuid: [115, 56, 108, 117, 74, 76, 90, 101],
+                take_profit_order_params: None,
+                stop_loss_order_params: None,
+            };
+            assert_eq!(signed_msg, expected);
+        } else {
+            assert!(false, "unexpected variant");
+        }
+    }
+
+    #[test]
+    fn deserialize_incoming_signed_message() {
+        let message = r#"{
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001000080841e00000000000000000000000000020000000000000000013201abe72e7c000000000162d06c7d00000000000066190816000000005a645349472d634c0000",
+            "signature": "LiwPgg6VXxOWfCI/PGQpv2c2PqDs11zgSrqDCOvHq1S0yvE0KZeQa84u7Pb0tanN2KO4Ac8laT7odaAyWxRDBA==",
+            "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+        }"#;
+
+        let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
         assert!(actual.verify_signature().is_ok());
         assert!(actual.signing_authority == [0u8; 32]);
     }
@@ -371,17 +457,53 @@ mod tests {
     #[test]
     fn deserialize_incoming_signed_message_with_signing_authority() {
         let message = r#"{
-            "market_index":6,
-            "market_type":"perp",
-            "message": "39656134656332650001010000f2052a01000000000000000000000006000000000000000001c8016fe90b0000000000013ecb0b0000000000000085d02c150000000034525a62354259710000",
-            "signature": "z2fOUSo9R4+zYWLXO+JgQL1XLlEmzKOGkgFVwsGs8sEI42mbe1U8saBv2jsUazuHB5ENe/maGLl50YyUzNDMBA==",
-            "taker_pubkey": "8YLKoCu7NwqHNS8GzuvA2ibsvLrsg22YMfMDafxh1B15",
-            "signing_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
-            }"#;
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001010080841e00000000000000000000000000020000000000000000013201bb60507d000000000117c0127c000000000000272108160000000073386c754a4c5a650000",
+            "signature": "H8HRloc2vBdhHyiNK5W/Shv3kVKmIYsHTBzlD2ecyxyOUh7EuysU/Y5AOXZ3IpsMxRyLn6OSAHKEgCIQX4OpDQ==",
+            "signing_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE",
+            "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+        }"#;
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
-        dbg!(actual.message.data);
+        dbg!(&actual.message);
         assert!(actual.verify_signature().is_ok());
+        assert!(
+            actual.signing_authority
+                == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE").to_bytes()
+        );
+
+        if let SignedMsgType::Authority(signed_msg) = actual.message {
+            let expected = SignedMsgOrderParamsMessage {
+                signed_msg_order_params: OrderParams {
+                    order_type: OrderType::Market,
+                    market_type: MarketType::Perp,
+                    direction: PositionDirection::Short,
+                    user_order_id: 0,
+                    base_asset_amount: 2000000,
+                    price: 0,
+                    market_index: 2,
+                    reduce_only: false,
+                    post_only: PostOnlyParam::None,
+                    immediate_or_cancel: false,
+                    max_ts: None,
+                    trigger_price: None,
+                    trigger_condition: OrderTriggerCondition::Above,
+                    oracle_price_offset: None,
+                    auction_duration: Some(50),
+                    auction_start_price: Some(2102419643),
+                    auction_end_price: Some(2081603607),
+                },
+                sub_account_id: 0,
+                slot: 369631527,
+                uuid: [115, 56, 108, 117, 74, 76, 90, 101],
+                take_profit_order_params: None,
+                stop_loss_order_params: None,
+            };
+            assert_eq!(signed_msg, expected);
+        } else {
+            assert!(false, "unexpected variant");
+        }
     }
 
     #[test]
@@ -389,7 +511,7 @@ mod tests {
         let encoded = OrderMetadataAndMessage {
             signing_authority: Pubkey::new_unique(),
             taker_authority: Pubkey::new_unique(),
-            order_message: SignedOrderParamsMessageWithPrefix::default(),
+            order_message: SignedMsgType::Authority(Default::default()),
             order_signature: [1u8; 64],
             ts: 55555,
             uuid: nanoid!(8).as_bytes().try_into().unwrap(),
@@ -426,17 +548,14 @@ mod tests {
             ..Default::default()
         };
 
-        let signed_order_message = SignedOrderParamsMessageWithPrefix {
-            discriminator: [0u8; 8],
-            message: order_params,
-        };
+        let signed_order_message = SignedMsgType::Authority(order_params);
 
         let order_metadata_json = OrderMetadataAndMessage {
             signing_authority,
             taker_authority,
             order_signature,
             uuid: order_params.uuid,
-            order_message: signed_order_message,
+            order_message: signed_order_message.clone(),
             ts: 55555,
         }
         .jsonify();
@@ -456,7 +575,7 @@ mod tests {
 
         assert_eq!(
             order_metadata_json["order_message"],
-            faster_hex::hex_string(signed_order_message.try_to_vec().unwrap().as_slice()),
+            faster_hex::hex_string(signed_order_message.to_borsh().as_slice()),
         );
 
         assert_eq!(order_metadata_json["ts"], 55555);

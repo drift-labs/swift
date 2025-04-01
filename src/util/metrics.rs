@@ -18,7 +18,7 @@ pub async fn metrics_handler(
     let mut buffer = Vec::new();
     let encoder = TextEncoder::new();
     if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
-        eprintln!("could not encode custom metrics: {}", e);
+        log::error!("could not encode custom metrics: {e}");
     }
     let response = String::from_utf8(buffer).unwrap();
     axum::http::Response::builder()
