@@ -16,7 +16,7 @@ use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     priority_fee_subscriber::{PriorityFeeSubscriber, PriorityFeeSubscriberConfig},
-    swift_order_subscriber::{SignedDelegateOrderInfo, SignedOrderInfo},
+    swift_order_subscriber::{SignedMessageInfo, SignedOrderInfo},
     types::{
         accounts::User, errors::ErrorCode, CommitmentConfig, MarketId, MarketType, OrderParams,
         OrderType, SdkError, VersionedMessage, VersionedTransaction,
@@ -48,7 +48,7 @@ use crate::{
     types::{
         messages::{
             IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
-            SignedMessageInfo, SignedMsgType, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
@@ -230,32 +230,16 @@ pub async fn process_order(
             Some(1_400_000),
         );
 
-        let versioned_message = match *signed_msg {
-            SignedMsgType::Authority(signed_order) => {
-                let signed_order_info = SignedOrderInfo::new(
-                    uuid,
-                    taker_authority,
-                    signing_pubkey,
-                    signed_order,
-                    Signature::from(taker_signature),
-                );
-                tx_builder
-                    .place_swift_order(&signed_order_info, &user)
-                    .build()
-            }
-            SignedMsgType::Delegated(signed_order) => {
-                let signed_order_info = SignedDelegateOrderInfo::new(
-                    uuid,
-                    taker_authority,
-                    signing_pubkey,
-                    signed_order,
-                    Signature::from(taker_signature),
-                );
-                tx_builder
-                    .place_swift_delegate_order(&signed_order_info, &user)
-                    .build()
-            }
-        };
+        let signed_order_info = SignedOrderInfo::new(
+            uuid,
+            taker_authority,
+            signing_pubkey,
+            *signed_msg,
+            Signature::from(taker_signature),
+        );
+        let versioned_message = tx_builder
+            .place_swift_order(&signed_order_info, &user)
+            .build();
 
         let place_tx_with_timeout = tokio::time::timeout(
             Duration::from_secs(35),
@@ -279,7 +263,7 @@ pub async fn process_order(
                     "{log_prefix}: Error sending order: {err:?}"
                 );
                 return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::http::StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                         error: Some(format!("tx send error: {err:?}")),
@@ -287,12 +271,12 @@ pub async fn process_order(
                 );
             }
             Err(_) => {
-                log::error!(target: "server", "{log_prefix}: Order send timeout");
+                log::warn!(target: "server", "{log_prefix}: Order send timeout");
                 return (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::http::StatusCode::OK,
                     Json(ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
-                        error: Some("tx send timeout".to_string()),
+                        error: Some("Tx not confirmed".to_string()),
                     }),
                 );
             }
@@ -946,6 +930,7 @@ impl ServerParams {
             order_params,
             &perp_market,
             oracle_data.data.price,
+            true,
         ) {
             Ok(result) => result,
             Err(err) => {

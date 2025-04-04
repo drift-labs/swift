@@ -33,8 +33,6 @@ pub enum WsError {
 pub enum TxError {
     #[error("internal error: {0}")]
     Sdk(#[from] SdkError),
-    #[error("{0}")]
-    BadRequest(String),
     #[error("tx failed ({code}): {reason}")]
     TxFailed { reason: String, code: u32 },
     #[error("tx not found: {tx_sig}")]
