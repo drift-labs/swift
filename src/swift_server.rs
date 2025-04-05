@@ -802,10 +802,6 @@ impl ServerParams {
             user: None,
         };
 
-        if self.is_rpc_sim_disabled() {
-            return Ok(sim_result);
-        }
-
         let t0 = SystemTime::now();
 
         let user_with_timeout = tokio::time::timeout(
@@ -830,6 +826,10 @@ impl ServerParams {
         })?;
 
         sim_result.user = Some(user);
+
+        if self.is_rpc_sim_disabled() {
+            return Ok(sim_result);
+        }
 
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
