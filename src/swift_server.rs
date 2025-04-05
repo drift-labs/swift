@@ -214,11 +214,10 @@ pub async fn process_order(
 
     // If fat fingered order that requires sanitization, then just send the order
     let mut order_params = order_params.clone();
-    if server_params
-        .simulate_will_auction_params_sanitize(&mut order_params)
-        .await
-    {
-        let uuid = String::from_utf8(uuid.to_vec()).expect("invalid utf8 uuid");
+    if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
+        let uuid = std::str::from_utf8(&uuid)
+            .expect("invalid utf8 uuid")
+            .to_string();
         let tx_builder = TransactionBuilder::new(
             server_params.drift.program_data(),
             taker_pubkey,
@@ -532,6 +531,7 @@ pub async fn start_server() {
     let client = DriftClient::new(context, RpcClient::new(rpc_endpoint), wallet)
         .await
         .expect("initialized client");
+    client.subscribe_blockhashes().await.unwrap();
 
     let user_account_fetcher = UserAccountFetcher::from_env(client.clone()).await;
 
@@ -905,7 +905,7 @@ impl ServerParams {
     }
 
     /// Simulate if auction params will be sanitized
-    async fn simulate_will_auction_params_sanitize(&self, order_params: &mut OrderParams) -> bool {
+    fn simulate_will_auction_params_sanitize(&self, order_params: &mut OrderParams) -> bool {
         let perp_market = match self
             .drift
             .try_get_perp_market_account(order_params.market_index)
