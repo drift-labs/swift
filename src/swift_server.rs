@@ -98,17 +98,16 @@ pub async fn process_order(
     server_params.metrics.taker_orders_counter.inc();
 
     let IncomingSignedMessage {
-        taker_pubkey,
+        taker_pubkey: taker_authority,
         signature: taker_signature,
         message: _,
         signing_authority,
     } = incoming_message;
 
-    let taker_authority = Pubkey::new_from_array(taker_pubkey);
-    let signing_pubkey = if signing_authority == [0u8; 32] {
+    let signing_pubkey = if signing_authority == Pubkey::default() {
         taker_authority
     } else {
-        Pubkey::new_from_array(signing_authority)
+        signing_authority
     };
 
     let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
@@ -191,7 +190,7 @@ pub async fn process_order(
         signing_authority: signing_pubkey,
         taker_authority,
         order_message: signed_msg.clone(),
-        order_signature: taker_signature,
+        order_signature: taker_signature.into(),
         ts: process_order_time,
         uuid,
     };
