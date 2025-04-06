@@ -88,28 +88,24 @@ pub struct SignedMessageInfo {
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct IncomingSignedMessage {
-    #[serde(deserialize_with = "base58_to_array")]
-    pub taker_pubkey: [u8; 32],
-    #[serde(deserialize_with = "base64_to_array")]
-    pub signature: [u8; 64],
+    #[serde(deserialize_with = "deser_pubkey")]
+    pub taker_pubkey: Pubkey,
+    #[serde(deserialize_with = "deser_signature")]
+    pub signature: Signature,
     #[serde(deserialize_with = "deser_signed_msg_type")]
     pub message: SignedMsgType,
-    #[serde(deserialize_with = "base58_to_array", default = "Default::default")]
-    pub signing_authority: [u8; 32],
+    #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
+    pub signing_authority: Pubkey,
 }
 
 impl IncomingSignedMessage {
     /// Verify taker signature against hex encoded `message`
     pub fn verify_signature(&self) -> Result<()> {
-        let pubkey = if self.signing_authority != [0u8; 32] {
-            PublicKey::from_bytes(self.signing_authority.as_ref())
-                .context("Invalid signing authority")?
+        let pubkey = if self.signing_authority != Pubkey::default() {
+            PublicKey::from_bytes(self.signing_authority.as_array())
         } else {
-            PublicKey::from_bytes(&self.taker_pubkey).context("Invalid taker pubkey")?
-        };
-
-        let signature =
-            Signature::from_bytes(self.signature.as_slice()).context("Invalid signature")?;
+            PublicKey::from_bytes(self.taker_pubkey.as_array())
+        }?;
 
         // client hex encodes msg before signing so use that as comparison
         let msg_data = &self.message.to_borsh();
@@ -117,7 +113,7 @@ impl IncomingSignedMessage {
         let _ = faster_hex::hex_encode(msg_data, &mut hex_bytes).expect("hexified");
 
         pubkey
-            .verify(&hex_bytes, &signature)
+            .verify(&hex_bytes, &self.signature)
             .context("Signature did not verify")
     }
     pub fn verify_and_get_signed_message(&self) -> Result<&SignedMsgType> {
@@ -214,12 +210,12 @@ pub struct WsSubscribeMessage {
 
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct WsAuthMessage {
-    #[serde(deserialize_with = "base58_to_array", default = "Default::default")]
-    pub stake_pubkey: [u8; 32],
-    #[serde(deserialize_with = "base58_to_array")]
-    pub pubkey: [u8; 32],
-    #[serde(deserialize_with = "base64_to_array")]
-    pub signature: [u8; 64],
+    #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
+    pub stake_pubkey: Pubkey,
+    #[serde(deserialize_with = "deser_pubkey")]
+    pub pubkey: Pubkey,
+    #[serde(deserialize_with = "deser_signature")]
+    pub signature: Signature,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -306,32 +302,26 @@ impl<'a> WsMessage<'a> {
     }
 }
 
-/// Deserialize base58 str as fixed size byte array
-pub fn base58_to_array<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+/// Deserialize solana pubkey str
+pub fn deser_pubkey<'de, D>(deserializer: D) -> Result<Pubkey, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let payload: &str = serde::Deserialize::deserialize(deserializer)?;
-    let mut buf = [0u8; N];
-    let _wrote = solana_sdk::bs58::decode(payload)
-        .onto(&mut buf)
-        .map_err(serde::de::Error::custom)?;
-
-    Ok(buf)
+    Pubkey::from_str(payload).map_err(serde::de::Error::custom)
 }
 
-/// Deserialize base64 str as fixed size byte array
-pub fn base64_to_array<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+/// Deserialize solana signature str
+pub fn deser_signature<'de, D>(deserializer: D) -> Result<Signature, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let payload: &str = serde::Deserialize::deserialize(deserializer)?;
-    let mut buf = [0u8; N];
+    let mut buf = [0u8; 64];
     let _wrote = base64::prelude::BASE64_STANDARD
-        .decode_slice_unchecked(payload, &mut buf)
+        .decode_slice(payload, &mut buf)
         .map_err(serde::de::Error::custom)?;
-
-    Ok(buf)
+    Signature::from_bytes(&buf).map_err(serde::de::Error::custom)
 }
 
 /// Deserialize hex str into fixed size byte array with Borsh helpers
@@ -404,7 +394,7 @@ mod tests {
         assert!(actual.verify_signature().is_ok());
         assert!(
             actual.signing_authority
-                == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf").to_bytes()
+                == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
         );
         if let SignedMsgType::Delegated(signed_msg) = actual.message {
             let expected = SignedMsgOrderParamsDelegateMessage {
@@ -451,7 +441,7 @@ mod tests {
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
         assert!(actual.verify_signature().is_ok());
-        assert!(actual.signing_authority == [0u8; 32]);
+        assert!(actual.signing_authority == Pubkey::default());
     }
 
     #[test]
@@ -470,7 +460,7 @@ mod tests {
         assert!(actual.verify_signature().is_ok());
         assert!(
             actual.signing_authority
-                == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE").to_bytes()
+                == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
         );
 
         if let SignedMsgType::Authority(signed_msg) = actual.message {
