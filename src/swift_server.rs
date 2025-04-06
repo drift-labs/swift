@@ -347,10 +347,39 @@ pub async fn health_check(
 ) -> impl axum::response::IntoResponse {
     let ws_healthy = server_params.drift.ws().is_running();
     let slot_sub_healthy = !server_params.slot_subscriber.is_stale();
-    if ws_healthy && slot_sub_healthy {
+
+    // Check if optional accounts are healthy
+    let user_account_fetcher_redis_health = if server_params.user_account_fetcher.redis.is_some() {
+        server_params
+            .user_account_fetcher
+            .check_redis_health()
+            .await
+    } else {
+        true
+    };
+
+    // Check if optional accounts are healthy
+    let redis_health = if server_params.redis_pool.is_some() {
+        let redis_health = if let Some(mut conn) = server_params.redis_pool.clone() {
+            let ping_result: redis::RedisResult<String> =
+                redis::cmd("PING").query_async(&mut conn).await;
+            ping_result.is_ok()
+        } else {
+            false
+        };
+        redis_health
+    } else {
+        true
+    };
+
+    if ws_healthy && slot_sub_healthy && user_account_fetcher_redis_health && redis_health {
         (axum::http::StatusCode::OK, "ok".into())
     } else {
-        let msg = format!("slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy}");
+        let msg = format!(
+            "slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy} 
+            | user_account_fetcher_healthy={user_account_fetcher_redis_health} |
+            redis_healthy={redis_health}",
+        );
         log::error!("{}", &msg);
         (axum::http::StatusCode::PRECONDITION_FAILED, msg)
     }
