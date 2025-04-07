@@ -222,8 +222,15 @@ pub async fn process_order(
             target: "server",
             "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
         );
+        return (
+            axum::http::StatusCode::OK,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                error: None,
+            }),
+        );
     }
-    if server_params.simulate_will_auction_params_sanitize(&mut order_params) && !ignore {
+    if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
         let uuid = std::str::from_utf8(&uuid)
             .expect("invalid utf8 uuid")
             .to_string();
