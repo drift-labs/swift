@@ -273,15 +273,6 @@ where
     MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
 }
 
-/// Calculate anchor type sighash
-fn sighash(name: &str) -> [u8; 8] {
-    let preimage = format!("global:{name}");
-    let mut hasher = anchor_lang::solana_program::hash::Hasher::default();
-    hasher.hash(preimage.as_bytes());
-    let digest = hasher.result().to_bytes();
-    digest[..8].try_into().unwrap()
-}
-
 #[cfg(test)]
 mod tests {
     use drift_rs::types::{

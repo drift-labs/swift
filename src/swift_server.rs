@@ -5,6 +5,27 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::{
+    connection::kafka_connect::KafkaClientBuilder,
+    super_slot_subscriber::SuperSlotSubscriber,
+    types::{
+        messages::{
+            IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
+            PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+            PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
+        },
+        types::unix_now_ms,
+    },
+    user_account_fetcher::UserAccountFetcher,
+    util::{
+        metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+        tx::send_tx,
+    },
+};
 use axum::{
     extract::State,
     http::Method,
@@ -42,28 +63,6 @@ use solana_sdk::{
 };
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::{
-    connection::kafka_connect::KafkaClientBuilder,
-    super_slot_subscriber::SuperSlotSubscriber,
-    types::{
-        messages::{
-            IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
-            PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-            PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
-        },
-        types::unix_now_ms,
-    },
-    user_account_fetcher::UserAccountFetcher,
-    util::{
-        metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
-        tx::send_tx,
-    },
-};
-
 struct Config {
     /// RPC tx simulation on/off
     disable_rpc_sim: AtomicBool,
@@ -92,6 +91,7 @@ pub struct ServerParams {
     user_account_fetcher: UserAccountFetcher,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     config: Arc<Config>,
+    ignore_submit_pubkeys: Vec<Pubkey>,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -214,7 +214,16 @@ pub async fn process_order(
 
     // If fat fingered order that requires sanitization, then just send the order
     let mut order_params = order_params.clone();
-    if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
+    let ignore = server_params
+        .ignore_submit_pubkeys
+        .contains(&taker_authority);
+    if ignore {
+        log::debug!(
+            target: "server",
+            "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
+        );
+    }
+    if server_params.simulate_will_auction_params_sanitize(&mut order_params) && !ignore {
         let uuid = std::str::from_utf8(&uuid)
             .expect("invalid utf8 uuid")
             .to_string();
@@ -562,6 +571,20 @@ pub async fn start_server() {
         },
     );
 
+    // Set ignore pubkeys
+    let ignore_pubkeys = env::var("IGNORE_PUBKEYS").unwrap_or_else(|_| "".to_string());
+    let pubkeys: Vec<Pubkey> = ignore_pubkeys
+        .split(',')
+        .map(|s| s.trim()) // remove extra whitespace
+        .filter_map(|s| match s.parse::<Pubkey>() {
+            Ok(key) => Some(key),
+            Err(_) => {
+                log::warn!("Warning: invalid pubkey skipped: {}", s);
+                None
+            }
+        })
+        .collect();
+
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::new(slot_subscriber),
@@ -571,6 +594,7 @@ pub async fn start_server() {
         user_account_fetcher,
         priority_fee_subscriber: priority_fee_subscriber.subscribe(),
         config: Arc::new(Config::from_env()),
+        ignore_submit_pubkeys: pubkeys,
     }));
 
     // start oracle/market subscriptions (async)
