@@ -15,8 +15,8 @@ use crate::{
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
-            PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-            PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
+            PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
+            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS, PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
         },
         types::unix_now_ms,
     },
@@ -214,23 +214,24 @@ pub async fn process_order(
 
     // If fat fingered order that requires sanitization, then just send the order
     let mut order_params = order_params.clone();
-    let ignore = server_params
-        .ignore_submit_pubkeys
-        .contains(&taker_authority);
-    if ignore {
-        log::debug!(
-            target: "server",
-            "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
-        );
-        return (
-            axum::http::StatusCode::OK,
-            Json(ProcessOrderResponse {
-                message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                error: None,
-            }),
-        );
-    }
     if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
+        let ignore = server_params
+            .ignore_submit_pubkeys
+            .contains(&taker_authority);
+        if ignore {
+            log::debug!(
+                target: "server",
+                "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
+            );
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
+                    error: Some("Sanitized order not submitted".to_string()),
+                }),
+            );
+        }
+
         let uuid = std::str::from_utf8(&uuid)
             .expect("invalid utf8 uuid")
             .to_string();
