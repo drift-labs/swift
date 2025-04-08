@@ -17,7 +17,7 @@ use solana_sdk::pubkey::Pubkey;
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct IncomingSignedMessage {
-    #[serde(deserialize_with = "deser_pubkey")]
+    #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub taker_pubkey: Pubkey,
     #[serde(deserialize_with = "deser_signature")]
     pub signature: Signature,
@@ -25,6 +25,8 @@ pub struct IncomingSignedMessage {
     pub message: SignedOrderType,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub signing_authority: Pubkey,
+    #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
+    pub taker_authority: Pubkey,
 }
 
 impl IncomingSignedMessage {
@@ -32,6 +34,8 @@ impl IncomingSignedMessage {
     pub fn verify_signature(&self) -> Result<()> {
         let pubkey = if self.signing_authority != Pubkey::default() {
             PublicKey::from_bytes(self.signing_authority.as_array())
+        } else if self.taker_authority != Pubkey::default() {
+            PublicKey::from_bytes(self.taker_authority.as_array())
         } else {
             PublicKey::from_bytes(self.taker_pubkey.as_array())
         }?;
@@ -121,7 +125,6 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slo
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
 pub const PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND: &str = "User not found";
-pub const PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT: &str = "Placing sanitizing tx timeout";
 pub const PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY: &str = "Ignore pubkey";
 
 #[derive(serde::Deserialize, Clone, Debug)]
