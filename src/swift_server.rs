@@ -244,10 +244,6 @@ pub async fn process_order(
             );
         }
 
-        log::trace!(
-            target: "server",
-            "{log_prefix}: Sending sanitized order with order params: {order_params:?}"
-        );
         server_params.metrics.sanitized_orders_counter.inc();
 
         let uuid = std::str::from_utf8(&uuid)
@@ -275,23 +271,26 @@ pub async fn process_order(
             .place_swift_order(&signed_order_info, &user)
             .build();
 
-        let place_tx_with_timeout = tokio::time::timeout(
-            Duration::from_secs(5),
-            send_tx(
-                &server_params.drift,
-                versioned_message,
-                "place swift order",
-                Some(30),
-                log_prefix.clone(),
-            ),
-        )
-        .await;
+        let place_tx = send_tx(
+            &server_params.drift,
+            versioned_message,
+            "place swift order",
+            Some(30),
+            log_prefix.clone(),
+        );
 
-        match place_tx_with_timeout {
-            Ok(Ok(tx_sig)) => {
-                log::trace!(target: "server", "{log_prefix}: Order sent successfully {tx_sig:?}");
+        match place_tx.await {
+            Ok(tx_sig) => {
+                log::trace!(target: "server", "{log_prefix}: Sending sanitized order with order params: {order_params:?}, tx sig: {tx_sig:?}");
+                return (
+                    axum::http::StatusCode::OK,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    }),
+                );
             }
-            Ok(Err(err)) => {
+            Err(err) => {
                 log::error!(
                     target: "server",
                     "{log_prefix}: Error sending order: {err:?}"
@@ -301,16 +300,6 @@ pub async fn process_order(
                     Json(ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                         error: Some(format!("tx send error: {err:?}")),
-                    }),
-                );
-            }
-            Err(_) => {
-                log::warn!(target: "server", "{log_prefix}: Order send timeout");
-                return (
-                    axum::http::StatusCode::OK,
-                    Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
-                        error: Some("Tx not confirmed".to_string()),
                     }),
                 );
             }
