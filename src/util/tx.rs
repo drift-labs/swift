@@ -79,7 +79,7 @@ pub async fn send_tx(
                 }
             };
 
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             if let Ok(Some(Ok(()))) = rpc.get_signature_status(&tx_signature).await {
                 confirmed = true;

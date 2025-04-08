@@ -120,11 +120,15 @@ pub async fn process_order(
     };
 
     let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
+    log::trace!(
+        target: "server",
+        "{log_prefix}: Received order with signing pubkey: {signing_pubkey}"
+    );
 
     let signed_msg = match incoming_message.verify_and_get_signed_message() {
         Ok(m) => m,
         Err(e) => {
-            log::error!("{log_prefix}: Error verifying signed message: {e:?}",);
+            log::warn!("{log_prefix}: Error verifying signed message: {e:?}",);
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
@@ -160,6 +164,10 @@ pub async fn process_order(
 
     // check the order is valid for execution by program
     if let Err(err) = validate_signed_order_params(&order_params) {
+        log::warn!(
+            target: "server",
+            "{log_prefix}: Order did not validate: {err:?}",
+        );
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -187,6 +195,10 @@ pub async fn process_order(
                 .rpc_simulation_status
                 .with_label_values(&["invalid"])
                 .inc();
+            log::warn!(
+                target: "server",
+                "{log_prefix}: Order sim failed: {sim_err_str}",
+            );
             return (
                 status,
                 Json(ProcessOrderResponse {
@@ -258,7 +270,7 @@ pub async fn process_order(
             .build();
 
         let place_tx_with_timeout = tokio::time::timeout(
-            Duration::from_secs(35),
+            Duration::from_secs(5),
             send_tx(
                 &server_params.drift,
                 versioned_message,
@@ -308,13 +320,10 @@ pub async fn process_order(
         uuid,
     };
     let encoded = order_metadata.encode();
-    log::trace!(target: "server", "base64 encoded message: {encoded:?}");
-
     let market_index = order_params.market_index;
     let market_type = order_params.market_type;
 
     let topic = format!("swift_orders_{}_{market_index}", market_type.as_str());
-    log::trace!(target: "server", "{log_prefix}: Topic: {topic}");
 
     if let Some(kafka_producer) = &server_params.kafka_producer {
         match kafka_producer
