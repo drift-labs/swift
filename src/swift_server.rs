@@ -5,6 +5,27 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use crate::{
+    connection::kafka_connect::KafkaClientBuilder,
+    super_slot_subscriber::SuperSlotSubscriber,
+    types::{
+        messages::{
+            IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
+            PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
+            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+        },
+        types::unix_now_ms,
+    },
+    user_account_fetcher::UserAccountFetcher,
+    util::{
+        metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+        tx::send_tx,
+    },
+};
 use axum::{
     extract::State,
     http::Method,
@@ -15,11 +36,14 @@ use dotenv::dotenv;
 use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
+    priority_fee_subscriber::{PriorityFeeSubscriber, PriorityFeeSubscriberConfig},
+    swift_order_subscriber::{SignedMessageInfo, SignedOrderInfo},
     types::{
-        errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
-        VersionedMessage, VersionedTransaction,
+        accounts::User, errors::ErrorCode, CommitmentConfig, MarketId, MarketType, OrderParams,
+        OrderType, SdkError, VersionedMessage, VersionedTransaction,
     },
-    Context, DriftClient, RpcClient, TransactionBuilder,
+    utils::load_keypair_multi_format,
+    Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
 use log::warn;
 use prometheus::Registry;
@@ -38,24 +62,6 @@ use solana_sdk::{
     signer::Signer,
 };
 use tower_http::cors::{Any, CorsLayer};
-
-use crate::{
-    connection::kafka_connect::KafkaClientBuilder,
-    super_slot_subscriber::SuperSlotSubscriber,
-    types::{
-        messages::{
-            IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
-            SignedMessageInfo, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
-            PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
-            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-        },
-        types::unix_now_ms,
-    },
-    user_account_fetcher::UserAccountFetcher,
-    util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
-};
 
 struct Config {
     /// RPC tx simulation on/off
@@ -83,7 +89,9 @@ pub struct ServerParams {
     metrics: SwiftServerMetrics,
     redis_pool: Option<MultiplexedConnection>,
     user_account_fetcher: UserAccountFetcher,
+    priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     config: Arc<Config>,
+    ignore_submit_pubkeys: Vec<Pubkey>,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -111,11 +119,15 @@ pub async fn process_order(
     };
 
     let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
+    log::trace!(
+        target: "server",
+        "{log_prefix}: Received order with signing pubkey: {signing_pubkey}"
+    );
 
     let signed_msg = match incoming_message.verify_and_get_signed_message() {
         Ok(m) => m,
         Err(e) => {
-            log::error!("{log_prefix}: Error verifying signed message: {e:?}",);
+            log::warn!("{log_prefix}: Error verifying signed message: {e:?}",);
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
@@ -151,6 +163,10 @@ pub async fn process_order(
 
     // check the order is valid for execution by program
     if let Err(err) = validate_signed_order_params(&order_params) {
+        log::warn!(
+            target: "server",
+            "{log_prefix}: Order did not validate: {err:?}",
+        );
         return (
             axum::http::StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -159,7 +175,8 @@ pub async fn process_order(
             }),
         );
     }
-    match server_params
+
+    let user: Option<User> = match server_params
         .simulate_taker_order_rpc(&taker_pubkey, &order_params, current_slot)
         .await
     {
@@ -167,8 +184,9 @@ pub async fn process_order(
             server_params
                 .metrics
                 .rpc_simulation_status
-                .with_label_values(&[sim_res.as_str()])
+                .with_label_values(&[sim_res.status.as_str()])
                 .inc();
+            sim_res.user
         }
         Err((status, sim_err_str)) => {
             server_params
@@ -176,6 +194,10 @@ pub async fn process_order(
                 .rpc_simulation_status
                 .with_label_values(&["invalid"])
                 .inc();
+            log::warn!(
+                target: "server",
+                "{log_prefix}: Order sim failed: {sim_err_str}",
+            );
             return (
                 status,
                 Json(ProcessOrderResponse {
@@ -183,6 +205,103 @@ pub async fn process_order(
                     error: Some(sim_err_str),
                 }),
             );
+        }
+    };
+
+    if user.is_none() {
+        log::warn!(
+            target: "server",
+            "{log_prefix}: Error simulating order, user not found"
+        );
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND,
+                error: Some("user not found".to_string()),
+            }),
+        );
+    }
+    let user = user.unwrap();
+
+    // If fat fingered order that requires sanitization, then just send the order
+    let mut order_params = order_params.clone();
+    if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
+        let ignore = server_params
+            .ignore_submit_pubkeys
+            .contains(&taker_authority);
+        if ignore {
+            log::debug!(
+                target: "server",
+                "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
+            );
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
+                    error: Some("Sanitized order not submitted".to_string()),
+                }),
+            );
+        }
+
+        server_params.metrics.sanitized_orders_counter.inc();
+
+        let uuid = std::str::from_utf8(&uuid)
+            .expect("invalid utf8 uuid")
+            .to_string();
+        let tx_builder = TransactionBuilder::new(
+            server_params.drift.program_data(),
+            taker_pubkey,
+            std::borrow::Cow::Owned(user),
+            false,
+        )
+        .with_priority_fee(
+            server_params.priority_fee_subscriber.priority_fee(),
+            Some(1_400_000),
+        );
+
+        let signed_order_info = SignedOrderInfo::new(
+            uuid,
+            taker_authority,
+            signing_pubkey,
+            *signed_msg,
+            Signature::from(taker_signature.to_bytes()),
+        );
+        let versioned_message = tx_builder
+            .place_swift_order(&signed_order_info, &user)
+            .build();
+
+        let place_tx = send_tx(
+            &server_params.drift,
+            versioned_message,
+            "place swift order",
+            Some(30),
+            log_prefix.clone(),
+        );
+
+        match place_tx.await {
+            Ok(tx_sig) => {
+                log::trace!(target: "server", "{log_prefix}: Sending sanitized order with order params: {order_params:?}, tx sig: {tx_sig:?}");
+                return (
+                    axum::http::StatusCode::OK,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    }),
+                );
+            }
+            Err(err) => {
+                log::error!(
+                    target: "server",
+                    "{log_prefix}: Error sending order: {err:?}"
+                );
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some(format!("tx send error: {err:?}")),
+                    }),
+                );
+            }
         }
     }
 
@@ -195,13 +314,10 @@ pub async fn process_order(
         uuid,
     };
     let encoded = order_metadata.encode();
-    log::trace!(target: "server", "base64 encoded message: {encoded:?}");
-
     let market_index = order_params.market_index;
     let market_type = order_params.market_type;
 
     let topic = format!("swift_orders_{}_{market_index}", market_type.as_str());
-    log::trace!(target: "server", "{log_prefix}: Topic: {topic}");
 
     if let Some(kafka_producer) = &server_params.kafka_producer {
         match kafka_producer
@@ -380,13 +496,20 @@ pub async fn health_check(
             | user_account_fetcher_healthy={user_account_fetcher_redis_health} |
             redis_healthy={redis_health}",
         );
-        log::error!("{}", &msg);
+        log::error!(target: "server", "Failed health check {}", &msg);
         (axum::http::StatusCode::PRECONDITION_FAILED, msg)
     }
 }
 
 pub async fn start_server() {
     dotenv().ok();
+
+    let keypair =
+        load_keypair_multi_format(env::var("PRIVATE_KEY").expect("PRIVATE_KEY set").as_str());
+    if let Err(err) = keypair {
+        log::error!(target: "server", "Failed to load swift private key: {err:?}");
+        return;
+    }
 
     let use_kafka: bool = env::var("USE_KAFKA").unwrap_or_else(|_| "false".to_string()) == "true";
     let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string()) == "true";
@@ -441,6 +564,7 @@ pub async fn start_server() {
     let rpc_endpoint =
         drift_rs::utils::get_http_url(&env::var("ENDPOINT").expect("valid rpc endpoint"))
             .expect("valid RPC endpoint");
+    let rpc_endpoint_cloned = rpc_endpoint.clone(); // for the priority fee subscriber
 
     // Registry for metrics
     let registry = Registry::new();
@@ -452,13 +576,11 @@ pub async fn start_server() {
         "mainnet-beta" => Context::MainNet,
         _ => panic!("Invalid drift environment: {drift_env}"),
     };
-    let client = DriftClient::new(
-        context,
-        RpcClient::new(rpc_endpoint),
-        Keypair::new().into(), // not sending txs
-    )
-    .await
-    .expect("initialized client");
+    let wallet = Wallet::new(keypair.unwrap());
+    let client = DriftClient::new(context, RpcClient::new(rpc_endpoint), wallet)
+        .await
+        .expect("initialized client");
+    client.subscribe_blockhashes().await.unwrap();
 
     let user_account_fetcher = UserAccountFetcher::from_env(client.clone()).await;
 
@@ -474,6 +596,35 @@ pub async fn start_server() {
     let mut slot_subscriber = SuperSlotSubscriber::new(ws_clients, client.rpc());
     slot_subscriber.subscribe();
 
+    let pubkeys: Vec<Pubkey> = client
+        .program_data()
+        .perp_market_configs()
+        .iter()
+        .map(|config| config.pubkey)
+        .collect();
+    let priority_fee_subscriber = PriorityFeeSubscriber::with_config(
+        RpcClient::new_with_commitment(rpc_endpoint_cloned.into(), CommitmentConfig::confirmed()),
+        &pubkeys[..],
+        PriorityFeeSubscriberConfig {
+            refresh_frequency: Some(Duration::from_millis(400 * 10)),
+            window: None,
+        },
+    );
+
+    // Set ignore pubkeys
+    let ignore_pubkeys = env::var("IGNORE_PUBKEYS").unwrap_or_else(|_| "".to_string());
+    let pubkeys: Vec<Pubkey> = ignore_pubkeys
+        .split(',')
+        .map(|s| s.trim()) // remove extra whitespace
+        .filter_map(|s| match s.parse::<Pubkey>() {
+            Ok(key) => Some(key),
+            Err(_) => {
+                log::warn!(target: "server", "Warning: invalid pubkey skipped for ignore pubkeys: {s:?}");
+                None
+            }
+        })
+        .collect();
+
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::new(slot_subscriber),
@@ -481,7 +632,9 @@ pub async fn start_server() {
         metrics,
         redis_pool,
         user_account_fetcher,
+        priority_fee_subscriber: priority_fee_subscriber.subscribe(),
         config: Arc::new(Config::from_env()),
+        ignore_submit_pubkeys: pubkeys,
     }));
 
     // start oracle/market subscriptions (async)
@@ -642,6 +795,12 @@ impl SimulationStatus {
     }
 }
 
+// Can we get compute units from local sim?
+pub struct SimulationResult {
+    pub status: SimulationStatus,
+    pub user: Option<drift_rs::types::accounts::User>,
+}
+
 impl ServerParams {
     /// Toggle RPC simulation off
     pub fn disable_rpc_sim(&self) {
@@ -701,10 +860,11 @@ impl ServerParams {
         taker_subaccount_pubkey: &Pubkey,
         taker_order_params: &OrderParams,
         slot: Slot,
-    ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
-        if self.is_rpc_sim_disabled() {
-            return Ok(SimulationStatus::Disabled);
-        }
+    ) -> Result<SimulationResult, (axum::http::StatusCode, String)> {
+        let mut sim_result = SimulationResult {
+            status: SimulationStatus::Disabled,
+            user: None,
+        };
 
         let t0 = SystemTime::now();
 
@@ -716,8 +876,9 @@ impl ServerParams {
         .await;
 
         if user_with_timeout.is_err() {
+            sim_result.status = SimulationStatus::Timeout;
             warn!(target: "sim", "simulateTransaction degraded (timeout)");
-            return Ok(SimulationStatus::Timeout);
+            return Ok(sim_result);
         }
 
         let user_result = user_with_timeout.unwrap();
@@ -728,12 +889,19 @@ impl ServerParams {
             )
         })?;
 
+        sim_result.user = Some(user);
+
+        if self.is_rpc_sim_disabled() {
+            return Ok(sim_result);
+        }
+
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
         if self.simulate_taker_order_local(taker_order_params, &user) {
+            sim_result.status = SimulationStatus::Success;
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
-            return Ok(SimulationStatus::Success);
+            return Ok(sim_result);
         }
 
         // fallback to network sim
@@ -784,14 +952,55 @@ impl ServerParams {
                     }
                 } else {
                     log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
-                    Ok(SimulationStatus::SuccessRpc)
+                    sim_result.status = SimulationStatus::SuccessRpc;
+                    Ok(sim_result)
                 }
             }
             Ok(Err(err)) => {
                 log::warn!(target: "sim", "network sim error: {err:?}");
-                Ok(SimulationStatus::Degraded)
+                sim_result.status = SimulationStatus::Degraded;
+                Ok(sim_result)
             }
-            Err(_) => Ok(SimulationStatus::Timeout),
+            Err(_) => {
+                sim_result.status = SimulationStatus::Timeout;
+                Ok(sim_result)
+            }
+        }
+    }
+
+    /// Simulate if auction params will be sanitized
+    fn simulate_will_auction_params_sanitize(&self, order_params: &mut OrderParams) -> bool {
+        let perp_market = match self
+            .drift
+            .try_get_perp_market_account(order_params.market_index)
+        {
+            Ok(m) => m,
+            Err(err) => {
+                log::debug!(target: "sim", "couldn't get perp market: {err:?}");
+                return false;
+            }
+        };
+
+        let market_id = MarketId::new(order_params.market_index, order_params.market_type);
+        let oracle_data = match self.drift.try_get_oracle_price_data_and_slot(market_id) {
+            Some(p) => p,
+            None => {
+                log::debug!(target: "sim", "orace price is None");
+                return false;
+            }
+        };
+
+        match drift_rs::ffi::simulate_will_auction_params_sanitize(
+            order_params,
+            &perp_market,
+            oracle_data.data.price,
+            true,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                log::debug!(target: "sim", "local sim failed: {err:?}");
+                true
+            }
         }
     }
 }
