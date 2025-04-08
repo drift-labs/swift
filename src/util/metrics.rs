@@ -49,7 +49,7 @@ impl SwiftServerMetrics {
         )
         .unwrap();
         let sanitized_orders_counter = Counter::new(
-            "swift_taker_orders_count",
+            "swift_sanitized_orders_count",
             "Number of taker orders received",
         )
         .unwrap();

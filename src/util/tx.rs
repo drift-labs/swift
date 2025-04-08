@@ -46,7 +46,7 @@ pub async fn send_tx(
         .send_transaction_with_config(&tx, tx_config)
         .await
         .inspect(|s| {
-            log::debug!(target: "tx", "{log_prefix} sent tx ({reason}): {s}");
+            log::debug!(target: LOG_TARGET, "{log_prefix} sent tx ({reason}): {s}");
         })
         .map_err(|err| {
             warn!(target: LOG_TARGET, "sending tx ({reason}) failed: {err:?}");

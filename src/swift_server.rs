@@ -288,8 +288,8 @@ pub async fn process_order(
         .await;
 
         match place_tx_with_timeout {
-            Ok(Ok(_)) => {
-                log::trace!(target: "server", "{log_prefix}: Order sent successfully");
+            Ok(Ok(tx_sig)) => {
+                log::trace!(target: "server", "{log_prefix}: Order sent successfully {tx_sig:?}");
             }
             Ok(Err(err)) => {
                 log::error!(
