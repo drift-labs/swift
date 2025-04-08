@@ -244,6 +244,12 @@ pub async fn process_order(
             );
         }
 
+        log::trace!(
+            target: "server",
+            "{log_prefix}: Sending sanitized order with order params: {order_params:?}"
+        );
+        server_params.metrics.sanitized_orders_counter.inc();
+
         let uuid = std::str::from_utf8(&uuid)
             .expect("invalid utf8 uuid")
             .to_string();
@@ -473,7 +479,7 @@ pub async fn health_check(
         (axum::http::StatusCode::OK, "ok".into())
     } else {
         let msg = format!("slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy}");
-        log::error!("{}", &msg);
+        log::error!(target: "server", "Failed health check {}", &msg);
         (axum::http::StatusCode::PRECONDITION_FAILED, msg)
     }
 }
@@ -484,7 +490,7 @@ pub async fn start_server() {
     let keypair =
         load_keypair_multi_format(env::var("PRIVATE_KEY").expect("PRIVATE_KEY set").as_str());
     if let Err(err) = keypair {
-        log::error!("Failed to load swift private key: {err:?}");
+        log::error!(target: "server", "Failed to load swift private key: {err:?}");
         return;
     }
 
@@ -596,7 +602,7 @@ pub async fn start_server() {
         .filter_map(|s| match s.parse::<Pubkey>() {
             Ok(key) => Some(key),
             Err(_) => {
-                log::warn!("Warning: invalid pubkey skipped: {}", s);
+                log::warn!(target: "server", "Warning: invalid pubkey skipped for ignore pubkeys: {s:?}");
                 None
             }
         })

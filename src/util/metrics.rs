@@ -32,6 +32,7 @@ pub async fn metrics_handler(
 
 #[derive(Clone)]
 pub struct SwiftServerMetrics {
+    pub sanitized_orders_counter: Counter,
     pub taker_orders_counter: Counter,
     pub order_type_counter: CounterVec,
     pub kafka_forward_fail_counter: Counter,
@@ -43,6 +44,11 @@ pub struct SwiftServerMetrics {
 impl SwiftServerMetrics {
     pub fn new() -> Self {
         let taker_orders_counter = Counter::new(
+            "swift_taker_orders_count",
+            "Number of taker orders received",
+        )
+        .unwrap();
+        let sanitized_orders_counter = Counter::new(
             "swift_taker_orders_count",
             "Number of taker orders received",
         )
@@ -77,6 +83,7 @@ impl SwiftServerMetrics {
 
         SwiftServerMetrics {
             taker_orders_counter,
+            sanitized_orders_counter,
             order_type_counter,
             kafka_forward_fail_counter,
             current_slot_gauge,
@@ -88,6 +95,9 @@ impl SwiftServerMetrics {
     pub fn register(&self, registry: &prometheus::Registry) {
         registry
             .register(Box::new(self.taker_orders_counter.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.sanitized_orders_counter.clone()))
             .unwrap();
         registry
             .register(Box::new(self.order_type_counter.clone()))
