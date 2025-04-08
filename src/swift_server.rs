@@ -245,13 +245,34 @@ pub async fn process_order(
 
         server_params.metrics.sanitized_orders_counter.inc();
 
+        if server_params.is_rpc_sim_disabled() {
+            log::warn!(
+                target: "server",
+                "{log_prefix}: RPC disabled, not sending order sanitized order"
+            );
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                    error: Some("RPC offline and order would get sanitized".to_string()),
+                }),
+            );
+        }
+
         let uuid = std::str::from_utf8(&uuid)
             .expect("invalid utf8 uuid")
             .to_string();
+
+        let swift_subaccount = server_params.drift.wallet().default_sub_account();
+        let swift_user = server_params
+            .drift
+            .get_user_account(&swift_subaccount)
+            .await
+            .unwrap();
         let tx_builder = TransactionBuilder::new(
             server_params.drift.program_data(),
-            taker_pubkey,
-            std::borrow::Cow::Owned(user),
+            swift_subaccount,
+            std::borrow::Cow::Owned(swift_user),
             false,
         )
         .with_priority_fee(
@@ -580,7 +601,6 @@ pub async fn start_server() {
     let client = DriftClient::new(context, RpcClient::new(rpc_endpoint), wallet)
         .await
         .expect("initialized client");
-    client.subscribe_blockhashes().await.unwrap();
 
     let user_account_fetcher = UserAccountFetcher::from_env(client.clone()).await;
 
@@ -647,6 +667,23 @@ pub async fn start_server() {
         }
         if let Err(err) = state.drift.subscribe_oracles(&all_markets).await {
             log::error!("couldn't subscribe oracles: {err:?}, RPC sim disabled!");
+            state.disable_rpc_sim();
+        }
+
+        if let Err(err) = state
+            .drift
+            .subscribe_account_polled(
+                &state.drift.wallet().default_sub_account(),
+                Duration::from_secs(300),
+            )
+            .await
+        {
+            log::error!("couldn't subscribe to swift user account: {err:?}, RPC sim disabled!");
+            state.disable_rpc_sim();
+        }
+
+        if let Err(err) = state.drift.subscribe_blockhashes().await {
+            log::error!("couldn't subscribe to blockhashes: {err:?}, RPC sim disabled!");
             state.disable_rpc_sim();
         }
     });
