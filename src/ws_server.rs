@@ -108,9 +108,8 @@ impl Challenge {
     ///
     /// * `pubkey` purported identity
     /// * `signature` signed bytes of challenge `nonce`
-    fn authenticate(&self, pubkey: [u8; 32], signature: [u8; 64]) -> Result<()> {
+    fn authenticate(&self, pubkey: [u8; 32], signature: &Signature) -> Result<()> {
         let pubkey = PublicKey::from_bytes(pubkey.as_slice()).context("Invalid public key")?;
-        let signature = Signature::from_bytes(signature.as_slice()).context("Invalid signature")?;
 
         // Check if the nonce has expired
         if self.expires_at < std::time::Instant::now() {
@@ -118,7 +117,7 @@ impl Challenge {
         }
 
         pubkey
-            .verify(self.nonce.as_bytes(), &signature)
+            .verify(self.nonce.as_bytes(), signature)
             .context("Invalid message/signature")
     }
 }
@@ -348,7 +347,7 @@ impl WsConnection {
                 }
 
                 let challenge = self.challenge.as_ref().expect("challenge exists");
-                match challenge.authenticate(pubkey, signature) {
+                match challenge.authenticate(pubkey.to_bytes(), &signature) {
                     Ok(_) => {
                         self.send_message(WsMessage::auth().set_message("Authenticated"))?;
                         self.authenticated = true;
@@ -359,11 +358,7 @@ impl WsConnection {
                             let pubkey = self.pubkey;
                             async move {
                                 let is_fast_ws = if *FAST_CHECK {
-                                    determine_fast_ws(
-                                        &pubkey,
-                                        &Pubkey::new_from_array(stake_pubkey),
-                                    )
-                                    .await
+                                    determine_fast_ws(&pubkey, &stake_pubkey).await
                                 } else {
                                     Ok(true)
                                 };
@@ -1044,8 +1039,8 @@ mod test {
 
         let res = ws_conn.handle_client_message(
             WsClientMessage::Auth(WsAuthMessage {
-                pubkey: wallet.authority().to_bytes(),
-                stake_pubkey: Pubkey::new_unique().to_bytes(),
+                pubkey: *wallet.authority(),
+                stake_pubkey: Pubkey::new_unique(),
                 signature: signature.as_ref().try_into().unwrap(),
             }),
             Box::leak(Box::default()),
@@ -1062,9 +1057,9 @@ mod test {
         let mut ws_conn = WsConnection::new(pubkey);
         let res = ws_conn.handle_client_message(
             WsClientMessage::Auth(WsAuthMessage {
-                pubkey: pubkey.to_bytes(),
-                signature: [1u8; 64],
-                stake_pubkey: stake_pubkey.to_bytes(),
+                pubkey,
+                signature: [1u8; 64].into(),
+                stake_pubkey,
             }),
             Box::leak(Box::default()),
         );

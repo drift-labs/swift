@@ -16,7 +16,7 @@ use crate::{
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
             PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND, PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
-            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS, PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT,
+            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
         },
         types::unix_now_ms,
     },
@@ -106,17 +106,16 @@ pub async fn process_order(
     server_params.metrics.taker_orders_counter.inc();
 
     let IncomingSignedMessage {
-        taker_pubkey,
+        taker_pubkey: taker_authority,
         signature: taker_signature,
         message: _,
         signing_authority,
     } = incoming_message;
 
-    let taker_authority = Pubkey::new_from_array(taker_pubkey);
-    let signing_pubkey = if signing_authority == [0u8; 32] {
+    let signing_pubkey = if signing_authority == Pubkey::default() {
         taker_authority
     } else {
-        Pubkey::new_from_array(signing_authority)
+        signing_authority
     };
 
     let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
@@ -265,7 +264,7 @@ pub async fn process_order(
             taker_authority,
             signing_pubkey,
             *signed_msg,
-            Signature::from(taker_signature),
+            Signature::from(taker_signature.to_bytes()),
         );
         let versioned_message = tx_builder
             .place_swift_order(&signed_order_info, &user)
@@ -310,7 +309,7 @@ pub async fn process_order(
         signing_authority: signing_pubkey,
         taker_authority,
         order_message: signed_msg.clone(),
-        order_signature: taker_signature,
+        order_signature: taker_signature.into(),
         ts: process_order_time,
         uuid,
     };
@@ -464,10 +463,39 @@ pub async fn health_check(
 ) -> impl axum::response::IntoResponse {
     let ws_healthy = server_params.drift.ws().is_running();
     let slot_sub_healthy = !server_params.slot_subscriber.is_stale();
-    if ws_healthy && slot_sub_healthy {
+
+    // Check if optional accounts are healthy
+    let user_account_fetcher_redis_health = if server_params.user_account_fetcher.redis.is_some() {
+        server_params
+            .user_account_fetcher
+            .check_redis_health()
+            .await
+    } else {
+        true
+    };
+
+    // Check if optional accounts are healthy
+    let redis_health = if server_params.redis_pool.is_some() {
+        let redis_health = if let Some(mut conn) = server_params.redis_pool.clone() {
+            let ping_result: redis::RedisResult<String> =
+                redis::cmd("PING").query_async(&mut conn).await;
+            ping_result.is_ok()
+        } else {
+            false
+        };
+        redis_health
+    } else {
+        true
+    };
+
+    if ws_healthy && slot_sub_healthy && user_account_fetcher_redis_health && redis_health {
         (axum::http::StatusCode::OK, "ok".into())
     } else {
-        let msg = format!("slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy}");
+        let msg = format!(
+            "slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy} 
+            | user_account_fetcher_healthy={user_account_fetcher_redis_health} |
+            redis_healthy={redis_health}",
+        );
         log::error!(target: "server", "Failed health check {}", &msg);
         (axum::http::StatusCode::PRECONDITION_FAILED, msg)
     }

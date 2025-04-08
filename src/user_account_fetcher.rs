@@ -7,7 +7,7 @@ use solana_sdk::{clock::Slot, pubkey::Pubkey};
 /// Fetches users from UserMap server
 #[derive(Clone)]
 pub struct UserAccountFetcher {
-    redis: Option<MultiplexedConnection>,
+    pub redis: Option<MultiplexedConnection>,
     drift: DriftClient,
 }
 
@@ -43,6 +43,19 @@ impl UserAccountFetcher {
         };
 
         Self { redis, drift }
+    }
+
+    /// Use pings to check for health
+    pub async fn check_redis_health(&self) -> bool {
+        if let Some(mut conn) = self.redis.clone() {
+            let ping_result: redis::RedisResult<String> =
+                redis::cmd("PING").query_async(&mut conn).await;
+            if ping_result.is_ok() {
+                return true;
+            }
+            log::error!("Redis health check failed: {:?}", ping_result.err());
+        }
+        false
     }
 
     // Fetch a drift `User` from usermap, falling back to RPC
