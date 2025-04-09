@@ -507,13 +507,21 @@ pub async fn health_check(
         true
     };
 
-    if ws_healthy && slot_sub_healthy && user_account_fetcher_redis_health && redis_health {
+    // Check if rpc is healthy
+    let rpc_healthy = server_params.drift.rpc().get_health().await.is_ok();
+
+    if ws_healthy
+        && slot_sub_healthy
+        && user_account_fetcher_redis_health
+        && redis_health
+        && rpc_healthy
+    {
         (axum::http::StatusCode::OK, "ok".into())
     } else {
         let msg = format!(
             "slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy} 
             | user_account_fetcher_healthy={user_account_fetcher_redis_health} |
-            redis_healthy={redis_health}",
+            redis_healthy={redis_health}|rpc_healthy={rpc_healthy}",
         );
         log::error!(target: "server", "Failed health check {}", &msg);
         (axum::http::StatusCode::PRECONDITION_FAILED, msg)
