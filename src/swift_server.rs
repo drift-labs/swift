@@ -259,20 +259,15 @@ pub async fn process_order(
             );
         }
 
-        let uuid = std::str::from_utf8(&uuid)
-            .expect("invalid utf8 uuid")
-            .to_string();
-
         let swift_subaccount = server_params.drift.wallet().default_sub_account();
-        let swift_user = server_params
-            .drift
-            .get_user_account(&swift_subaccount)
-            .await
-            .unwrap();
         let tx_builder = TransactionBuilder::new(
             server_params.drift.program_data(),
             swift_subaccount,
-            std::borrow::Cow::Owned(swift_user),
+            std::borrow::Cow::Owned(User {
+                sub_account_id: 0,
+                authority: *server_params.drift.wallet().authority(),
+                ..Default::default()
+            }),
             false,
         )
         .with_priority_fee(
@@ -280,6 +275,9 @@ pub async fn process_order(
             Some(1_400_000),
         );
 
+        let uuid = std::str::from_utf8(&uuid)
+            .expect("invalid utf8 uuid")
+            .to_string();
         let signed_order_info = SignedOrderInfo::new(
             uuid,
             taker_authority,
@@ -667,18 +665,6 @@ pub async fn start_server() {
         }
         if let Err(err) = state.drift.subscribe_oracles(&all_markets).await {
             log::error!("couldn't subscribe oracles: {err:?}, RPC sim disabled!");
-            state.disable_rpc_sim();
-        }
-
-        if let Err(err) = state
-            .drift
-            .subscribe_account_polled(
-                &state.drift.wallet().default_sub_account(),
-                Duration::from_secs(300),
-            )
-            .await
-        {
-            log::error!("couldn't subscribe to swift user account: {err:?}, RPC sim disabled!");
             state.disable_rpc_sim();
         }
 
