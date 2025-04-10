@@ -37,8 +37,6 @@ pub enum TxError {
     TxFailed { reason: String, code: u32 },
     #[error("tx not found: {tx_sig}")]
     TxNotFound { tx_sig: String },
-    #[error("tx sim error: {tx_sig}")]
-    SimError { tx_sig: String },
 }
 
 /// Current unix timestamp (ms)
