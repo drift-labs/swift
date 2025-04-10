@@ -68,6 +68,8 @@ struct Config {
     disable_rpc_sim: AtomicBool,
     /// RPC tx simulation timeout
     simulation_timeout: Duration,
+    /// Send sanitized orders directly
+    send_sanitized_orders: AtomicBool,
 }
 
 impl Config {
@@ -77,6 +79,9 @@ impl Config {
                 std::env::var("DISABLE_RPC_SIM").unwrap_or("false".to_string()) == "true",
             ),
             simulation_timeout: Duration::from_millis(300),
+            send_sanitized_orders: AtomicBool::new(
+                std::env::var("SEND_SANITIZED_ORDERS").unwrap_or("false".to_string()) == "true",
+            ),
         }
     }
 }
@@ -224,102 +229,104 @@ pub async fn process_order(
     let user = user.unwrap();
 
     // If fat fingered order that requires sanitization, then just send the order
-    let mut order_params = order_params.clone();
-    if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
-        let ignore = server_params
-            .ignore_submit_pubkeys
-            .contains(&taker_authority);
-        if ignore {
-            log::debug!(
-                target: "server",
-                "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
-            );
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(ProcessOrderResponse {
-                    message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
-                    error: Some("Sanitized order not submitted".to_string()),
-                }),
-            );
-        }
-
-        server_params.metrics.sanitized_orders_counter.inc();
-
-        if server_params.is_rpc_sim_disabled() {
-            log::warn!(
-                target: "server",
-                "{log_prefix}: RPC disabled, not sending order sanitized order"
-            );
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(ProcessOrderResponse {
-                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-                    error: Some("RPC offline and order would get sanitized".to_string()),
-                }),
-            );
-        }
-
-        let swift_subaccount = server_params.drift.wallet().default_sub_account();
-        let tx_builder = TransactionBuilder::new(
-            server_params.drift.program_data(),
-            swift_subaccount,
-            std::borrow::Cow::Owned(User {
-                sub_account_id: 0,
-                authority: *server_params.drift.wallet().authority(),
-                ..Default::default()
-            }),
-            false,
-        )
-        .with_priority_fee(
-            server_params.priority_fee_subscriber.priority_fee(),
-            Some(1_400_000),
-        );
-
-        let uuid = std::str::from_utf8(&uuid)
-            .expect("invalid utf8 uuid")
-            .to_string();
-        let signed_order_info = SignedOrderInfo::new(
-            uuid,
-            taker_authority,
-            signing_pubkey,
-            *signed_msg,
-            Signature::from(taker_signature.to_bytes()),
-        );
-        let versioned_message = tx_builder
-            .place_swift_order(&signed_order_info, &user)
-            .build();
-
-        let place_tx = send_tx(
-            &server_params.drift,
-            versioned_message,
-            "place swift order",
-            Some(30),
-            log_prefix.clone(),
-        );
-
-        match place_tx.await {
-            Ok(tx_sig) => {
-                log::trace!(target: "server", "{log_prefix}: Sending sanitized order with order params: {order_params:?}, tx sig: {tx_sig:?}");
-                return (
-                    axum::http::StatusCode::OK,
-                    Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                        error: None,
-                    }),
-                );
-            }
-            Err(err) => {
-                log::error!(
+    if server_params.can_send_sanitized_orders() {
+        let mut order_params = order_params.clone();
+        if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
+            let ignore = server_params
+                .ignore_submit_pubkeys
+                .contains(&taker_authority);
+            if ignore {
+                log::debug!(
                     target: "server",
-                    "{log_prefix}: Error sending order: {err:?}"
+                    "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
                 );
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                        error: Some(format!("tx send error: {err:?}")),
+                        message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
+                        error: Some("Sanitized order not submitted".to_string()),
                     }),
                 );
+            }
+
+            server_params.metrics.sanitized_orders_counter.inc();
+
+            if server_params.is_rpc_sim_disabled() {
+                log::warn!(
+                    target: "server",
+                    "{log_prefix}: RPC disabled, not sending order sanitized order"
+                );
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                        error: Some("RPC offline and order would get sanitized".to_string()),
+                    }),
+                );
+            }
+
+            let swift_subaccount = server_params.drift.wallet().default_sub_account();
+            let tx_builder = TransactionBuilder::new(
+                server_params.drift.program_data(),
+                swift_subaccount,
+                std::borrow::Cow::Owned(User {
+                    sub_account_id: 0,
+                    authority: *server_params.drift.wallet().authority(),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .with_priority_fee(
+                server_params.priority_fee_subscriber.priority_fee(),
+                Some(1_400_000),
+            );
+
+            let uuid = std::str::from_utf8(&uuid)
+                .expect("invalid utf8 uuid")
+                .to_string();
+            let signed_order_info = SignedOrderInfo::new(
+                uuid,
+                taker_authority,
+                signing_pubkey,
+                *signed_msg,
+                Signature::from(taker_signature.to_bytes()),
+            );
+            let versioned_message = tx_builder
+                .place_swift_order(&signed_order_info, &user)
+                .build();
+
+            let place_tx = send_tx(
+                &server_params.drift,
+                versioned_message,
+                "place swift order",
+                Some(30),
+                log_prefix.clone(),
+            );
+
+            match place_tx.await {
+                Ok(tx_sig) => {
+                    log::trace!(target: "server", "{log_prefix}: Sending sanitized order with order params: {order_params:?}, tx sig: {tx_sig:?}");
+                    return (
+                        axum::http::StatusCode::OK,
+                        Json(ProcessOrderResponse {
+                            message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                            error: None,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    log::error!(
+                        target: "server",
+                        "{log_prefix}: Error sending order: {err:?}"
+                    );
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(ProcessOrderResponse {
+                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                            error: Some(format!("tx send error: {err:?}")),
+                        }),
+                    );
+                }
             }
         }
     }
@@ -843,6 +850,12 @@ impl ServerParams {
     pub fn is_rpc_sim_disabled(&self) -> bool {
         self.config
             .disable_rpc_sim
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// True if we can send sanitized orders
+    pub fn can_send_sanitized_orders(&self) -> bool {
+        self.config
+            .send_sanitized_orders
             .load(std::sync::atomic::Ordering::Relaxed)
     }
     fn simulate_taker_order_local(
