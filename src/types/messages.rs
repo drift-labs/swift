@@ -8,83 +8,12 @@ use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
 use drift_rs::{
-    types::{
-        MarketType, OrderParams, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
-    },
-    Wallet,
+    swift_order_subscriber::{deser_signed_msg_type, SignedOrderType},
+    types::MarketType,
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use solana_sdk::{clock::Slot, pubkey::Pubkey};
-
-mod discriminators {
-    use std::cell::LazyCell;
-
-    use super::sighash;
-
-    pub const SIGNED_MSG_ORDER_PARAMS_MESSAGE: LazyCell<[u8; 8]> =
-        LazyCell::new(|| sighash("SignedMsgOrderParamsMessage"));
-
-    pub const SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE: LazyCell<[u8; 8]> =
-        LazyCell::new(|| sighash("SignedMsgOrderParamsDelegateMessage"));
-}
-
-// TODO: switch to use bytemuck
-/// Wrapper for SignedMsg types
-#[derive(Clone, Debug, PartialEq, AnchorSerialize, AnchorDeserialize, InitSpace)]
-pub enum SignedMsgType {
-    Authority(SignedMsgOrderParamsMessage),
-    Delegated(SignedMsgOrderParamsDelegateMessage),
-}
-
-impl SignedMsgType {
-    /// Get common info fields of the signed msg
-    pub fn info(&self, taker_authority: &Pubkey) -> SignedMessageInfo {
-        match self {
-            SignedMsgType::Authority(x) => SignedMessageInfo {
-                taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
-                order_params: x.signed_msg_order_params,
-                uuid: x.uuid,
-                slot: x.slot,
-            },
-            SignedMsgType::Delegated(x) => SignedMessageInfo {
-                taker_pubkey: x.taker_pubkey,
-                order_params: x.signed_msg_order_params,
-                uuid: x.uuid,
-                slot: x.slot,
-            },
-        }
-    }
-    /// Serialize as a borsh buffer
-    /// This differs from AnchorSerialize as it does _not_ encode the enum byte
-    pub fn to_borsh(&self) -> ArrayVec<u8, { SignedMsgType::INIT_SPACE + 8 }> {
-        let mut buf = ArrayVec::new();
-        match self {
-            SignedMsgType::Authority(ref x) => {
-                (*self::discriminators::SIGNED_MSG_ORDER_PARAMS_MESSAGE)
-                    .serialize(&mut buf)
-                    .unwrap();
-                x.serialize(&mut buf).unwrap();
-            }
-            SignedMsgType::Delegated(ref x) => {
-                (*self::discriminators::SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE)
-                    .serialize(&mut buf)
-                    .unwrap();
-                x.serialize(&mut buf).unwrap();
-            }
-        }
-
-        buf
-    }
-}
-
-/// Common fields of signed message types
-pub struct SignedMessageInfo {
-    pub taker_pubkey: Pubkey,
-    pub order_params: OrderParams,
-    pub uuid: [u8; 8],
-    pub slot: Slot,
-}
+use solana_sdk::pubkey::Pubkey;
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct IncomingSignedMessage {
@@ -93,7 +22,7 @@ pub struct IncomingSignedMessage {
     #[serde(deserialize_with = "deser_signature")]
     pub signature: Signature,
     #[serde(deserialize_with = "deser_signed_msg_type")]
-    pub message: SignedMsgType,
+    pub message: SignedOrderType,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub signing_authority: Pubkey,
 }
@@ -116,7 +45,7 @@ impl IncomingSignedMessage {
             .verify(&hex_bytes, &self.signature)
             .context("Signature did not verify")
     }
-    pub fn verify_and_get_signed_message(&self) -> Result<&SignedMsgType> {
+    pub fn verify_and_get_signed_message(&self) -> Result<&SignedOrderType> {
         self.verify_signature()?;
         Ok(&self.message)
     }
@@ -126,7 +55,7 @@ impl IncomingSignedMessage {
 pub struct OrderMetadataAndMessage {
     pub signing_authority: Pubkey,
     pub taker_authority: Pubkey,
-    pub order_message: SignedMsgType,
+    pub order_message: SignedOrderType,
     pub order_signature: [u8; 64],
     pub uuid: [u8; 8],
     pub ts: u64,
@@ -191,6 +120,9 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE: &str =
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slot too old";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
+pub const PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND: &str = "User not found";
+pub const PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT: &str = "Placing sanitizing tx timeout";
+pub const PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY: &str = "Ignore pubkey";
 
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -324,35 +256,6 @@ where
     Signature::from_bytes(&buf).map_err(serde::de::Error::custom)
 }
 
-/// Deserialize hex str into fixed size byte array with Borsh helpers
-pub fn deser_signed_msg_type<'de, D>(deserializer: D) -> Result<SignedMsgType, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let payload: &[u8] = serde::Deserialize::deserialize(deserializer)?;
-    if payload.len() % 2 != 0 {
-        return Err(serde::de::Error::custom("Hex string length must be even"));
-    }
-
-    // decode expecting the largest possible variant
-    let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
-
-    faster_hex::hex_decode(payload, &mut borsh_buf[..payload.len() / 2])
-        .map_err(serde::de::Error::custom)?;
-
-    // this is basically the same as if we derived AnchorDeserialize on `SignedMsgType` _expect_ it does not
-    // add a u8 to distinguish the enum
-    if borsh_buf[..8] == *self::discriminators::SIGNED_MSG_ORDER_PARAMS_DELEGATE_MESSAGE {
-        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
-            .map(SignedMsgType::Delegated)
-            .map_err(serde::de::Error::custom)
-    } else {
-        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
-            .map(SignedMsgType::Authority)
-            .map_err(serde::de::Error::custom)
-    }
-}
-
 pub fn deser_market_type<'de, D>(deserializer: D) -> Result<MarketType, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -361,19 +264,11 @@ where
     MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
 }
 
-/// Calculate anchor type sighash
-fn sighash(name: &str) -> [u8; 8] {
-    let preimage = format!("global:{name}");
-    let mut hasher = anchor_lang::solana_program::hash::Hasher::default();
-    hasher.hash(preimage.as_bytes());
-    let digest = hasher.result().to_bytes();
-    digest[..8].try_into().unwrap()
-}
-
 #[cfg(test)]
 mod tests {
     use drift_rs::types::{
         OrderParams, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
+        SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
     };
     use nanoid::nanoid;
 
@@ -396,7 +291,7 @@ mod tests {
             actual.signing_authority
                 == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
         );
-        if let SignedMsgType::Delegated(signed_msg) = actual.message {
+        if let SignedOrderType::Delegated(signed_msg) = actual.message {
             let expected = SignedMsgOrderParamsDelegateMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -463,7 +358,7 @@ mod tests {
                 == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
         );
 
-        if let SignedMsgType::Authority(signed_msg) = actual.message {
+        if let SignedOrderType::Authority(signed_msg) = actual.message {
             let expected = SignedMsgOrderParamsMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -501,7 +396,7 @@ mod tests {
         let encoded = OrderMetadataAndMessage {
             signing_authority: Pubkey::new_unique(),
             taker_authority: Pubkey::new_unique(),
-            order_message: SignedMsgType::Authority(Default::default()),
+            order_message: SignedOrderType::Authority(Default::default()),
             order_signature: [1u8; 64],
             ts: 55555,
             uuid: nanoid!(8).as_bytes().try_into().unwrap(),
@@ -538,7 +433,7 @@ mod tests {
             ..Default::default()
         };
 
-        let signed_order_message = SignedMsgType::Authority(order_params);
+        let signed_order_message = SignedOrderType::Authority(order_params);
 
         let order_metadata_json = OrderMetadataAndMessage {
             signing_authority,
