@@ -7,6 +7,7 @@ use drift_rs::types::VersionedMessage;
 use drift_rs::DriftClient;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
+use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
 use solana_sdk::commitment_config::CommitmentLevel;
 use tokio::time::Duration;
 
@@ -39,6 +40,33 @@ pub async fn send_tx(
         skip_preflight: true,
         ..Default::default()
     };
+
+    // simulate tx first
+    let sim_result = client
+        .rpc()
+        .simulate_transaction_with_config(
+            &tx,
+            RpcSimulateTransactionConfig {
+                sig_verify: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|err| {
+            warn!(target: LOG_TARGET, "sending tx ({reason}) failed: {err:?}");
+            // tx has some program/logic error, retry won't fix
+            handle_tx_err(err.into())
+        })?;
+
+    if let Some(err) = sim_result.value.err {
+        if let Some(sim_logs) = sim_result.value.logs {
+            warn!(target: LOG_TARGET, "{log_prefix} tx simulation logs: {sim_logs:?}");
+        }
+        warn!(target: LOG_TARGET, "{log_prefix} tx simulation failed: {err:?}");
+        return Err(TxError::SimError {
+            tx_sig: tx.signatures[0].to_string(),
+        });
+    }
 
     // submit to primary RPC first,
     let sig = client
