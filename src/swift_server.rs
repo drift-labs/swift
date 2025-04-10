@@ -96,7 +96,7 @@ pub struct ServerParams {
     user_account_fetcher: UserAccountFetcher,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     config: Arc<Config>,
-    ignore_submit_pubkeys: Vec<Pubkey>,
+    farmer_pubkeys: Vec<Pubkey>,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -108,14 +108,28 @@ pub async fn process_order(
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
     let process_order_time = unix_now_ms();
-    server_params.metrics.taker_orders_counter.inc();
-
     let IncomingSignedMessage {
         taker_pubkey: taker_authority,
         signature: taker_signature,
         message: _,
         signing_authority,
     } = incoming_message;
+
+    if server_params.farmer_pubkeys.contains(&taker_authority) {
+        log::debug!(
+            target: "server",
+            "Ignoring order from farmer pubkey: {taker_authority}"
+        );
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
+                error: None,
+            }),
+        );
+    }
+
+    server_params.metrics.taker_orders_counter.inc();
 
     let signing_pubkey = if signing_authority == Pubkey::default() {
         taker_authority
@@ -232,30 +246,33 @@ pub async fn process_order(
     if server_params.can_send_sanitized_orders() {
         let mut order_params = order_params.clone();
         if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
-            let ignore = server_params
-                .ignore_submit_pubkeys
-                .contains(&taker_authority);
-            if ignore {
-                log::debug!(
-                    target: "server",
-                    "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
-                );
-                return (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
-                        error: Some("Sanitized order not submitted".to_string()),
-                    }),
-                );
-            }
-
-            server_params.metrics.sanitized_orders_counter.inc();
+            server_params
+                .metrics
+                .order_type_counter
+                .with_label_values(&[
+                    &order_params.market_type.as_str(),
+                    &order_params.market_index.to_string(),
+                    "true",
+                ])
+                .inc();
 
             if server_params.is_rpc_sim_disabled() {
                 log::warn!(
                     target: "server",
                     "{log_prefix}: RPC disabled, not sending order sanitized order"
                 );
+                server_params
+                    .metrics
+                    .response_time_histogram
+                    .observe((unix_now_ms() - process_order_time) as f64);
+                (
+                    axum::http::StatusCode::OK,
+                    Json(ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    }),
+                );
+
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
@@ -301,6 +318,18 @@ pub async fn process_order(
                 "place swift order",
                 Some(30),
                 log_prefix.clone(),
+            );
+
+            server_params
+                .metrics
+                .response_time_histogram
+                .observe((unix_now_ms() - process_order_time) as f64);
+            (
+                axum::http::StatusCode::OK,
+                Json(ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                    error: None,
+                }),
             );
 
             match place_tx.await {
@@ -362,7 +391,7 @@ pub async fn process_order(
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&[market_type.as_str(), &market_index.to_string()])
+                    .with_label_values(&[market_type.as_str(), &market_index.to_string(), "false"])
                     .inc();
 
                 server_params
@@ -404,7 +433,7 @@ pub async fn process_order(
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&[market_type.as_str(), &market_index.to_string()])
+                    .with_label_values(&[market_type.as_str(), &market_index.to_string(), "false"])
                     .inc();
 
                 server_params
@@ -448,7 +477,7 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&["_", "heartbeat"])
+                    .with_label_values(&["_", "heartbeat", "_"])
                     .inc();
             }
             Err((e, _)) => {
@@ -471,7 +500,7 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&["_", "heartbeat"])
+                    .with_label_values(&["_", "heartbeat", "_"])
                     .inc();
             }
             Err(e) => {
@@ -667,7 +696,7 @@ pub async fn start_server() {
         user_account_fetcher,
         priority_fee_subscriber: priority_fee_subscriber.subscribe(),
         config: Arc::new(Config::from_env()),
-        ignore_submit_pubkeys: pubkeys,
+        farmer_pubkeys: pubkeys,
     }));
 
     // start oracle/market subscriptions (async)
