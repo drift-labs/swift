@@ -90,9 +90,6 @@ impl SwiftServerMetrics {
             .register(Box::new(self.taker_orders_counter.clone()))
             .unwrap();
         registry
-            .register(Box::new(self.sanitized_orders_counter.clone()))
-            .unwrap();
-        registry
             .register(Box::new(self.order_type_counter.clone()))
             .unwrap();
         registry
