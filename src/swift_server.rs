@@ -68,6 +68,8 @@ struct Config {
     disable_rpc_sim: AtomicBool,
     /// RPC tx simulation timeout
     simulation_timeout: Duration,
+    /// Send sanitized orders directly
+    send_sanitized_orders: AtomicBool,
 }
 
 impl Config {
@@ -77,6 +79,9 @@ impl Config {
                 std::env::var("DISABLE_RPC_SIM").unwrap_or("false".to_string()) == "true",
             ),
             simulation_timeout: Duration::from_millis(300),
+            send_sanitized_orders: AtomicBool::new(
+                std::env::var("SEND_SANITIZED_ORDERS").unwrap_or("false".to_string()) == "true",
+            ),
         }
     }
 }
@@ -91,7 +96,7 @@ pub struct ServerParams {
     user_account_fetcher: UserAccountFetcher,
     priority_fee_subscriber: Arc<PriorityFeeSubscriber>,
     config: Arc<Config>,
-    ignore_submit_pubkeys: Vec<Pubkey>,
+    farmer_pubkeys: Vec<Pubkey>,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
@@ -103,8 +108,6 @@ pub async fn process_order(
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
     let process_order_time = unix_now_ms();
-    server_params.metrics.taker_orders_counter.inc();
-
     let IncomingSignedMessage {
         taker_pubkey,
         signature: taker_signature,
@@ -113,11 +116,21 @@ pub async fn process_order(
         taker_authority,
     } = incoming_message;
 
-    let taker_authority = if taker_authority == Pubkey::default() {
-        taker_pubkey
-    } else {
-        taker_authority
-    };
+    if server_params.farmer_pubkeys.contains(&taker_authority) {
+        log::debug!(
+            target: "server",
+            "Ignoring order from farmer pubkey: {taker_authority}"
+        );
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
+                error: None,
+            }),
+        );
+    }
+
+    server_params.metrics.taker_orders_counter.inc();
 
     let signing_pubkey = if signing_authority == Pubkey::default() {
         taker_authority
@@ -231,83 +244,105 @@ pub async fn process_order(
     let user = user.unwrap();
 
     // If fat fingered order that requires sanitization, then just send the order
-    let mut order_params = order_params.clone();
-    if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
-        let ignore = server_params
-            .ignore_submit_pubkeys
-            .contains(&taker_authority);
-        if ignore {
-            log::debug!(
-                target: "server",
-                "{log_prefix}: Ignoring submit sanitized order for authority: {taker_authority}"
-            );
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(ProcessOrderResponse {
-                    message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
-                    error: Some("Sanitized order not submitted".to_string()),
-                }),
-            );
-        }
+    if server_params.can_send_sanitized_orders() {
+        let mut order_params = order_params;
+        if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
+            server_params
+                .metrics
+                .order_type_counter
+                .with_label_values(&[
+                    order_params.market_type.as_str(),
+                    &order_params.market_index.to_string(),
+                    "true",
+                ])
+                .inc();
 
-        server_params.metrics.sanitized_orders_counter.inc();
-
-        let uuid = std::str::from_utf8(&uuid)
-            .expect("invalid utf8 uuid")
-            .to_string();
-        let tx_builder = TransactionBuilder::new(
-            server_params.drift.program_data(),
-            taker_pubkey,
-            std::borrow::Cow::Owned(user),
-            false,
-        )
-        .with_priority_fee(
-            server_params.priority_fee_subscriber.priority_fee(),
-            Some(1_400_000),
-        );
-
-        let signed_order_info = SignedOrderInfo::new(
-            uuid,
-            taker_authority,
-            signing_pubkey,
-            *signed_msg,
-            Signature::from(taker_signature.to_bytes()),
-        );
-        let versioned_message = tx_builder
-            .place_swift_order(&signed_order_info, &user)
-            .build();
-
-        let place_tx = send_tx(
-            &server_params.drift,
-            versioned_message,
-            "place swift order",
-            Some(30),
-            log_prefix.clone(),
-        );
-
-        match place_tx.await {
-            Ok(tx_sig) => {
-                log::trace!(target: "server", "{log_prefix}: Sending sanitized order with order params: {order_params:?}, tx sig: {tx_sig:?}");
-                return (
-                    axum::http::StatusCode::OK,
-                    Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                        error: None,
-                    }),
-                );
-            }
-            Err(err) => {
-                log::error!(
+            if server_params.is_rpc_sim_disabled() {
+                log::warn!(
                     target: "server",
-                    "{log_prefix}: Error sending order: {err:?}"
+                    "{log_prefix}: RPC disabled, not sending order sanitized order"
                 );
+                server_params
+                    .metrics
+                    .response_time_histogram
+                    .observe((unix_now_ms() - process_order_time) as f64);
+
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                        error: Some(format!("tx send error: {err:?}")),
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                        error: Some("RPC offline and order would get sanitized".to_string()),
                     }),
                 );
+            }
+
+            let swift_subaccount = server_params.drift.wallet().default_sub_account();
+            let tx_builder = TransactionBuilder::new(
+                server_params.drift.program_data(),
+                swift_subaccount,
+                std::borrow::Cow::Owned(User {
+                    sub_account_id: 0,
+                    authority: *server_params.drift.wallet().authority(),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .with_priority_fee(
+                server_params.priority_fee_subscriber.priority_fee(),
+                Some(1_400_000),
+            );
+
+            let uuid = std::str::from_utf8(&uuid)
+                .expect("invalid utf8 uuid")
+                .to_string();
+            let signed_order_info = SignedOrderInfo::new(
+                uuid,
+                taker_authority,
+                signing_pubkey,
+                *signed_msg,
+                Signature::from(taker_signature.to_bytes()),
+            );
+            let versioned_message = tx_builder
+                .place_swift_order(&signed_order_info, &user)
+                .build();
+
+            let place_tx = send_tx(
+                &server_params.drift,
+                versioned_message,
+                "place swift order",
+                Some(30),
+                log_prefix.clone(),
+            );
+
+            server_params
+                .metrics
+                .response_time_histogram
+                .observe((unix_now_ms() - process_order_time) as f64);
+
+            match place_tx.await {
+                Ok(tx_sig) => {
+                    log::trace!(target: "server", "{log_prefix}: Sending sanitized order with order params: {order_params:?}, tx sig: {tx_sig:?}");
+                    return (
+                        axum::http::StatusCode::OK,
+                        Json(ProcessOrderResponse {
+                            message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                            error: None,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    log::error!(
+                        target: "server",
+                        "{log_prefix}: Error sending order: {err:?}"
+                    );
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        Json(ProcessOrderResponse {
+                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                            error: Some(format!("tx send error: {err:?}")),
+                        }),
+                    );
+                }
             }
         }
     }
@@ -315,7 +350,7 @@ pub async fn process_order(
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority,
-        order_message: signed_msg.clone(),
+        order_message: *signed_msg,
         order_signature: taker_signature.into(),
         ts: process_order_time,
         uuid,
@@ -343,7 +378,7 @@ pub async fn process_order(
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&[market_type.as_str(), &market_index.to_string()])
+                    .with_label_values(&[market_type.as_str(), &market_index.to_string(), "false"])
                     .inc();
 
                 server_params
@@ -385,7 +420,7 @@ pub async fn process_order(
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&[market_type.as_str(), &market_index.to_string()])
+                    .with_label_values(&[market_type.as_str(), &market_index.to_string(), "false"])
                     .inc();
 
                 server_params
@@ -429,7 +464,7 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&["_", "heartbeat"])
+                    .with_label_values(&["_", "heartbeat", "_"])
                     .inc();
             }
             Err((e, _)) => {
@@ -452,7 +487,7 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&["_", "heartbeat"])
+                    .with_label_values(&["_", "heartbeat", "_"])
                     .inc();
             }
             Err(e) => {
@@ -495,13 +530,21 @@ pub async fn health_check(
         true
     };
 
-    if ws_healthy && slot_sub_healthy && user_account_fetcher_redis_health && redis_health {
+    // Check if rpc is healthy
+    let rpc_healthy = server_params.drift.rpc().get_health().await.is_ok();
+
+    if ws_healthy
+        && slot_sub_healthy
+        && user_account_fetcher_redis_health
+        && redis_health
+        && rpc_healthy
+    {
         (axum::http::StatusCode::OK, "ok".into())
     } else {
         let msg = format!(
             "slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy} 
             | user_account_fetcher_healthy={user_account_fetcher_redis_health} |
-            redis_healthy={redis_health}",
+            redis_healthy={redis_health}|rpc_healthy={rpc_healthy}",
         );
         log::error!(target: "server", "Failed health check {}", &msg);
         (axum::http::StatusCode::PRECONDITION_FAILED, msg)
@@ -587,7 +630,6 @@ pub async fn start_server() {
     let client = DriftClient::new(context, RpcClient::new(rpc_endpoint), wallet)
         .await
         .expect("initialized client");
-    client.subscribe_blockhashes().await.unwrap();
 
     let user_account_fetcher = UserAccountFetcher::from_env(client.clone()).await;
 
@@ -610,7 +652,7 @@ pub async fn start_server() {
         .map(|config| config.pubkey)
         .collect();
     let priority_fee_subscriber = PriorityFeeSubscriber::with_config(
-        RpcClient::new_with_commitment(rpc_endpoint_cloned.into(), CommitmentConfig::confirmed()),
+        RpcClient::new_with_commitment(rpc_endpoint_cloned, CommitmentConfig::confirmed()),
         &pubkeys[..],
         PriorityFeeSubscriberConfig {
             refresh_frequency: Some(Duration::from_millis(400 * 10)),
@@ -641,7 +683,7 @@ pub async fn start_server() {
         user_account_fetcher,
         priority_fee_subscriber: priority_fee_subscriber.subscribe(),
         config: Arc::new(Config::from_env()),
-        ignore_submit_pubkeys: pubkeys,
+        farmer_pubkeys: pubkeys,
     }));
 
     // start oracle/market subscriptions (async)
@@ -654,6 +696,11 @@ pub async fn start_server() {
         }
         if let Err(err) = state.drift.subscribe_oracles(&all_markets).await {
             log::error!("couldn't subscribe oracles: {err:?}, RPC sim disabled!");
+            state.disable_rpc_sim();
+        }
+
+        if let Err(err) = state.drift.subscribe_blockhashes().await {
+            log::error!("couldn't subscribe to blockhashes: {err:?}, RPC sim disabled!");
             state.disable_rpc_sim();
         }
     });
@@ -819,6 +866,12 @@ impl ServerParams {
     pub fn is_rpc_sim_disabled(&self) -> bool {
         self.config
             .disable_rpc_sim
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// True if we can send sanitized orders
+    pub fn can_send_sanitized_orders(&self) -> bool {
+        self.config
+            .send_sanitized_orders
             .load(std::sync::atomic::Ordering::Relaxed)
     }
     fn simulate_taker_order_local(
