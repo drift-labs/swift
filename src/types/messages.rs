@@ -343,6 +343,34 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_incoming_signed_message_with_taker_authority() {
+        let message = r#"{
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001000080841e00000000000000000000000000020000000000000000013201abe72e7c000000000162d06c7d00000000000066190816000000005a645349472d634c0000",
+            "signature": "LiwPgg6VXxOWfCI/PGQpv2c2PqDs11zgSrqDCOvHq1S0yvE0KZeQa84u7Pb0tanN2KO4Ac8laT7odaAyWxRDBA==",
+            "taker_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+        }"#;
+
+        let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
+        assert!(actual.verify_signature().is_ok());
+        assert!(actual.signing_authority == Pubkey::default());
+
+        let message = r#"{
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001000080841e00000000000000000000000000020000000000000000013201abe72e7c000000000162d06c7d00000000000066190816000000005a645349472d634c0000",
+            "signature": "LiwPgg6VXxOWfCI/PGQpv2c2PqDs11zgSrqDCOvHq1S0yvE0KZeQa84u7Pb0tanN2KO4Ac8laT7odaAyWxRDBA==",
+            "taker_pubkey": "2Ym3QkbXGEZSLDSERE6zCuar6fMCHTzvmw2He3MSL1s9",
+            "taker_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+        }"#;
+
+        let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
+        assert!(actual.verify_signature().is_ok());
+        assert!(actual.signing_authority == Pubkey::default());
+    }
+
+    #[test]
     fn deserialize_incoming_signed_message_with_signing_authority() {
         let message = r#"{
             "market_index": 2,
