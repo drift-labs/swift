@@ -244,13 +244,13 @@ pub async fn process_order(
 
     // If fat fingered order that requires sanitization, then just send the order
     if server_params.can_send_sanitized_orders() {
-        let mut order_params = order_params.clone();
+        let mut order_params = order_params;
         if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
             server_params
                 .metrics
                 .order_type_counter
                 .with_label_values(&[
-                    &order_params.market_type.as_str(),
+                    order_params.market_type.as_str(),
                     &order_params.market_index.to_string(),
                     "true",
                 ])
@@ -265,13 +265,6 @@ pub async fn process_order(
                     .metrics
                     .response_time_histogram
                     .observe((unix_now_ms() - process_order_time) as f64);
-                (
-                    axum::http::StatusCode::OK,
-                    Json(ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                        error: None,
-                    }),
-                );
 
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
@@ -324,13 +317,6 @@ pub async fn process_order(
                 .metrics
                 .response_time_histogram
                 .observe((unix_now_ms() - process_order_time) as f64);
-            (
-                axum::http::StatusCode::OK,
-                Json(ProcessOrderResponse {
-                    message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                    error: None,
-                }),
-            );
 
             match place_tx.await {
                 Ok(tx_sig) => {
@@ -363,7 +349,7 @@ pub async fn process_order(
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority,
-        order_message: signed_msg.clone(),
+        order_message: *signed_msg,
         order_signature: taker_signature.into(),
         ts: process_order_time,
         uuid,
@@ -665,7 +651,7 @@ pub async fn start_server() {
         .map(|config| config.pubkey)
         .collect();
     let priority_fee_subscriber = PriorityFeeSubscriber::with_config(
-        RpcClient::new_with_commitment(rpc_endpoint_cloned.into(), CommitmentConfig::confirmed()),
+        RpcClient::new_with_commitment(rpc_endpoint_cloned, CommitmentConfig::confirmed()),
         &pubkeys[..],
         PriorityFeeSubscriberConfig {
             refresh_frequency: Some(Duration::from_millis(400 * 10)),
