@@ -17,7 +17,7 @@ use solana_sdk::pubkey::Pubkey;
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct IncomingSignedMessage {
-    #[serde(deserialize_with = "deser_pubkey")]
+    #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub taker_pubkey: Pubkey,
     #[serde(deserialize_with = "deser_signature")]
     pub signature: Signature,
@@ -25,6 +25,8 @@ pub struct IncomingSignedMessage {
     pub message: SignedOrderType,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub signing_authority: Pubkey,
+    #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
+    pub taker_authority: Pubkey,
 }
 
 impl IncomingSignedMessage {
@@ -32,6 +34,8 @@ impl IncomingSignedMessage {
     pub fn verify_signature(&self) -> Result<()> {
         let pubkey = if self.signing_authority != Pubkey::default() {
             PublicKey::from_bytes(self.signing_authority.as_array())
+        } else if self.taker_authority != Pubkey::default() {
+            PublicKey::from_bytes(self.taker_authority.as_array())
         } else {
             PublicKey::from_bytes(self.taker_pubkey.as_array())
         }?;
@@ -121,7 +125,6 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slo
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
 pub const PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND: &str = "User not found";
-pub const PROCESS_ORDER_RESPONSE_PLACE_TX_TIMEOUT: &str = "Placing sanitizing tx timeout";
 pub const PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY: &str = "Ignore pubkey";
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -332,6 +335,34 @@ mod tests {
             "message": "c8d5a65e2234f55d0001000080841e00000000000000000000000000020000000000000000013201abe72e7c000000000162d06c7d00000000000066190816000000005a645349472d634c0000",
             "signature": "LiwPgg6VXxOWfCI/PGQpv2c2PqDs11zgSrqDCOvHq1S0yvE0KZeQa84u7Pb0tanN2KO4Ac8laT7odaAyWxRDBA==",
             "taker_pubkey": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+        }"#;
+
+        let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
+        assert!(actual.verify_signature().is_ok());
+        assert!(actual.signing_authority == Pubkey::default());
+    }
+
+    #[test]
+    fn deserialize_incoming_signed_message_with_taker_authority() {
+        let message = r#"{
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001000080841e00000000000000000000000000020000000000000000013201abe72e7c000000000162d06c7d00000000000066190816000000005a645349472d634c0000",
+            "signature": "LiwPgg6VXxOWfCI/PGQpv2c2PqDs11zgSrqDCOvHq1S0yvE0KZeQa84u7Pb0tanN2KO4Ac8laT7odaAyWxRDBA==",
+            "taker_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+        }"#;
+
+        let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
+        assert!(actual.verify_signature().is_ok());
+        assert!(actual.signing_authority == Pubkey::default());
+
+        let message = r#"{
+            "market_index": 2,
+            "market_type": "perp",
+            "message": "c8d5a65e2234f55d0001000080841e00000000000000000000000000020000000000000000013201abe72e7c000000000162d06c7d00000000000066190816000000005a645349472d634c0000",
+            "signature": "LiwPgg6VXxOWfCI/PGQpv2c2PqDs11zgSrqDCOvHq1S0yvE0KZeQa84u7Pb0tanN2KO4Ac8laT7odaAyWxRDBA==",
+            "taker_pubkey": "2Ym3QkbXGEZSLDSERE6zCuar6fMCHTzvmw2He3MSL1s9",
+            "taker_authority": "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
         }"#;
 
         let actual: IncomingSignedMessage = serde_json::from_str(&message).expect("deserializes");
