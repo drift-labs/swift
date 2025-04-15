@@ -109,10 +109,11 @@ pub async fn process_order(
 ) -> impl axum::response::IntoResponse {
     let process_order_time = unix_now_ms();
     let IncomingSignedMessage {
-        taker_pubkey: taker_authority,
+        taker_pubkey,
         signature: taker_signature,
         message: _,
         signing_authority,
+        taker_authority,
     } = incoming_message;
 
     if server_params.farmer_pubkeys.contains(&taker_authority) {
@@ -130,6 +131,12 @@ pub async fn process_order(
     }
 
     server_params.metrics.taker_orders_counter.inc();
+
+    let taker_authority = if taker_authority == Pubkey::default() {
+        taker_pubkey
+    } else {
+        taker_authority
+    };
 
     let signing_pubkey = if signing_authority == Pubkey::default() {
         taker_authority
