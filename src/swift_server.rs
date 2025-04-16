@@ -116,6 +116,12 @@ pub async fn process_order(
         taker_authority,
     } = incoming_message;
 
+    let taker_authority = if taker_authority == Pubkey::default() {
+        taker_pubkey
+    } else {
+        taker_authority
+    };
+
     if server_params.farmer_pubkeys.contains(&taker_authority) {
         log::debug!(
             target: "server",
@@ -131,12 +137,6 @@ pub async fn process_order(
     }
 
     server_params.metrics.taker_orders_counter.inc();
-
-    let taker_authority = if taker_authority == Pubkey::default() {
-        taker_pubkey
-    } else {
-        taker_authority
-    };
 
     let signing_pubkey = if signing_authority == Pubkey::default() {
         taker_authority
