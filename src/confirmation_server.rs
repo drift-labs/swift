@@ -9,17 +9,17 @@ use axum::{
 use axum_prometheus::PrometheusMetricLayer;
 use dotenv::dotenv;
 use futures_util::StreamExt;
-use redis::{aio::MultiplexedConnection, AsyncCommands, ScanOptions};
+use redis::{AsyncCommands, ScanOptions};
 use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
 
 const HASH_PREFIX: &str = "swift-hashes::*";
 
 #[derive(Clone)]
-pub struct ServerParams {
+pub struct ServerParams<T: Clone + AsyncCommands> {
     pub host: String,
     pub port: String,
-    pub redis_pool: MultiplexedConnection,
+    pub redis_pool: T,
 }
 #[derive(serde::Deserialize)]
 pub struct HashQuery {
@@ -36,8 +36,8 @@ pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse
     (axum::http::StatusCode::NOT_FOUND, format!("No route {uri}"))
 }
 
-pub async fn health_check(
-    State(server_params): State<ServerParams>,
+pub async fn health_check<T: Clone + AsyncCommands>(
+    State(server_params): State<ServerParams<T>>,
 ) -> impl axum::response::IntoResponse {
     match server_params.redis_pool.clone().ping().await {
         Ok(()) => (axum::http::StatusCode::OK, "ok".into()),
@@ -49,8 +49,8 @@ pub async fn health_check(
     }
 }
 
-pub async fn get_all_hashes(
-    State(server_params): State<ServerParams>,
+pub async fn get_all_hashes<T: Clone + AsyncCommands>(
+    State(server_params): State<ServerParams<T>>,
 ) -> impl axum::response::IntoResponse {
     let scan_opts = ScanOptions::default()
         .with_pattern(HASH_PREFIX)
@@ -102,8 +102,8 @@ pub async fn get_all_hashes(
     }
 }
 
-pub async fn get_hash_status(
-    State(server_params): State<ServerParams>,
+pub async fn get_hash_status<T: Clone + AsyncCommands>(
+    State(server_params): State<ServerParams<T>>,
     Query(query): Query<HashQuery>,
 ) -> impl axum::response::IntoResponse {
     let encoded_hash = query.hash;
@@ -224,24 +224,42 @@ mod tests {
     use std::str::from_utf8;
 
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
-    use mockall::mock;
-    use mockall::predicate::*;
-    use redis::{aio::MultiplexedConnection, RedisError};
+    use futures_util::FutureExt;
+    use redis::{
+        aio::{ConnectionLike, MultiplexedConnection},
+        RedisError, RedisFuture,
+    };
 
     use super::*;
 
-    mock! {
-        pub RedisConn {}
-        impl Clone for RedisConn {
-            fn clone(&self) -> Self;
+    /// Mock redis client with broken pipe
+    #[derive(Clone)]
+    struct MockBrokenRedis;
+    impl ConnectionLike for MockBrokenRedis {
+        fn get_db(&self) -> i64 {
+            0_i64
         }
-        #[async_trait::async_trait]
-        impl AsyncCommands for RedisConn {
-            async fn ping(&mut self) -> redis::RedisResult<()>;
+        fn req_packed_command<'a>(
+            &'a mut self,
+            _cmd: &'a redis::Cmd,
+        ) -> redis::RedisFuture<'a, redis::Value> {
+            Box::pin(std::future::ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "oh no",
+            )
+            .into())))
+        }
+        fn req_packed_commands<'a>(
+            &'a mut self,
+            cmd: &'a redis::Pipeline,
+            _offset: usize,
+            _count: usize,
+        ) -> RedisFuture<'a, Vec<redis::Value>> {
+            (async move { cmd.exec_async(self).await.map(|_f| vec![redis::Value::Nil]) }).boxed()
         }
     }
 
-    async fn setup_test_server() -> ServerParams {
+    async fn setup_test_server() -> ServerParams<MultiplexedConnection> {
         let cli = redis::Client::open("redis://localhost:6379").expect("valid redis URL");
         let redis_pool = cli
             .get_multiplexed_tokio_connection()
@@ -264,18 +282,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check_failure() {
-        let mut mock_conn = MockRedisConn::new();
-        mock_conn.expect_ping().returning(|| {
-            Err(RedisError::from((
-                redis::ErrorKind::IoError,
-                "Connection failed",
-            )))
-        });
-
         let state = ServerParams {
             host: "127.0.0.1".to_string(),
             port: "3000".to_string(),
-            redis_pool: mock_conn,
+            redis_pool: MockBrokenRedis {},
         };
 
         let response = health_check(State(state)).await;

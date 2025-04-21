@@ -55,7 +55,6 @@ fast = ["rdkafka/dynamic-linking"]
 
 [dev-dependencies]
 axum-macros = "0.4.2"
-mockall = "0.12.1"
 
 [profile.dev.package]
 ark-ff = { opt-level = 0 }
