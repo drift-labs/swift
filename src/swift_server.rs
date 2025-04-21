@@ -539,8 +539,7 @@ pub async fn health_check(
     // Check if optional accounts are healthy
     let redis_health = if server_params.redis_pool.is_some() {
         let redis_health = if let Some(mut conn) = server_params.redis_pool.clone() {
-            let ping_result: redis::RedisResult<String> =
-                redis::cmd("PING").query_async(&mut conn).await;
+            let ping_result: redis::RedisResult<String> = conn.ping().await;
             ping_result.is_ok()
         } else {
             false
