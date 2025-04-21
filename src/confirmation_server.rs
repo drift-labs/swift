@@ -224,8 +224,22 @@ mod tests {
     use std::str::from_utf8;
 
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use mockall::mock;
+    use mockall::predicate::*;
+    use redis::{aio::MultiplexedConnection, RedisError};
 
     use super::*;
+
+    mock! {
+        pub RedisConn {}
+        impl Clone for RedisConn {
+            fn clone(&self) -> Self;
+        }
+        #[async_trait::async_trait]
+        impl AsyncCommands for RedisConn {
+            async fn ping(&mut self) -> redis::RedisResult<()>;
+        }
+    }
 
     async fn setup_test_server() -> ServerParams {
         let cli = redis::Client::open("redis://localhost:6379").expect("valid redis URL");
@@ -246,6 +260,31 @@ mod tests {
         let state = setup_test_server().await;
         let response = health_check(State(state)).await;
         assert_eq!(response.into_response().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_failure() {
+        let mut mock_conn = MockRedisConn::new();
+        mock_conn.expect_ping().returning(|| {
+            Err(RedisError::from((
+                redis::ErrorKind::IoError,
+                "Connection failed",
+            )))
+        });
+
+        let state = ServerParams {
+            host: "127.0.0.1".to_string(),
+            port: "3000".to_string(),
+            redis_pool: mock_conn,
+        };
+
+        let response = health_check(State(state)).await;
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let body_bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        let body_str = from_utf8(&body_bytes).unwrap();
+        assert_eq!(body_str, "redis_healthy=false");
     }
 
     #[tokio::test]
