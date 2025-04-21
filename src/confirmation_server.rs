@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, net::SocketAddr};
+use std::{borrow::Cow, env, net::SocketAddr};
 
 use axum::{
     extract::{Query, State},
@@ -10,7 +10,10 @@ use axum_prometheus::PrometheusMetricLayer;
 use dotenv::dotenv;
 use futures_util::StreamExt;
 use redis::{aio::MultiplexedConnection, AsyncCommands, ScanOptions};
+use serde_json::Value;
 use tower_http::cors::{Any, CorsLayer};
+
+const HASH_PREFIX: &str = "swift-hashes::*";
 
 #[derive(Clone)]
 pub struct ServerParams {
@@ -26,28 +29,38 @@ pub struct HashQuery {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct HashesResponse {
     #[serde(rename = "hashes")]
-    pub hashes: HashMap<String, String>,
+    pub hashes: serde_json::Map<String, Value>,
 }
 
 pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse {
     (axum::http::StatusCode::NOT_FOUND, format!("No route {uri}"))
 }
 
-pub async fn health_check() -> impl axum::response::IntoResponse {
-    axum::http::StatusCode::OK
+pub async fn health_check(
+    State(server_params): State<ServerParams>,
+) -> impl axum::response::IntoResponse {
+    match server_params.redis_pool.clone().ping().await {
+        Ok(()) => (axum::http::StatusCode::OK, "ok".into()),
+        Err(err) => {
+            let msg = "redis_healthy=false";
+            log::error!(target: "server", "Failed health check {msg}");
+            (axum::http::StatusCode::PRECONDITION_FAILED, msg)
+        }
+    }
 }
 
 pub async fn get_all_hashes(
     State(server_params): State<ServerParams>,
 ) -> impl axum::response::IntoResponse {
-    let pattern = "swift-hashes::*";
-    let scan_opts = ScanOptions::default().with_pattern(pattern).with_count(100);
+    let scan_opts = ScanOptions::default()
+        .with_pattern(HASH_PREFIX)
+        .with_count(256);
     let mut conn = server_params.redis_pool.clone();
 
     let keys = match conn.scan_options::<String>(scan_opts).await {
         Ok(it) => it.collect::<Vec<String>>().await,
         Err(e) => {
-            log::error!("Error scanning keys: {:?}", e);
+            log::error!("Error scanning keys: {e:?}");
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "Error getting keys".to_string(),
@@ -55,12 +68,11 @@ pub async fn get_all_hashes(
         }
     };
 
-    let mut pipe = redis::pipe();
-    for key in &keys {
-        pipe.get(key);
+    if keys.is_empty() {
+        return (axum::http::StatusCode::NOT_FOUND, "not found".to_string());
     }
 
-    let values: Vec<Option<String>> = match pipe.query_async(&mut conn).await {
+    let values: Vec<Option<String>> = match conn.mget(&keys).await {
         Ok(values) => values,
         Err(e) => {
             log::error!("Error executing pipeline: {:?}", e);
@@ -71,21 +83,17 @@ pub async fn get_all_hashes(
         }
     };
 
-    let hash_map: HashMap<String, String> = keys
-        .into_iter()
-        .zip(values.into_iter())
-        .filter_map(|(key, value)| {
-            value.map(|v| {
-                let hash = key
-                    .strip_prefix("swift-hashes::")
-                    .unwrap_or(&key)
-                    .to_string();
-                (hash, v)
-            })
-        })
-        .collect();
+    let mut map = serde_json::Map::new();
+    for (mut key, value) in keys.into_iter().zip(values.into_iter()) {
+        if let Some(value) = value {
+            if key.starts_with(HASH_PREFIX) {
+                key.drain(0..HASH_PREFIX.len());
+            }
+            map.insert(key, serde_json::Value::String(value));
+        }
+    }
 
-    match serde_json::to_string(&HashesResponse { hashes: hash_map }) {
+    match serde_json::to_string(&HashesResponse { hashes: map }) {
         Ok(json) => (axum::http::StatusCode::OK, json),
         Err(_) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -102,14 +110,14 @@ pub async fn get_hash_status(
     if encoded_hash.is_empty() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            "Missing hash parameter".to_string(),
+            Cow::Borrowed("Missing hash parameter"),
         );
     }
     let decoded_hash_result = urlencoding::decode(&encoded_hash);
     if decoded_hash_result.is_err() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            "Invalid hash parameter".to_string(),
+            Cow::Borrowed("Invalid hash parameter"),
         );
     }
 
@@ -120,18 +128,21 @@ pub async fn get_hash_status(
     let redis_key = format!("swift-hashes::{}", decoded_hash);
     match conn.get::<_, Option<String>>(redis_key).await {
         Ok(Some(value)) => {
-            println!("Value for decoded_hash {}: {}", decoded_hash, value);
-            (axum::http::StatusCode::OK, value)
+            log::info!("Value for decoded_hash {decoded_hash}: {value}");
+            (axum::http::StatusCode::OK, Cow::Owned(value))
         }
         Ok(None) => {
-            println!("No value found for key: {}", decoded_hash);
-            (axum::http::StatusCode::NOT_FOUND, "not found".to_string())
+            log::info!("No value found for key: {decoded_hash}");
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                Cow::Borrowed("not found"),
+            )
         }
         Err(e) => {
-            println!("Error: {:?}", e);
+            log::error!("Error: {e:?}");
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "error finding".to_string(),
+                Cow::Borrowed("error finding"),
             )
         }
     }
@@ -155,7 +166,7 @@ pub async fn start_server() {
         .await
         .expect("redis connects");
 
-    println!("Connecting to Redis via pool");
+    log::info!("Connecting to Redis via pool");
 
     let state = ServerParams {
         redis_pool,
@@ -163,7 +174,7 @@ pub async fn start_server() {
         port: env::var("PORT").unwrap_or_else(|_| "3000".to_string()),
     };
 
-    println!("Established Redis pool connection");
+    log::info!("Established Redis pool connection");
 
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
     let addr: SocketAddr = format!("{}:{}", state.host, state.port).parse().unwrap();
@@ -232,7 +243,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check() {
-        let response = health_check().await;
+        let state = setup_test_server().await;
+        let response = health_check(State(state)).await;
         assert_eq!(response.into_response().status(), StatusCode::OK);
     }
 
