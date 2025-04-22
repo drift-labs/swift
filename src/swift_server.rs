@@ -571,6 +571,8 @@ pub async fn health_check(
 }
 
 pub async fn start_server() {
+    // Start server
+
     dotenv().ok();
 
     let keypair =
