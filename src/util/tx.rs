@@ -96,10 +96,16 @@ pub async fn send_tx(
 }
 
 fn handle_tx_err(err: SdkError) -> TxError {
-    if let Some(code) = err.to_anchor_error_code() {
-        TxError::TxFailed {
-            reason: code.name(),
-            code: code.into(),
+    if let Some(err) = err.to_anchor_error_code() {
+        match err {
+            drift_rs::types::ProgramError::Drift(err) => TxError::TxFailed {
+                reason: err.to_string(),
+                code: err.into(),
+            },
+            drift_rs::types::ProgramError::Other { ix_idx, code } => TxError::TxFailed {
+                reason: format!("tx failed. ix index: {ix_idx}"),
+                code: code.into(),
+            },
         }
     } else {
         TxError::Sdk(err)
