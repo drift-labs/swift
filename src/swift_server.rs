@@ -251,8 +251,7 @@ pub async fn process_order(
 
     // If fat fingered order that requires sanitization, then just send the order
     if server_params.can_send_sanitized_orders() {
-        let mut order_params = order_params;
-        if server_params.simulate_will_auction_params_sanitize(&mut order_params) {
+        if server_params.simulate_will_auction_params_sanitize(&order_params) {
             server_params
                 .metrics
                 .order_type_counter
@@ -1034,7 +1033,7 @@ impl ServerParams {
     }
 
     /// Simulate if auction params will be sanitized
-    fn simulate_will_auction_params_sanitize(&self, order_params: &mut OrderParams) -> bool {
+    fn simulate_will_auction_params_sanitize(&self, order_params: &OrderParams) -> bool {
         let perp_market = match self
             .drift
             .try_get_perp_market_account(order_params.market_index)
