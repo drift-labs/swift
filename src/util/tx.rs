@@ -6,6 +6,9 @@ use drift_rs::types::SdkError;
 use drift_rs::types::VersionedMessage;
 use drift_rs::DriftClient;
 use log::{debug, info, warn};
+use prometheus::core::AtomicF64;
+use prometheus::core::GenericCounter;
+use prometheus::IntCounter;
 use serde::{Deserialize, Serialize};
 use solana_sdk::commitment_config::CommitmentLevel;
 use tokio::time::Duration;
@@ -30,6 +33,7 @@ pub async fn send_tx(
     reason: &'static str,
     ttl: Option<u16>,
     log_prefix: String,
+    confirmed_counter: IntCounter,
 ) -> Result<TxResponse, TxError> {
     let recent_block_hash = client.get_latest_blockhash().await?;
     let tx = client.wallet().sign_tx(tx, recent_block_hash)?;
@@ -83,6 +87,7 @@ pub async fn send_tx(
 
             if let Ok(Some(Ok(()))) = rpc.get_signature_status(&tx_signature).await {
                 confirmed = true;
+                confirmed_counter.inc();
                 info!(target: LOG_TARGET, "tx confirmed onchain: {tx_signature:?}");
                 break;
             }

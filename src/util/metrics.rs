@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts,
-    Registry, TextEncoder,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec,
+    IntCounter, Opts, Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -38,6 +38,7 @@ pub struct SwiftServerMetrics {
     pub current_slot_gauge: Gauge,
     pub rpc_simulation_status: CounterVec,
     pub response_time_histogram: Histogram,
+    pub sanitized_confirmed_tx_counter: IntCounter,
 }
 
 impl SwiftServerMetrics {
@@ -58,6 +59,11 @@ impl SwiftServerMetrics {
         let kafka_forward_fail_counter = Counter::new(
             "swift_kafka_forward_fail_count",
             "Number of failed forwards to Kafka",
+        )
+        .unwrap();
+        let sanitized_confirmed_tx_counter = IntCounter::new(
+            "swift_sanitized_confirmed_tx_count",
+            "Number of successfully confirmed, sanitized txs",
         )
         .unwrap();
         let current_slot_gauge = Gauge::new("swift_current_slot", "Current slot").unwrap();
@@ -82,6 +88,7 @@ impl SwiftServerMetrics {
             current_slot_gauge,
             rpc_simulation_status,
             response_time_histogram,
+            sanitized_confirmed_tx_counter,
         }
     }
 
@@ -103,6 +110,9 @@ impl SwiftServerMetrics {
             .unwrap();
         registry
             .register(Box::new(self.rpc_simulation_status.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.sanitized_confirmed_tx_counter.clone()))
             .unwrap();
     }
 }

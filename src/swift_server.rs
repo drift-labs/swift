@@ -317,6 +317,7 @@ pub async fn process_order(
                 "place swift order",
                 Some(30),
                 log_prefix.clone(),
+                server_params.metrics.sanitized_confirmed_tx_counter.clone(),
             );
 
             server_params
