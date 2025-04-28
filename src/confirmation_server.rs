@@ -40,7 +40,7 @@ pub async fn health_check<T: Clone + AsyncCommands>(
     State(server_params): State<ServerParams<T>>,
 ) -> impl axum::response::IntoResponse {
     match server_params.redis_pool.clone().ping().await {
-        Ok(()) => (axum::http::StatusCode::OK, "ok".into()),
+        Ok(()) => (axum::http::StatusCode::OK, "ok"),
         Err(_) => {
             let msg = "redis_healthy=false";
             log::error!(target: "server", "Failed health check {msg}");
