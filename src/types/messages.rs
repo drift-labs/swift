@@ -63,6 +63,7 @@ pub struct OrderMetadataAndMessage {
     pub order_signature: [u8; 64],
     pub uuid: [u8; 8],
     pub ts: u64,
+    pub will_sanitize: bool,
 }
 
 impl OrderMetadataAndMessage {
@@ -107,6 +108,7 @@ impl OrderMetadataAndMessage {
             "signing_authority": self.signing_authority.to_string(),
             "uuid": self.uuid(),
             "ts": self.ts,
+            "will_sanitize": self.will_sanitize,
         })
     }
 }
@@ -124,7 +126,6 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE: &str =
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slot too old";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
-pub const PROCESS_ORDER_RESPONSE_ERROR_USER_NOT_FOUND: &str = "User not found";
 pub const PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY: &str = "Ignore pubkey";
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -431,6 +432,7 @@ mod tests {
             order_signature: [1u8; 64],
             ts: 55555,
             uuid: nanoid!(8).as_bytes().try_into().unwrap(),
+            will_sanitize: true,
         }
         .encode();
         let order_metadata = OrderMetadataAndMessage::decode(&encoded).unwrap();
@@ -473,6 +475,7 @@ mod tests {
             uuid: order_params.uuid,
             order_message: signed_order_message.clone(),
             ts: 55555,
+            will_sanitize: false,
         }
         .jsonify();
 
@@ -500,5 +503,7 @@ mod tests {
             order_metadata_json["signing_authority"],
             signing_authority.to_string(),
         );
+
+        assert_eq!(order_metadata_json["will_sanitize"], false,);
     }
 }
