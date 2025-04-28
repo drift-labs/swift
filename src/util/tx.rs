@@ -6,9 +6,8 @@ use drift_rs::types::SdkError;
 use drift_rs::types::VersionedMessage;
 use drift_rs::DriftClient;
 use log::{debug, info, warn};
-use prometheus::core::AtomicF64;
-use prometheus::core::GenericCounter;
-use prometheus::IntCounter;
+use prometheus::HistogramTimer;
+use prometheus::IntGauge;
 use serde::{Deserialize, Serialize};
 use solana_sdk::commitment_config::CommitmentLevel;
 use tokio::time::Duration;
@@ -33,7 +32,8 @@ pub async fn send_tx(
     reason: &'static str,
     ttl: Option<u16>,
     log_prefix: String,
-    confirmed_counter: IntCounter,
+    response_time: HistogramTimer,
+    inflight_gauge: IntGauge,
 ) -> Result<TxResponse, TxError> {
     let recent_block_hash = client.get_latest_blockhash().await?;
     let tx = client.wallet().sign_tx(tx, recent_block_hash)?;
@@ -44,19 +44,16 @@ pub async fn send_tx(
         ..Default::default()
     };
 
-    // submit to primary RPC first,
     let sig = client
         .rpc()
         .send_transaction_with_config(&tx, tx_config)
         .await
-        .inspect(|s| {
-            log::debug!(target: LOG_TARGET, "{log_prefix} sent tx ({reason}): {s}");
-        })
         .map_err(|err| {
             warn!(target: LOG_TARGET, "sending tx ({reason}) failed: {err:?}");
             // tx has some program/logic error, retry won't fix
             handle_tx_err(err.into())
         })?;
+    log::info!(target: LOG_TARGET, "{log_prefix} sent tx ({reason}): {}", sig);
 
     // start a dedicated tx sending task
     // - tx is broadcast to all available RPCs
@@ -76,10 +73,10 @@ pub async fn send_tx(
             let res = rpc.send_transaction_with_config(&tx, tx_config).await;
             match res {
                 Ok(sig) => {
-                    debug!(target: LOG_TARGET, "sent tx ({reason}): {sig}");
+                    debug!(target: LOG_TARGET, "resent tx ({reason}): {sig}");
                 }
                 Err(err) => {
-                    warn!(target: LOG_TARGET, "sending tx ({reason}) failed: {err:?}");
+                    warn!(target: LOG_TARGET, "resending tx ({reason}) failed: {err:?}");
                 }
             };
 
@@ -87,7 +84,6 @@ pub async fn send_tx(
 
             if let Ok(Some(Ok(()))) = rpc.get_signature_status(&tx_signature).await {
                 confirmed = true;
-                confirmed_counter.inc();
                 info!(target: LOG_TARGET, "tx confirmed onchain: {tx_signature:?}");
                 break;
             }
@@ -95,6 +91,8 @@ pub async fn send_tx(
         if !confirmed {
             warn!(target: LOG_TARGET, "tx was not confirmed: {tx_signature:?}");
         }
+        response_time.observe_duration();
+        inflight_gauge.dec();
     });
 
     Ok(TxResponse::new(sig.to_string()))

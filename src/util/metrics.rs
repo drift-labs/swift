@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec,
-    IntCounter, Opts, Registry, TextEncoder,
+    IntGauge, Opts, Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -38,7 +38,8 @@ pub struct SwiftServerMetrics {
     pub current_slot_gauge: Gauge,
     pub rpc_simulation_status: CounterVec,
     pub response_time_histogram: Histogram,
-    pub sanitized_confirmed_tx_counter: IntCounter,
+    pub sanitized_confirmation_time_histogram: Histogram,
+    pub sanitized_inflight_txs: IntGauge,
 }
 
 impl SwiftServerMetrics {
@@ -61,11 +62,6 @@ impl SwiftServerMetrics {
             "Number of failed forwards to Kafka",
         )
         .unwrap();
-        let sanitized_confirmed_tx_counter = IntCounter::new(
-            "swift_sanitized_confirmed_tx_count",
-            "Number of successfully confirmed, sanitized txs",
-        )
-        .unwrap();
         let current_slot_gauge = Gauge::new("swift_current_slot", "Current slot").unwrap();
         let response_time_histogram = Histogram::with_opts(HistogramOpts {
             common_opts: prometheus::Opts::new(
@@ -80,6 +76,19 @@ impl SwiftServerMetrics {
             &["status"],
         )
         .unwrap();
+        let sanitized_inflight_txs = IntGauge::new(
+            "swift_sanitized_inflight_txs",
+            "Number of sanitized txs inflight/tasks",
+        )
+        .unwrap();
+        let sanitized_confirmation_time_histogram = Histogram::with_opts(HistogramOpts {
+            common_opts: prometheus::Opts::new(
+                "swift_sanitized_confirmation_time",
+                "Duration of placing a sanitized swift order tx in s",
+            ),
+            buckets: prometheus::exponential_buckets(1.0, 2.0, 10).unwrap(),
+        })
+        .unwrap();
 
         SwiftServerMetrics {
             taker_orders_counter,
@@ -88,7 +97,8 @@ impl SwiftServerMetrics {
             current_slot_gauge,
             rpc_simulation_status,
             response_time_histogram,
-            sanitized_confirmed_tx_counter,
+            sanitized_confirmation_time_histogram,
+            sanitized_inflight_txs,
         }
     }
 
@@ -112,7 +122,10 @@ impl SwiftServerMetrics {
             .register(Box::new(self.rpc_simulation_status.clone()))
             .unwrap();
         registry
-            .register(Box::new(self.sanitized_confirmed_tx_counter.clone()))
+            .register(Box::new(self.sanitized_confirmation_time_histogram.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.sanitized_inflight_txs.clone()))
             .unwrap();
     }
 }

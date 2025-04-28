@@ -317,8 +317,13 @@ pub async fn process_order(
                 "place swift order",
                 Some(30),
                 log_prefix.clone(),
-                server_params.metrics.sanitized_confirmed_tx_counter.clone(),
+                server_params
+                    .metrics
+                    .sanitized_confirmation_time_histogram
+                    .start_timer(),
+                server_params.metrics.sanitized_inflight_txs.clone(),
             );
+            server_params.metrics.sanitized_inflight_txs.inc();
 
             server_params
                 .metrics
@@ -832,7 +837,7 @@ fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), 
 }
 
 #[derive(Debug)]
-enum SimulationStatus {
+pub enum SimulationStatus {
     /// Success sim'd locally
     Success,
     Degraded,
