@@ -225,18 +225,6 @@ pub async fn process_order(
 
     // If fat fingered order that requires sanitization, then just send the order
     let will_sanitize = server_params.simulate_will_auction_params_sanitize(&order_params);
-    if will_sanitize {
-        server_params
-            .metrics
-            .order_type_counter
-            .with_label_values(&[
-                order_params.market_type.as_str(),
-                &order_params.market_index.to_string(),
-                "true",
-            ])
-            .inc();
-    }
-
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority,
@@ -269,7 +257,14 @@ pub async fn process_order(
                 server_params
                     .metrics
                     .order_type_counter
-                    .with_label_values(&[market_type.as_str(), &market_index.to_string(), "false"])
+                    .with_label_values(&[
+                        market_type.as_str(),
+                        &market_index.to_string(),
+                        match will_sanitize {
+                            true => "true",
+                            false => "false,",
+                        },
+                    ])
                     .inc();
 
                 server_params
