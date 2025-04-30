@@ -262,7 +262,7 @@ pub async fn process_order(
                         &market_index.to_string(),
                         match will_sanitize {
                             true => "true",
-                            false => "false,",
+                            false => "false",
                         },
                     ])
                     .inc();
