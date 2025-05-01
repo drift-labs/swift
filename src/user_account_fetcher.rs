@@ -1,17 +1,35 @@
+use std::collections::HashMap;
+
 use anchor_lang::AccountDeserialize;
 use base64::Engine;
 use drift_rs::{types::accounts::User, DriftClient};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use solana_sdk::{clock::Slot, pubkey::Pubkey};
 
+/// Fallback lookup strategy
+#[derive(Clone)]
+enum Fallback {
+    /// Lookup from RPC
+    Rpc(DriftClient),
+    /// Lookup from some mocked hashmap
+    Mock(HashMap<Pubkey, User>),
+}
+
 /// Fetches users from UserMap server
 #[derive(Clone)]
 pub struct UserAccountFetcher {
     pub redis: Option<MultiplexedConnection>,
-    drift: DriftClient,
+    fallback: Fallback,
 }
 
 impl UserAccountFetcher {
+    #[cfg(test)]
+    pub fn mock(mocks: HashMap<Pubkey, User>) -> Self {
+        Self {
+            fallback: Fallback::Mock(mocks),
+            redis: None,
+        }
+    }
     /// Create a new `UserAccountFetcher` from env vars
     pub async fn from_env(drift: DriftClient) -> Self {
         let redis = {
@@ -42,7 +60,10 @@ impl UserAccountFetcher {
             }
         };
 
-        Self { redis, drift }
+        Self {
+            redis,
+            fallback: Fallback::Rpc(drift),
+        }
     }
 
     /// Use pings to check for health
@@ -62,7 +83,10 @@ impl UserAccountFetcher {
     pub async fn get_user(&self, account: &Pubkey, slot: Slot) -> Result<User, ()> {
         match self.usermap_lookup(account, slot).await {
             Ok(res) => Ok(res),
-            Err(_) => self.drift.get_account_value(account).await.map_err(|_| ()),
+            Err(_) => match &self.fallback {
+                Fallback::Rpc(drift) => drift.get_account_value(account).await.map_err(|_| ()),
+                Fallback::Mock(mocks) => mocks.get(account).copied().ok_or(()),
+            },
         }
     }
 
