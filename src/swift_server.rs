@@ -35,8 +35,8 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::SignedMessageInfo,
     types::{
-        errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
-        VersionedMessage, VersionedTransaction,
+        accounts::PerpMarket, errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType,
+        SdkError, VersionedMessage, VersionedTransaction,
     },
     utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -179,7 +179,11 @@ pub async fn process_order(
     }
 
     // check the order is valid for execution by program
-    if let Err(err) = validate_signed_order_params(&order_params) {
+    let market = server_params
+        .drift
+        .try_get_perp_market_account(order_params.market_index)
+        .ok();
+    if let Err(err) = validate_signed_order_params(&order_params, &market) {
         log::warn!(
             target: "server",
             "{log_prefix}: Order did not validate: {err:?}",
@@ -677,7 +681,10 @@ pub async fn start_server() {
 }
 
 /// Simple validation from program's `handle_signed_order_ix`
-fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), ErrorCode> {
+fn validate_signed_order_params(
+    taker_order_params: &OrderParams,
+    market: &Option<PerpMarket>,
+) -> Result<(), ErrorCode> {
     if !matches!(
         taker_order_params.order_type,
         OrderType::Market | OrderType::Oracle | OrderType::Limit
@@ -687,6 +694,17 @@ fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), 
 
     if !matches!(taker_order_params.market_type, MarketType::Perp) {
         return Err(ErrorCode::InvalidOrderMarketType);
+    }
+
+    match market {
+        Some(market) => {
+            if taker_order_params.base_asset_amount < market.amm.min_order_size {
+                return Err(ErrorCode::InvalidOrderSizeTooSmall);
+            }
+        }
+        None => {
+            return Err(ErrorCode::PerpMarketNotFound);
+        }
     }
 
     if taker_order_params.auction_duration.is_none()

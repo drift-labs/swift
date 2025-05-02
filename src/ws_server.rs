@@ -289,14 +289,13 @@ impl WsConnection {
 
                 if market_index.is_none() {
                     log::debug!(
-                        "{}: subscribe for market index that doesn't exist",
+                        "{}: subscribe for market that doesn't exist",
                         self.pubkey.to_string()
                     );
                     self.send_message(
-                        WsMessage::subscribe()
-                            .set_error(&format!("Market {market_name} not found",)),
+                        WsMessage::subscribe().set_error(&format!("Market {market_name} invalid")),
                     )?;
-                    return Err(WsError::UnknownMarket(market_name));
+                    return Ok(());
                 }
 
                 let topic = format!(
@@ -322,7 +321,12 @@ impl WsConnection {
                                 "{}: trying to subscribe to topic not found: {topic}",
                                 self.pubkey.to_string()
                             );
-                            Err(WsError::UnknownTopic(topic))
+                            self.send_message(
+                                WsMessage::auth()
+                                    .set_error(&format!("Couldn't subscribe: {:?}", topic)),
+                            )?;
+                            // the topic is expected to exist at this point
+                            Err(WsError::UnknownTopic(format!("unknown topic: {topic:?}")))
                         }
                     }
                     SubscribeActions::Unsubscribe => {
@@ -471,7 +475,11 @@ impl WsConnection {
                                 break 'handler Ok(())
                             }
                             Some(Err(err)) => {
-                                warn!(target: "ws", "{log_prefix}: Ws protocol error: {err:?}");
+                                match err {
+                                    // these variants are not problematic errors, safely ignore
+                                    tungstenite::Error::ConnectionClosed | tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake) => (),
+                                    _ => warn!(target: "ws", "{log_prefix}: Ws protocol error: {err:?}"),
+                                }
                                 break 'handler Err(WsError::Protocol);
                             },
                             None => {
@@ -790,14 +798,22 @@ pub async fn start_server() {
             .await
             .unwrap();
 
+    let perp_market_accounts: Vec<PerpMarket> = perp_market_accounts
+        .into_iter()
+        .filter(|m| {
+            if m.symbol().contains("BET") {
+                log::info!("Skipping BET market: {}", m.market_index);
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
     // Set up the server with the server params
     let subscriptions = DashMap::new();
     let mut topic_names: Vec<String> = vec!["heartbeat".to_string()];
-    for market in &perp_market_accounts {
-        if market.symbol().contains("BET") {
-            log::info!("Skipping BET market");
-            continue;
-        }
+    for market in perp_market_accounts.iter() {
         let topic = format!(
             "swift_orders_{}_{}",
             market.market_type(),
