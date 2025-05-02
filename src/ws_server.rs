@@ -471,7 +471,11 @@ impl WsConnection {
                                 break 'handler Ok(())
                             }
                             Some(Err(err)) => {
-                                warn!(target: "ws", "{log_prefix}: Ws protocol error: {err:?}");
+                                match err {
+                                    // these variants are not problematic errors, safely ignore
+                                    tungstenite::Error::ConnectionClosed | tungstenite::Error::Protocol(tungstenite::error::ProtocolError::ResetWithoutClosingHandshake) => (),
+                                    _ => warn!(target: "ws", "{log_prefix}: Ws protocol error: {err:?}"),
+                                }
                                 break 'handler Err(WsError::Protocol);
                             },
                             None => {
