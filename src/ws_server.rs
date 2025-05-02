@@ -450,12 +450,7 @@ impl WsConnection {
                                 match serde_json::from_str::<WsClientMessage>(message) {
                                     Ok(msg) => {
                                         if let Err(err) = self.handle_client_message(msg, shared_state) {
-                                            match err {
-                                                WsError::UnknownTopic(_) => {},
-                                                _ => {
-                                                    log::error!(target: "ws", "{log_prefix}: processing msg failed: {err:?}");
-                                                }
-                                            }
+                                            log::error!(target: "ws", "{log_prefix}: processing msg failed: {err:?}");
                                         }
                                     }
                                     Err(e) => {
