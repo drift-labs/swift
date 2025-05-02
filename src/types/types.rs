@@ -6,8 +6,6 @@ pub enum WsError {
     Unauthenticated,
     /// Client failed to authenticate its challenge
     FailedChallenge,
-    /// Unknown drift market with name
-    UnknownMarket(String),
     /// Unknown kafkas topic
     UnknownTopic(String),
     /// Server couldn't handle the message backpressure
