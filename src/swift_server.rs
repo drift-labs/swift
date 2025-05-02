@@ -35,8 +35,8 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::SignedMessageInfo,
     types::{
-        errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType, SdkError,
-        VersionedMessage, VersionedTransaction,
+        accounts::PerpMarket, errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType,
+        SdkError, VersionedMessage, VersionedTransaction,
     },
     utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -128,10 +128,11 @@ pub async fn process_order(
 
     server_params.metrics.taker_orders_counter.inc();
 
-    let signing_pubkey = if signing_authority == Pubkey::default() {
-        taker_authority
-    } else {
+    let using_delegate_signing = signing_authority != Pubkey::default();
+    let signing_pubkey = if using_delegate_signing {
         signing_authority
+    } else {
+        taker_authority
     };
 
     let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
@@ -178,7 +179,11 @@ pub async fn process_order(
     }
 
     // check the order is valid for execution by program
-    if let Err(err) = validate_signed_order_params(&order_params) {
+    let market = server_params
+        .drift
+        .try_get_perp_market_account(order_params.market_index)
+        .ok();
+    if let Err(err) = validate_signed_order_params(&order_params, &market) {
         log::warn!(
             target: "server",
             "{log_prefix}: Order did not validate: {err:?}",
@@ -192,15 +197,21 @@ pub async fn process_order(
         );
     }
 
+    let delegate_signer = if using_delegate_signing {
+        Some(&signing_pubkey)
+    } else {
+        None
+    };
+
     match server_params
-        .simulate_taker_order_rpc(&taker_pubkey, &order_params, current_slot)
+        .simulate_taker_order_rpc(&taker_pubkey, &order_params, delegate_signer, current_slot)
         .await
     {
         Ok(sim_res) => {
             server_params
                 .metrics
                 .rpc_simulation_status
-                .with_label_values(&[sim_res.status.as_str()])
+                .with_label_values(&[sim_res.as_str()])
                 .inc();
         }
         Err((status, sim_err_str)) => {
@@ -672,7 +683,10 @@ pub async fn start_server() {
 }
 
 /// Simple validation from program's `handle_signed_order_ix`
-fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), ErrorCode> {
+fn validate_signed_order_params(
+    taker_order_params: &OrderParams,
+    market: &Option<PerpMarket>,
+) -> Result<(), ErrorCode> {
     if !matches!(
         taker_order_params.order_type,
         OrderType::Market | OrderType::Oracle | OrderType::Limit
@@ -682,6 +696,17 @@ fn validate_signed_order_params(taker_order_params: &OrderParams) -> Result<(), 
 
     if !matches!(taker_order_params.market_type, MarketType::Perp) {
         return Err(ErrorCode::InvalidOrderMarketType);
+    }
+
+    match market {
+        Some(market) => {
+            if taker_order_params.base_asset_amount < market.amm.min_order_size {
+                return Err(ErrorCode::InvalidOrderSizeTooSmall);
+            }
+        }
+        None => {
+            return Err(ErrorCode::PerpMarketNotFound);
+        }
     }
 
     if taker_order_params.auction_duration.is_none()
@@ -715,11 +740,6 @@ impl SimulationStatus {
             Self::SuccessRpc => "successRpc",
         }
     }
-}
-
-// Can we get compute units from local sim?
-pub struct SimulationResult {
-    pub status: SimulationStatus,
 }
 
 impl ServerParams {
@@ -780,11 +800,10 @@ impl ServerParams {
         &self,
         taker_subaccount_pubkey: &Pubkey,
         taker_order_params: &OrderParams,
+        delegate_signer: Option<&Pubkey>,
         slot: Slot,
-    ) -> Result<SimulationResult, (axum::http::StatusCode, String)> {
-        let mut sim_result = SimulationResult {
-            status: SimulationStatus::Disabled,
-        };
+    ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
+        let mut sim_result = SimulationStatus::Disabled;
 
         let t0 = SystemTime::now();
 
@@ -796,7 +815,7 @@ impl ServerParams {
         .await;
 
         if user_with_timeout.is_err() {
-            sim_result.status = SimulationStatus::Timeout;
+            sim_result = SimulationStatus::Timeout;
             warn!(target: "sim", "simulateTransaction degraded (timeout)");
             return Ok(sim_result);
         }
@@ -809,6 +828,14 @@ impl ServerParams {
             )
         })?;
 
+        // check the account delegate matches the signer
+        if delegate_signer.is_some_and(|d| d != &user.delegate) {
+            return Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "signer is not configured delegate".to_string(),
+            ));
+        }
+
         if self.is_rpc_sim_disabled() {
             return Ok(sim_result);
         }
@@ -817,7 +844,7 @@ impl ServerParams {
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
         if self.simulate_taker_order_local(taker_order_params, &user) {
-            sim_result.status = SimulationStatus::Success;
+            sim_result = SimulationStatus::Success;
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
             return Ok(sim_result);
         }
@@ -870,17 +897,17 @@ impl ServerParams {
                     }
                 } else {
                     log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
-                    sim_result.status = SimulationStatus::SuccessRpc;
+                    sim_result = SimulationStatus::SuccessRpc;
                     Ok(sim_result)
                 }
             }
             Ok(Err(err)) => {
                 log::warn!(target: "sim", "network sim error: {err:?}");
-                sim_result.status = SimulationStatus::Degraded;
+                sim_result = SimulationStatus::Degraded;
                 Ok(sim_result)
             }
             Err(_) => {
-                sim_result.status = SimulationStatus::Timeout;
+                sim_result = SimulationStatus::Timeout;
                 Ok(sim_result)
             }
         }
@@ -903,7 +930,7 @@ impl ServerParams {
         let oracle_data = match self.drift.try_get_oracle_price_data_and_slot(market_id) {
             Some(p) => p,
             None => {
-                log::debug!(target: "sim", "orace price is None");
+                log::debug!(target: "sim", "oracle price is None");
                 return false;
             }
         };
@@ -920,5 +947,101 @@ impl ServerParams {
                 true
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![cfg(test)]
+    use crate::{
+        super_slot_subscriber::SuperSlotSubscriber, swift_server::ServerParams,
+        user_account_fetcher::UserAccountFetcher, util::metrics::SwiftServerMetrics,
+    };
+    use drift_rs::{
+        types::{accounts::User, MarketType, OrderParams, OrderType, PositionDirection},
+        DriftClient, Pubkey, RpcClient,
+    };
+    use solana_sdk::{native_token::LAMPORTS_PER_SOL, signature::Keypair, signer::Signer};
+    use std::{collections::HashMap, sync::Arc};
+
+    #[tokio::test]
+    async fn test_simulate_taker_order_rpc() {
+        let _ = env_logger::try_init();
+        // Create mock server params
+        let drift = DriftClient::new(
+            drift_rs::Context::DevNet,
+            RpcClient::new("https://api.devnet.solana.com".to_string()),
+            Keypair::new().into(),
+        )
+        .await
+        .unwrap();
+
+        let taker_pubkey = Keypair::new().pubkey();
+        let taker_pubkey2 = Keypair::new().pubkey();
+        let delegate_pubkey = Keypair::new().pubkey();
+        let users: HashMap<Pubkey, User> = [
+            (
+                taker_pubkey,
+                User {
+                    authority: taker_pubkey,
+                    delegate: Pubkey::default(),
+                    ..Default::default()
+                },
+            ),
+            (
+                taker_pubkey2,
+                User {
+                    authority: taker_pubkey2,
+                    delegate: delegate_pubkey,
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into();
+
+        dbg!(users.contains_key(&taker_pubkey));
+        dbg!(users.contains_key(&taker_pubkey2));
+
+        let server_params = ServerParams {
+            slot_subscriber: Arc::new(SuperSlotSubscriber::new(vec![], drift.rpc())),
+            metrics: SwiftServerMetrics::new(),
+            user_account_fetcher: UserAccountFetcher::mock(users),
+            config: Arc::new(crate::swift_server::Config::from_env()),
+            drift,
+            farmer_pubkeys: Default::default(),
+            kafka_producer: Default::default(),
+            redis_pool: Default::default(),
+        };
+
+        // Create mock order params
+        let order_params = OrderParams {
+            market_index: 0,
+            market_type: MarketType::Perp,
+            order_type: OrderType::Market,
+            base_asset_amount: 1 * LAMPORTS_PER_SOL,
+            price: 1_000,
+            direction: PositionDirection::Short,
+            ..Default::default()
+        };
+
+        // Test
+        let result = server_params
+            .simulate_taker_order_rpc(&taker_pubkey, &order_params, Some(&delegate_pubkey), 1_000)
+            .await;
+        assert!(result.is_err_and(|(status, msg)| {
+            dbg!(&msg);
+            status == axum::http::StatusCode::BAD_REQUEST
+                && msg.contains("signer is not configured delegate")
+        }));
+
+        let result = server_params
+            .simulate_taker_order_rpc(&taker_pubkey2, &order_params, Some(&delegate_pubkey), 1_000)
+            .await;
+        // it fails later at remote sim since the account is not a real drift account
+        assert!(result.is_err_and(|(status, msg)| {
+            dbg!(&msg);
+            status == axum::http::StatusCode::BAD_REQUEST
+                && msg.contains("invalid order: AccountNotFound")
+        }));
     }
 }
