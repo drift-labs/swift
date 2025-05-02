@@ -829,12 +829,12 @@ impl ServerParams {
         })?;
 
         // check the account delegate matches the signer
-        if delegate_signer.is_some_and(|d| d != &user.delegate) {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                "signer is not configured delegate".to_string(),
-            ));
-        }
+        // if delegate_signer.is_some_and(|d| d != &user.delegate) {
+        //     return Err((
+        //         axum::http::StatusCode::BAD_REQUEST,
+        //         "signer is not configured delegate".to_string(),
+        //     ));
+        // }
 
         if self.is_rpc_sim_disabled() {
             return Ok(sim_result);
