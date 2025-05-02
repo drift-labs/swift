@@ -128,11 +128,10 @@ pub async fn process_order(
 
     server_params.metrics.taker_orders_counter.inc();
 
-    let using_delegate_signing = signing_authority != Pubkey::default();
-    let signing_pubkey = if using_delegate_signing {
-        signing_authority
-    } else {
+    let signing_pubkey = if signing_authority == Pubkey::default() {
         taker_authority
+    } else {
+        signing_authority
     };
 
     let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
@@ -154,6 +153,7 @@ pub async fn process_order(
             );
         }
     };
+    let is_delegated = signed_msg.is_delegated();
     let SignedMessageInfo {
         slot: taker_slot,
         taker_pubkey,
@@ -197,7 +197,7 @@ pub async fn process_order(
         );
     }
 
-    let delegate_signer = if using_delegate_signing {
+    let delegate_signer = if is_delegated {
         Some(&signing_pubkey)
     } else {
         None
