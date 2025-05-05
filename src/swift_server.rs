@@ -25,7 +25,7 @@ use crate::{
 };
 use axum::{
     extract::State,
-    http::Method,
+    http::{self, Method},
     routing::{get, post},
     Json, Router,
 };
@@ -33,7 +33,7 @@ use dotenv::dotenv;
 use drift_rs::{
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
-    swift_order_subscriber::SignedMessageInfo,
+    swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
     types::{
         accounts::PerpMarket, errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType,
         SdkError, VersionedMessage, VersionedTransaction,
@@ -93,10 +93,29 @@ pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse
     (axum::http::StatusCode::NOT_FOUND, format!("No route {uri}"))
 }
 
-pub async fn process_order(
+#[inline]
+fn extract_uuid(msg: &SignedOrderType) -> [u8; 8] {
+    match msg {
+        SignedOrderType::Authority(x) => x.uuid,
+        SignedOrderType::Delegated(x) => x.uuid,
+    }
+}
+
+pub async fn process_order_wrapper(
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
+    let uuid_raw = extract_uuid(&incoming_message.message);
+    let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
+    let (status, resp) = process_order(server_params, incoming_message).await;
+    log::info!(target: "server", "{}|{}|{:?}", status, uuid, resp.error.as_deref().unwrap_or(""));
+    (status, Json(resp))
+}
+
+pub async fn process_order(
+    server_params: &'static ServerParams,
+    incoming_message: IncomingSignedMessage,
+) -> (http::StatusCode, ProcessOrderResponse) {
     let process_order_time = unix_now_ms();
     let IncomingSignedMessage {
         taker_pubkey,
@@ -119,10 +138,10 @@ pub async fn process_order(
         );
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
+            ProcessOrderResponse {
                 message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
                 error: None,
-            }),
+            },
         );
     }
 
@@ -146,10 +165,10 @@ pub async fn process_order(
             log::warn!("{log_prefix}: Error verifying signed message: {e:?}",);
             return (
                 axum::http::StatusCode::BAD_REQUEST,
-                Json(ProcessOrderResponse {
+                ProcessOrderResponse {
                     message: PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
                     error: Some(e.to_string()),
-                }),
+                },
             );
         }
     };
@@ -171,10 +190,10 @@ pub async fn process_order(
         let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
+            ProcessOrderResponse {
                 message: err_str,
                 error: Some(err_str.to_string()),
-            }),
+            },
         );
     }
 
@@ -190,10 +209,10 @@ pub async fn process_order(
         );
         return (
             axum::http::StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
+            ProcessOrderResponse {
                 message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
                 error: Some(err.to_string()),
-            }),
+            },
         );
     }
 
@@ -226,10 +245,10 @@ pub async fn process_order(
             );
             return (
                 status,
-                Json(ProcessOrderResponse {
+                ProcessOrderResponse {
                     message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
                     error: Some(sim_err_str),
-                }),
+                },
             );
         }
     };
@@ -284,10 +303,10 @@ pub async fn process_order(
                     .observe((unix_now_ms() - process_order_time) as f64);
                 (
                     axum::http::StatusCode::OK,
-                    Json(ProcessOrderResponse {
+                    ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
                         error: None,
-                    }),
+                    },
                 )
             }
             Err((e, _)) => {
@@ -298,10 +317,10 @@ pub async fn process_order(
                 server_params.metrics.kafka_forward_fail_counter.inc();
                 (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ProcessOrderResponse {
+                    ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                         error: Some(format!("kafka publish error: {e:?}")),
-                    }),
+                    },
                 )
             }
         }
@@ -327,18 +346,18 @@ pub async fn process_order(
 
                 (
                     axum::http::StatusCode::OK,
-                    Json(ProcessOrderResponse {
+                    ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
                         error: None,
-                    }),
+                    },
                 )
             }
             Err(e) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ProcessOrderResponse {
+                ProcessOrderResponse {
                     message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                     error: Some(format!("redis publish error: {e:?}")),
-                }),
+                },
             ),
         }
     }
@@ -594,7 +613,7 @@ pub async fn start_server() {
     let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();
     let app = Router::new()
         .fallback(fallback)
-        .route("/orders", post(process_order))
+        .route("/orders", post(process_order_wrapper))
         .route("/health", get(health_check))
         .layer(cors)
         .with_state(state);
