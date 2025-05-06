@@ -1953,7 +1953,7 @@ checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=44f2a23#44f2a23232d2f19848167605e8692d55b87fe2c3"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=7c46ff6#7c46ff63df07a13ff3955a0edd92bb751df694c7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1966,7 +1966,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=44f2a23#44f2a23232d2f19848167605e8692d55b87fe2c3"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=7c46ff6#7c46ff63df07a13ff3955a0edd92bb751df694c7"
 dependencies = [
  "futures-util",
  "gjson",
@@ -1986,7 +1986,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0-alpha.15"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=44f2a23#44f2a23232d2f19848167605e8692d55b87fe2c3"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=7c46ff6#7c46ff63df07a13ff3955a0edd92bb751df694c7"
 dependencies = [
  "abi_stable",
  "ahash 0.8.11",
@@ -8434,8 +8434,7 @@ checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
 [[package]]
 name = "yellowstone-grpc-client"
 version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7504e16bd8edc6af4ba11be0b42fba24ffb42b383b1373c5d26dc644a327070a"
+source = "git+https://github.com/rpcpool/yellowstone-grpc?rev=bb3a44a#bb3a44a2f723fb1885eb70a1d1efcab44e8ac32f"
 dependencies = [
  "bytes",
  "futures",
@@ -8448,8 +8447,7 @@ dependencies = [
 [[package]]
 name = "yellowstone-grpc-proto"
 version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a19211525073ab3811f57f30056633011f836fd61781a1f3b24ed4404a4c214"
+source = "git+https://github.com/rpcpool/yellowstone-grpc?rev=bb3a44a#bb3a44a2f723fb1885eb70a1d1efcab44e8ac32f"
 dependencies = [
  "anyhow",
  "bincode",
