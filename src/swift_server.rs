@@ -31,12 +31,15 @@ use axum::{
 };
 use dotenv::dotenv;
 use drift_rs::{
+    constants::high_leverage_mode_account,
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
     types::{
-        accounts::PerpMarket, errors::ErrorCode, MarketId, MarketType, OrderParams, OrderType,
-        SdkError, VersionedMessage, VersionedTransaction,
+        accounts::{HighLeverageModeConfig, PerpMarket},
+        errors::ErrorCode,
+        MarketId, MarketType, OrderParams, OrderType, SdkError, VersionedMessage,
+        VersionedTransaction,
     },
     utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -784,6 +787,14 @@ impl ServerParams {
                 return false;
             }
         };
+        let mut hlm: HighLeverageModeConfig =
+            match self.drift.try_get_account(high_leverage_mode_account()) {
+                Ok(s) => s,
+                Err(err) => {
+                    log::warn!(target: "sim", "HLM config account fetch failed: {err:?}");
+                    return false;
+                }
+            };
         let mut accounts_builder = AccountsListBuilder::default();
         let accounts = accounts_builder.try_build(
             &self.drift,
@@ -804,6 +815,7 @@ impl ServerParams {
             &mut accounts.unwrap(),
             &state,
             order_params,
+            Some(&mut hlm),
         ) {
             Ok(_) => true,
             Err(err) => {
