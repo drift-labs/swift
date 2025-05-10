@@ -38,7 +38,7 @@ ensure an x86_64 toolchain is configured for building `swift-server`
 ```shell
 rustup install 1.83.0-x86_64-apple-darwin
 # run inside swift-server directory
-rusutp override set 1.83.0-x86_64-apple-darwin
+rustup override set 1.83.0-x86_64-apple-darwin
 ```
 
 ```shell
