@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts,
-    Registry, TextEncoder,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec,
+    IntGauge, Opts, Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -38,6 +38,7 @@ pub struct SwiftServerMetrics {
     pub current_slot_gauge: Gauge,
     pub rpc_simulation_status: CounterVec,
     pub response_time_histogram: Histogram,
+    pub kafka_inflight_count: IntGauge,
 }
 
 impl SwiftServerMetrics {
@@ -69,6 +70,8 @@ impl SwiftServerMetrics {
             buckets: prometheus::exponential_buckets(1.0, 2.0, 10).unwrap(),
         })
         .unwrap();
+        let kafka_inflight_count =
+            IntGauge::new("swift_kafka_inflight_count", "Inflight kafka messages").unwrap();
         let rpc_simulation_status = CounterVec::new(
             Opts::new("swift_rpc_sim_status", "RPC order simulation status"),
             &["status"],
@@ -82,6 +85,7 @@ impl SwiftServerMetrics {
             current_slot_gauge,
             rpc_simulation_status,
             response_time_histogram,
+            kafka_inflight_count,
         }
     }
 
@@ -100,6 +104,9 @@ impl SwiftServerMetrics {
             .unwrap();
         registry
             .register(Box::new(self.response_time_histogram.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.kafka_inflight_count.clone()))
             .unwrap();
         registry
             .register(Box::new(self.rpc_simulation_status.clone()))
