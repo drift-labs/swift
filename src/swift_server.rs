@@ -47,7 +47,7 @@ use drift_rs::{
 use log::warn;
 use prometheus::Registry;
 use rdkafka::{
-    producer::{FutureProducer, FutureRecord},
+    producer::{FutureProducer, FutureRecord, Producer},
     util::Timeout,
 };
 use redis::{aio::MultiplexedConnection, AsyncCommands};
@@ -274,19 +274,34 @@ pub async fn process_order(
     let topic = format!("swift_orders_{}_{market_index}", market_type.as_str());
 
     if let Some(kafka_producer) = &server_params.kafka_producer {
-        match kafka_producer
-            .send(
-                FutureRecord::<String, String>::to(&topic).payload(&encoded),
-                Timeout::After(Duration::ZERO),
-            )
-            .await
+        let enqueue_result = match kafka_producer
+            .send_result(FutureRecord::<String, String>::to(&topic).payload(&encoded))
         {
-            Ok(_) => {
+            Ok(fut) => fut.await,
+            Err((err, _)) => {
+                log::error!(
+                    target: "kafka",
+                    "{log_prefix}: Failed to queue order: {order_metadata:?}, error: {err:?}"
+                );
+                server_params.metrics.kafka_forward_fail_counter.inc();
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some(format!("kafka publish error: {err:?}")),
+                    },
+                );
+            }
+        };
+
+        match enqueue_result {
+            Ok(Ok(_delivery_result)) => {
                 log::trace!(target: "kafka", "{log_prefix}: Sent message for order: {order_metadata:?}");
                 server_params
                     .metrics
                     .current_slot_gauge
-                    .add(current_slot as f64);
+                    .set(current_slot as f64);
+
                 server_params
                     .metrics
                     .order_type_counter
@@ -302,8 +317,15 @@ pub async fn process_order(
 
                 server_params
                     .metrics
+                    .kafka_inflight_count
+                    .set(kafka_producer.in_flight_count() as i64);
+
+                server_params
+                    .metrics
                     .response_time_histogram
                     .observe((unix_now_ms() - process_order_time) as f64);
+
+                log::info!(target: "kafka", "published to kafka: {}", order_metadata.uuid());
                 (
                     axum::http::StatusCode::OK,
                     ProcessOrderResponse {
@@ -312,10 +334,10 @@ pub async fn process_order(
                     },
                 )
             }
-            Err((e, _)) => {
+            Ok(Err((e, _))) => {
                 log::error!(
                     target: "kafka",
-                    "{log_prefix}: Failed to deliver for order: {order_metadata:?}, error: {e:?}"
+                    "{log_prefix}: Failed to deliver order: {order_metadata:?}, error: {e:?}"
                 );
                 server_params.metrics.kafka_forward_fail_counter.inc();
                 (
@@ -323,6 +345,20 @@ pub async fn process_order(
                     ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                         error: Some(format!("kafka publish error: {e:?}")),
+                    },
+                )
+            }
+            Err(_) => {
+                log::error!(
+                    target: "kafka",
+                    "{log_prefix}: Failed to queue order: {order_metadata:?}"
+                );
+                server_params.metrics.kafka_forward_fail_counter.inc();
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some("kafka publish error".into()),
                     },
                 )
             }
@@ -335,7 +371,7 @@ pub async fn process_order(
                 server_params
                     .metrics
                     .current_slot_gauge
-                    .add(current_slot as f64);
+                    .set(current_slot as f64);
                 server_params
                     .metrics
                     .order_type_counter
