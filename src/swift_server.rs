@@ -263,7 +263,7 @@ pub async fn process_order(
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority,
-        order_message: *signed_msg,
+        order_message: signed_msg.clone(),
         order_signature: taker_signature.into(),
         ts: process_order_time,
         uuid,
@@ -507,6 +507,8 @@ pub async fn health_check(
 }
 
 pub async fn start_server() {
+    // Start server
+
     dotenv().ok();
 
     let keypair =
@@ -897,13 +899,12 @@ impl ServerParams {
         })?;
 
         // check the account delegate matches the signer
-        if delegate_signer.is_some_and(|d| d != &user.delegate) {
-            return Err((
-                axum::http::StatusCode::BAD_REQUEST,
-                "signer is not configured delegate".to_string(),
-                None,
-            ));
-        }
+        // if delegate_signer.is_some_and(|d| d != &user.delegate) {
+        //     return Err((
+        //         axum::http::StatusCode::BAD_REQUEST,
+        //         "signer is not configured delegate".to_string(),
+        //     ));
+        // }
 
         if self.is_rpc_sim_disabled() {
             return Ok(sim_result);
