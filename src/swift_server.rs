@@ -236,7 +236,7 @@ pub async fn process_order(
                 .with_label_values(&[sim_res.as_str()])
                 .inc();
         }
-        Err((status, sim_err_str)) => {
+        Err((status, sim_err_str, logs)) => {
             server_params
                 .metrics
                 .rpc_simulation_status
@@ -892,6 +892,7 @@ impl ServerParams {
             (
                 axum::http::StatusCode::NOT_FOUND,
                 format!("unable to fetch user: {err:?}"),
+                None,
             )
         })?;
 
