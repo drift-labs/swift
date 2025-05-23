@@ -236,7 +236,7 @@ pub async fn process_order(
                 .with_label_values(&[sim_res.as_str()])
                 .inc();
         }
-        Err((status, sim_err_str)) => {
+        Err((status, sim_err_str, logs)) => {
             server_params
                 .metrics
                 .rpc_simulation_status
@@ -244,7 +244,9 @@ pub async fn process_order(
                 .inc();
             log::warn!(
                 target: "server",
-                "{log_prefix}: Order sim failed: {sim_err_str}",
+                "{log_prefix}: Order sim failed (taker: {taker_pubkey:?}, delegate: {delegate_signer:?}, market: {:?}-{}): {sim_err_str}. Logs: {logs:?}",
+                order_params.market_type,
+                order_params.market_index,
             );
             return (
                 status,
@@ -869,7 +871,7 @@ impl ServerParams {
         taker_order_params: &OrderParams,
         delegate_signer: Option<&Pubkey>,
         slot: Slot,
-    ) -> Result<SimulationStatus, (axum::http::StatusCode, String)> {
+    ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
 
         let t0 = SystemTime::now();
@@ -892,6 +894,7 @@ impl ServerParams {
             (
                 axum::http::StatusCode::NOT_FOUND,
                 format!("unable to fetch user: {err:?}"),
+                None,
             )
         })?;
 
@@ -956,10 +959,12 @@ impl ServerParams {
                         Some(code) => Err((
                             axum::http::StatusCode::BAD_REQUEST,
                             format!("invalid order. error code: {code:?}"),
+                            res.value.logs,
                         )),
                         None => Err((
                             axum::http::StatusCode::BAD_REQUEST,
                             format!("invalid order: {simulate_err:?}"),
+                            res.value.logs,
                         )),
                     }
                 } else {
@@ -1095,7 +1100,7 @@ mod tests {
         let result = server_params
             .simulate_taker_order_rpc(&taker_pubkey, &order_params, Some(&delegate_pubkey), 1_000)
             .await;
-        assert!(result.is_err_and(|(status, msg)| {
+        assert!(result.is_err_and(|(status, msg, _)| {
             dbg!(&msg);
             status == axum::http::StatusCode::BAD_REQUEST
                 && msg.contains("signer is not configured delegate")
@@ -1105,7 +1110,7 @@ mod tests {
             .simulate_taker_order_rpc(&taker_pubkey2, &order_params, Some(&delegate_pubkey), 1_000)
             .await;
         // it fails later at remote sim since the account is not a real drift account
-        assert!(result.is_err_and(|(status, msg)| {
+        assert!(result.is_err_and(|(status, msg, _)| {
             dbg!(&msg);
             status == axum::http::StatusCode::BAD_REQUEST
                 && msg.contains("invalid order: AccountNotFound")
