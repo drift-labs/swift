@@ -908,7 +908,8 @@ impl ServerParams {
 
         log::info!(
             target: "server",
-            "{taker_subaccount_pubkey}: max_leverage={},margin_mode={:?},activate_hlm={}",
+            "{:?}: max_leverage={},margin_mode={:?},activate_hlm={}",
+            user.authority,
             taker_order_params.base_asset_amount == u64::MAX,
             user.margin_mode,
             taker_order_params.high_leverage_mode(),
