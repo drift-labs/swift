@@ -906,6 +906,15 @@ impl ServerParams {
         //     ));
         // }
 
+        log::info!(
+            target: "server",
+            "{:?}: max_leverage={},margin_mode={:?},activate_hlm={}",
+            user.authority,
+            taker_order_params.base_asset_amount == u64::MAX,
+            user.margin_mode,
+            taker_order_params.high_leverage_mode(),
+        );
+
         if self.is_rpc_sim_disabled() {
             return Ok(sim_result);
         }
