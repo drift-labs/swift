@@ -248,6 +248,10 @@ pub async fn process_order(
                 order_params.market_type,
                 order_params.market_index,
             );
+            log::warn!(
+                target: "server",
+                "{log_prefix}: failed order params: {order_params:?}"
+            );
             return (
                 status,
                 ProcessOrderResponse {
