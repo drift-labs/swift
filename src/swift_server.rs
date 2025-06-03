@@ -38,7 +38,7 @@ use drift_rs::{
     types::{
         accounts::{HighLeverageModeConfig, PerpMarket},
         errors::ErrorCode,
-        MarketId, MarketType, OrderParams, OrderType, SdkError, VersionedMessage,
+        MarketId, MarketType, OrderParams, OrderType, ProgramError, SdkError, VersionedMessage,
         VersionedTransaction,
     },
     utils::load_keypair_multi_format,
@@ -61,6 +61,9 @@ use solana_sdk::{
     signer::Signer,
 };
 use tower_http::cors::{Any, CorsLayer};
+
+/// Accept orders under-collaterized upto this ratio.
+const COLLATERAL_BUFFER: f64 = 1.1;
 
 struct Config {
     /// RPC tx simulation on/off
@@ -792,6 +795,8 @@ pub enum SimulationStatus {
     Disabled,
     /// Success but sim'd over RPC
     SuccessRpc,
+    /// Given leniency for collateral error
+    SuccessCollateralBuffer,
 }
 
 impl SimulationStatus {
@@ -802,6 +807,7 @@ impl SimulationStatus {
             Self::Timeout => "timeout",
             Self::Disabled => "disabled",
             Self::SuccessRpc => "successRpc",
+            Self::SuccessCollateralBuffer => "successBuffer",
         }
     }
 }
@@ -969,11 +975,25 @@ impl ServerParams {
                         kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
                     });
                     match err.to_anchor_error_code() {
-                        Some(code) => Err((
-                            axum::http::StatusCode::BAD_REQUEST,
-                            format!("invalid order. error code: {code:?}"),
-                            res.value.logs,
-                        )),
+                        Some(code) => {
+                            // insufficient collateral is prone to precision errors, allow the order through with some leniency
+                            if code == ProgramError::Drift(ErrorCode::InsufficientCollateral) {
+                                if let Some(ref logs) = res.value.logs {
+                                    if let Some(collateral_ratio) = extract_collateral_ratio(logs) {
+                                        if collateral_ratio <= COLLATERAL_BUFFER {
+                                            log::info!(target: "sim", "accepting undercollateralized order: {collateral_ratio}");
+                                            log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
+                                            return Ok(SimulationStatus::SuccessCollateralBuffer);
+                                        }
+                                    }
+                                }
+                            }
+                            return Err((
+                                axum::http::StatusCode::BAD_REQUEST,
+                                format!("invalid order. error code: {code:?}"),
+                                res.value.logs,
+                            ));
+                        }
                         None => Err((
                             axum::http::StatusCode::BAD_REQUEST,
                             format!("invalid order: {simulate_err:?}"),
@@ -1033,6 +1053,39 @@ impl ServerParams {
             }
         }
     }
+}
+
+/// extract collateral ratio from program sim logs
+fn extract_collateral_ratio(logs: &[String]) -> Option<f64> {
+    for line in logs {
+        if line.contains("Program log: total_collateral=") {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                // Extract total_collateral
+                let total_collateral_part = parts[0];
+                let margin_requirement_part = parts[1];
+
+                let total_collateral = total_collateral_part
+                    .split('=')
+                    .nth(1)?
+                    .trim()
+                    .parse::<f64>()
+                    .ok()?;
+
+                let margin_requirement = margin_requirement_part
+                    .split('=')
+                    .nth(1)?
+                    .trim()
+                    .parse::<f64>()
+                    .ok()?;
+
+                if margin_requirement != 0.0 {
+                    return Some(total_collateral / margin_requirement);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
