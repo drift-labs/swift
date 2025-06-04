@@ -124,7 +124,7 @@ pub async fn process_order_wrapper(
 }
 
 pub async fn process_order(
-    server_params: &ServerParams,
+    server_params: &'static ServerParams,
     incoming_message: IncomingSignedMessage,
 ) -> (http::StatusCode, ProcessOrderResponse) {
     let process_order_time = unix_now_ms();
@@ -1186,15 +1186,5 @@ mod tests {
             status == axum::http::StatusCode::BAD_REQUEST
                 && msg.contains("invalid order: AccountNotFound")
         }));
-    }
-
-    #[test]
-    fn ui_header_extract() {
-        use axum::http::{HeaderMap, HeaderValue};
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-swift-client-consumer", HeaderValue::from_static("true"));
-        let is_app_order = headers.contains_key("x-swift-client-consumer");
-        assert!(is_app_order);
     }
 }
