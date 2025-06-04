@@ -21,11 +21,14 @@ use crate::{
         types::unix_now_ms,
     },
     user_account_fetcher::UserAccountFetcher,
-    util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+    util::{
+        headers::XSwiftClientConsumer,
+        metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+    },
 };
 use axum::{
     extract::State,
-    http::{self, HeaderMap, HeaderName, Method},
+    http::{self, Method},
     routing::{get, post},
     Json, Router,
 };
@@ -108,20 +111,19 @@ fn extract_uuid(msg: &SignedOrderType) -> [u8; 8] {
 }
 
 pub async fn process_order_wrapper(
-    headers: HeaderMap,
+    x_swift_client_header: axum_extra::TypedHeader<XSwiftClientConsumer>,
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
-    let is_app_order = headers.contains_key(HeaderName::from_static("X-Swift-Client-Consumer"));
     let uuid_raw = extract_uuid(&incoming_message.message);
     let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
     let (status, resp) = process_order(server_params, incoming_message).await;
-    log::info!(target: "server", "{}|{}|{:?}|ui={}", status, uuid, resp.error.as_deref().unwrap_or(""),is_app_order);
+    log::info!(target: "server", "{}|{}|{:?}|ui={}", status, uuid, resp.error.as_deref().unwrap_or(""), x_swift_client_header.is_app_order());
     (status, Json(resp))
 }
 
 pub async fn process_order(
-    server_params: &'static ServerParams,
+    server_params: &ServerParams,
     incoming_message: IncomingSignedMessage,
 ) -> (http::StatusCode, ProcessOrderResponse) {
     let process_order_time = unix_now_ms();
@@ -990,11 +992,11 @@ impl ServerParams {
                                     }
                                 }
                             }
-                            return Err((
+                            Err((
                                 axum::http::StatusCode::BAD_REQUEST,
                                 format!("invalid order. error code: {code:?}"),
                                 res.value.logs,
-                            ));
+                            ))
                         }
                         None => Err((
                             axum::http::StatusCode::BAD_REQUEST,
@@ -1183,5 +1185,15 @@ mod tests {
             status == axum::http::StatusCode::BAD_REQUEST
                 && msg.contains("invalid order: AccountNotFound")
         }));
+    }
+
+    #[test]
+    fn ui_header_extract() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-swift-client-consumer", HeaderValue::from_static("true"));
+        let is_app_order = headers.contains_key("x-swift-client-consumer");
+        assert!(is_app_order);
     }
 }
