@@ -21,7 +21,10 @@ use crate::{
         types::unix_now_ms,
     },
     user_account_fetcher::UserAccountFetcher,
-    util::metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+    util::{
+        headers::XSwiftClientConsumer,
+        metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
+    },
 };
 use axum::{
     extract::State,
@@ -38,7 +41,7 @@ use drift_rs::{
     types::{
         accounts::{HighLeverageModeConfig, PerpMarket},
         errors::ErrorCode,
-        MarketId, MarketType, OrderParams, OrderType, SdkError, VersionedMessage,
+        MarketId, MarketType, OrderParams, OrderType, ProgramError, SdkError, VersionedMessage,
         VersionedTransaction,
     },
     utils::load_keypair_multi_format,
@@ -61,6 +64,9 @@ use solana_sdk::{
     signer::Signer,
 };
 use tower_http::cors::{Any, CorsLayer};
+
+/// Accept orders under-collaterized upto this ratio.
+const COLLATERAL_BUFFER: f64 = 1.01;
 
 struct Config {
     /// RPC tx simulation on/off
@@ -105,13 +111,18 @@ fn extract_uuid(msg: &SignedOrderType) -> [u8; 8] {
 }
 
 pub async fn process_order_wrapper(
+    x_swift_client_header: Option<axum_extra::TypedHeader<XSwiftClientConsumer>>,
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
     let uuid_raw = extract_uuid(&incoming_message.message);
     let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
     let (status, resp) = process_order(server_params, incoming_message).await;
-    log::info!(target: "server", "{}|{}|{:?}", status, uuid, resp.error.as_deref().unwrap_or(""));
+    log::info!(
+        target: "server", "{status}|{uuid}|{:?}|ui={}",
+        resp.error.as_deref().unwrap_or(""),
+        x_swift_client_header.is_some_and(|x| x.is_app_order())
+    );
     (status, Json(resp))
 }
 
@@ -792,6 +803,8 @@ pub enum SimulationStatus {
     Disabled,
     /// Success but sim'd over RPC
     SuccessRpc,
+    /// Given leniency for collateral error
+    SuccessCollateralBuffer,
 }
 
 impl SimulationStatus {
@@ -802,6 +815,7 @@ impl SimulationStatus {
             Self::Timeout => "timeout",
             Self::Disabled => "disabled",
             Self::SuccessRpc => "successRpc",
+            Self::SuccessCollateralBuffer => "successBuffer",
         }
     }
 }
@@ -969,11 +983,25 @@ impl ServerParams {
                         kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
                     });
                     match err.to_anchor_error_code() {
-                        Some(code) => Err((
-                            axum::http::StatusCode::BAD_REQUEST,
-                            format!("invalid order. error code: {code:?}"),
-                            res.value.logs,
-                        )),
+                        Some(code) => {
+                            // insufficient collateral is prone to precision errors, allow the order through with some leniency
+                            if code == ProgramError::Drift(ErrorCode::InsufficientCollateral) {
+                                if let Some(ref logs) = res.value.logs {
+                                    if let Some(collateral_ratio) = extract_collateral_ratio(logs) {
+                                        if collateral_ratio <= COLLATERAL_BUFFER {
+                                            log::info!(target: "sim", "accepting undercollateralized order: {collateral_ratio}");
+                                            log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
+                                            return Ok(SimulationStatus::SuccessCollateralBuffer);
+                                        }
+                                    }
+                                }
+                            }
+                            Err((
+                                axum::http::StatusCode::BAD_REQUEST,
+                                format!("invalid order. error code: {code:?}"),
+                                res.value.logs,
+                            ))
+                        }
                         None => Err((
                             axum::http::StatusCode::BAD_REQUEST,
                             format!("invalid order: {simulate_err:?}"),
@@ -1033,6 +1061,39 @@ impl ServerParams {
             }
         }
     }
+}
+
+/// extract collateral ratio from program sim logs
+fn extract_collateral_ratio(logs: &[String]) -> Option<f64> {
+    for line in logs {
+        if line.contains("Program log: total_collateral=") {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                // Extract total_collateral
+                let total_collateral_part = parts[0];
+                let margin_requirement_part = parts[1];
+
+                let total_collateral = total_collateral_part
+                    .split('=')
+                    .nth(1)?
+                    .trim()
+                    .parse::<f64>()
+                    .ok()?;
+
+                let margin_requirement = margin_requirement_part
+                    .split('=')
+                    .nth(1)?
+                    .trim()
+                    .parse::<f64>()
+                    .ok()?;
+
+                if margin_requirement != 0.0 {
+                    return Some(total_collateral / margin_requirement);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
