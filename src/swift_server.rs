@@ -111,7 +111,7 @@ fn extract_uuid(msg: &SignedOrderType) -> [u8; 8] {
 }
 
 pub async fn process_order_wrapper(
-    x_swift_client_header: axum_extra::TypedHeader<XSwiftClientConsumer>,
+    x_swift_client_header: Option<axum_extra::TypedHeader<XSwiftClientConsumer>>,
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
@@ -121,7 +121,7 @@ pub async fn process_order_wrapper(
     log::info!(
         target: "server", "{status}|{uuid}|{:?}|ui={}",
         resp.error.as_deref().unwrap_or(""),
-        x_swift_client_header.is_app_order()
+        x_swift_client_header.is_some_and(|x| x.is_app_order())
     );
     (status, Json(resp))
 }
