@@ -18,7 +18,8 @@ aws-sdk-sts = { version = "1", default-features = false, features = [
     "rt-tokio",
     "rustls",
 ]}
-axum = { version = "^0.7.5", features = ["ws"] }
+axum = { version = "^0.8.3", features = ["ws"] }
+axum-extra = { version = "0.10.1", features = ["typed-header"] }
 axum-prometheus = "0.7.0"
 base64 = "0.22.1"
 clap = { version = "4.0", features = ["derive"] }
@@ -46,7 +47,6 @@ urlencoding = "2.1.0"
 uuid = { version = "1.10.0", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
 tower-http = { version = "0.6.2", features= ["cors"] }
 strum_macros = "0.27.0"
-thiserror = "2.0.12"
 
 [features]
 default = ["rdkafka/cmake-build"]
