@@ -28,7 +28,7 @@ use crate::{
 };
 use axum::{
     extract::State,
-    http::{self, HeaderMap, HeaderName, Method},
+    http::{self, Method},
     routing::{get, post},
     Json, Router,
 };
@@ -115,11 +115,14 @@ pub async fn process_order_wrapper(
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
-    let is_app_order = headers.contains_key(HeaderName::from_static("X-Swift-Client-Consumer"));
     let uuid_raw = extract_uuid(&incoming_message.message);
     let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
     let (status, resp) = process_order(server_params, incoming_message).await;
-    log::info!(target: "server", "{}|{}|{:?}|ui={}", status, uuid, resp.error.as_deref().unwrap_or(""), x_swift_client_header.is_app_order());
+    log::info!(
+        target: "server", "{status}|{uuid}|{:?}|ui={}",
+        resp.error.as_deref().unwrap_or(""),
+        x_swift_client_header.is_app_order()
+    );
     (status, Json(resp))
 }
 
