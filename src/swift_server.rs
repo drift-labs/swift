@@ -41,8 +41,8 @@ use drift_rs::{
     types::{
         accounts::{HighLeverageModeConfig, PerpMarket},
         errors::ErrorCode,
-        MarketId, MarketType, OrderParams, OrderType, ProgramError, SdkError, VersionedMessage,
-        VersionedTransaction,
+        CommitmentConfig, MarketId, MarketType, OrderParams, OrderType, ProgramError, SdkError,
+        VersionedMessage, VersionedTransaction,
     },
     utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -968,6 +968,8 @@ impl ServerParams {
                 RpcSimulateTransactionConfig {
                     sig_verify: false,
                     replace_recent_blockhash: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    min_context_slot: Some(slot),
                     ..Default::default()
                 },
             ),
