@@ -219,7 +219,7 @@ pub async fn process_order(
     if let Err(err) = validate_signed_order_params(&order_params, &market) {
         log::warn!(
             target: "server",
-            "{log_prefix}: Order did not validate: {err:?}",
+            "{log_prefix}: Order did not validate: {err:?}, {order_params:?}",
         );
         return (
             axum::http::StatusCode::BAD_REQUEST,
