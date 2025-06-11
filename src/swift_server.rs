@@ -1089,8 +1089,8 @@ fn extract_collateral_ratio(logs: &[String]) -> Option<f64> {
                     .parse::<f64>()
                     .ok()?;
 
-                if margin_requirement != 0.0 {
-                    return Some(total_collateral / margin_requirement);
+                if total_collateral != 0.0 {
+                    return Some(margin_requirement / total_collateral);
                 }
             }
         }
