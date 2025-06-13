@@ -113,7 +113,7 @@ impl OrderMetadataAndMessage {
     }
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, PartialEq)]
 pub struct ProcessOrderResponse {
     pub message: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +125,8 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE: &str =
     "Error verifying signed message";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slot too old";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
+pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT: &str =
+    "Invalid base_asset_amount in tp/sl";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
 pub const PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY: &str = "Ignore pubkey";
 

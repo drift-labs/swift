@@ -227,7 +227,7 @@ mod tests {
     use futures_util::FutureExt;
     use redis::{
         aio::{ConnectionLike, MultiplexedConnection},
-        RedisError, RedisFuture,
+        RedisFuture,
     };
 
     use super::*;
