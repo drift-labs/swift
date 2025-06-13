@@ -14,6 +14,7 @@ use crate::{
             IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
             PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
@@ -39,10 +40,9 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
     types::{
-        accounts::{HighLeverageModeConfig, PerpMarket},
-        errors::ErrorCode,
-        CommitmentConfig, MarketId, MarketType, OrderParams, OrderType, ProgramError, SdkError,
-        VersionedMessage, VersionedTransaction,
+        accounts::HighLeverageModeConfig, errors::ErrorCode, CommitmentConfig, MarketId,
+        MarketType, OrderParams, OrderType, PositionDirection, ProgramError, SdkError,
+        SignedMsgTriggerOrderParams, VersionedMessage, VersionedTransaction,
     },
     utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -176,7 +176,7 @@ pub async fn process_order(
     let signed_msg = match incoming_message.verify_and_get_signed_message() {
         Ok(m) => m,
         Err(e) => {
-            log::warn!("{log_prefix}: Error verifying signed message: {e:?}",);
+            log::warn!("{log_prefix}: Error verifying signed message: {e:?}, signer: {}, taker_authority: {}", incoming_message.signing_authority, incoming_message.taker_authority);
             return (
                 axum::http::StatusCode::BAD_REQUEST,
                 ProcessOrderResponse {
@@ -187,36 +187,26 @@ pub async fn process_order(
         }
     };
     let is_delegated = signed_msg.is_delegated();
+
+    let current_slot = server_params.slot_subscriber.current_slot();
     let SignedMessageInfo {
         slot: taker_slot,
+        order_params,
         taker_pubkey,
         uuid,
-        order_params,
-    } = signed_msg.info(&signing_pubkey);
-
-    // check the order's slot is reasonable
-    let current_slot = server_params.slot_subscriber.current_slot();
-    if taker_slot < current_slot - 500 {
-        log::warn!(
-            target: "server",
-            "{log_prefix}: Order slot too old: {taker_slot}, current slot: {current_slot}",
-        );
-        let err_str = PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD;
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            ProcessOrderResponse {
-                message: err_str,
-                error: Some(err_str.to_string()),
-            },
-        );
-    }
+    } = match extract_signed_message_info(&signed_msg, &taker_authority, current_slot) {
+        Ok(info) => info,
+        Err(err) => return err,
+    };
 
     // check the order is valid for execution by program
     let market = server_params
         .drift
-        .try_get_perp_market_account(order_params.market_index)
-        .ok();
-    if let Err(err) = validate_signed_order_params(&order_params, &market) {
+        .try_get_perp_market_account(order_params.market_index);
+    if let Err(err) = validate_signed_order_params(
+        &order_params,
+        market.map(|m| m.amm.min_order_size).unwrap_or(0),
+    ) {
         log::warn!(
             target: "server",
             "{log_prefix}: Order did not validate: {err:?}, {order_params:?}",
@@ -760,7 +750,7 @@ pub async fn start_server() {
 /// Simple validation from program's `handle_signed_order_ix`
 fn validate_signed_order_params(
     taker_order_params: &OrderParams,
-    market: &Option<PerpMarket>,
+    min_order_size: u64,
 ) -> Result<(), ErrorCode> {
     if !matches!(
         taker_order_params.order_type,
@@ -773,25 +763,36 @@ fn validate_signed_order_params(
         return Err(ErrorCode::InvalidOrderMarketType);
     }
 
-    match market {
-        Some(market) => {
-            if taker_order_params.base_asset_amount < market.amm.min_order_size {
-                return Err(ErrorCode::InvalidOrderSizeTooSmall);
-            }
-        }
-        None => {
-            return Err(ErrorCode::PerpMarketNotFound);
-        }
+    if taker_order_params.base_asset_amount < min_order_size {
+        log::info!(target: "server", "{} < {min_order_size}", taker_order_params.base_asset_amount);
+        return Err(ErrorCode::InvalidOrderSizeTooSmall);
     }
 
-    if taker_order_params.auction_duration.is_none()
-        || taker_order_params.auction_start_price.is_none()
-        || taker_order_params.auction_end_price.is_none()
+    // has_valid_auction_params
+    if taker_order_params.auction_duration.is_some()
+        && taker_order_params.auction_start_price.is_some()
+        && taker_order_params.auction_end_price.is_some()
     {
-        return Err(ErrorCode::InvalidOrderAuction);
-    }
+        let start_price = taker_order_params.auction_start_price.unwrap();
+        let end_price = taker_order_params.auction_end_price.unwrap();
 
-    Ok(())
+        if taker_order_params.direction == PositionDirection::Long && start_price <= end_price
+            || taker_order_params.direction == PositionDirection::Short && start_price >= end_price
+        {
+            Ok(())
+        } else {
+            log::info!(target: "server", "auction price reversed");
+            Err(ErrorCode::InvalidOrderAuction)
+        }
+    } else if taker_order_params.order_type == OrderType::Limit
+        && taker_order_params.auction_duration.is_none()
+        && taker_order_params.auction_start_price.is_none()
+        && taker_order_params.auction_end_price.is_none()
+    {
+        Ok(())
+    } else {
+        Err(ErrorCode::InvalidOrderAuction)
+    }
 }
 
 #[derive(Debug)]
@@ -1098,98 +1099,401 @@ fn extract_collateral_ratio(logs: &[String]) -> Option<f64> {
     None
 }
 
+fn validate_order(
+    stop_loss: Option<&SignedMsgTriggerOrderParams>,
+    take_profit: Option<&SignedMsgTriggerOrderParams>,
+    taker_slot: Slot,
+    current_slot: Slot,
+) -> Result<(), (axum::http::StatusCode, ProcessOrderResponse)> {
+    // Validate order parameters
+    if stop_loss.is_some_and(|x| x.base_asset_amount == 0)
+        || take_profit.is_some_and(|x| x.base_asset_amount == 0)
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT,
+                error: None,
+            },
+        ));
+    }
+
+    // Validate slot
+    if taker_slot < current_slot - 500 {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
+                error: Some(PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD.to_string()),
+            },
+        ));
+    }
+
+    Ok(())
+}
+
+fn extract_signed_message_info(
+    signed_msg: &SignedOrderType,
+    taker_authority: &Pubkey,
+    current_slot: Slot,
+) -> Result<SignedMessageInfo, (axum::http::StatusCode, ProcessOrderResponse)> {
+    match signed_msg {
+        SignedOrderType::Delegated(x) => {
+            validate_order(
+                x.stop_loss_order_params.as_ref(),
+                x.take_profit_order_params.as_ref(),
+                x.slot,
+                current_slot,
+            )?;
+            Ok(SignedMessageInfo {
+                taker_pubkey: x.taker_pubkey,
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            })
+        }
+        SignedOrderType::Authority(x) => {
+            validate_order(
+                x.stop_loss_order_params.as_ref(),
+                x.take_profit_order_params.as_ref(),
+                x.slot,
+                current_slot,
+            )?;
+            Ok(SignedMessageInfo {
+                taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #![cfg(test)]
-    use crate::{
-        super_slot_subscriber::SuperSlotSubscriber, swift_server::ServerParams,
-        user_account_fetcher::UserAccountFetcher, util::metrics::SwiftServerMetrics,
+    use super::*;
+    use drift_rs::types::{
+        SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+        SignedMsgTriggerOrderParams,
     };
-    use drift_rs::{
-        types::{accounts::User, MarketType, OrderParams, OrderType, PositionDirection},
-        DriftClient, Pubkey, RpcClient,
-    };
-    use solana_sdk::{native_token::LAMPORTS_PER_SOL, signature::Keypair, signer::Signer};
-    use std::{collections::HashMap, sync::Arc};
+    use solana_sdk::native_token::LAMPORTS_PER_SOL;
 
-    #[tokio::test]
-    async fn test_simulate_taker_order_rpc() {
-        let _ = env_logger::try_init();
-        // Create mock server params
-        let drift = DriftClient::new(
-            drift_rs::Context::DevNet,
-            RpcClient::new("https://api.devnet.solana.com".to_string()),
-            Keypair::new().into(),
-        )
-        .await
-        .unwrap();
-
-        let taker_pubkey = Keypair::new().pubkey();
-        let taker_pubkey2 = Keypair::new().pubkey();
-        let delegate_pubkey = Keypair::new().pubkey();
-        let users: HashMap<Pubkey, User> = [
-            (
-                taker_pubkey,
-                User {
-                    authority: taker_pubkey,
-                    delegate: Pubkey::default(),
-                    ..Default::default()
-                },
-            ),
-            (
-                taker_pubkey2,
-                User {
-                    authority: taker_pubkey2,
-                    delegate: delegate_pubkey,
-                    ..Default::default()
-                },
-            ),
-        ]
-        .into();
-
-        dbg!(users.contains_key(&taker_pubkey));
-        dbg!(users.contains_key(&taker_pubkey2));
-
-        let server_params = ServerParams {
-            slot_subscriber: Arc::new(SuperSlotSubscriber::new(vec![], drift.rpc())),
-            metrics: SwiftServerMetrics::new(),
-            user_account_fetcher: UserAccountFetcher::mock(users),
-            config: Arc::new(crate::swift_server::Config::from_env()),
-            drift,
-            farmer_pubkeys: Default::default(),
-            kafka_producer: Default::default(),
-            redis_pool: Default::default(),
-        };
-
-        // Create mock order params
-        let order_params = OrderParams {
+    fn create_test_order_params(
+        order_type: OrderType,
+        market_type: MarketType,
+        base_asset_amount: u64,
+        direction: PositionDirection,
+        auction_params: Option<(u8, i64, i64)>, // (duration, start_price, end_price)
+    ) -> OrderParams {
+        let (auction_duration, auction_start_price, auction_end_price) =
+            auction_params.unwrap_or((0, 0, 0));
+        OrderParams {
             market_index: 0,
-            market_type: MarketType::Perp,
-            order_type: OrderType::Market,
-            base_asset_amount: 1 * LAMPORTS_PER_SOL,
+            market_type,
+            order_type,
+            base_asset_amount,
             price: 1_000,
-            direction: PositionDirection::Short,
+            direction,
+            auction_duration: if auction_duration > 0 {
+                Some(auction_duration)
+            } else {
+                None
+            },
+            auction_start_price: if auction_start_price > 0 {
+                Some(auction_start_price)
+            } else {
+                None
+            },
+            auction_end_price: if auction_end_price > 0 {
+                Some(auction_end_price)
+            } else {
+                None
+            },
             ..Default::default()
-        };
+        }
+    }
 
-        // Test
-        let result = server_params
-            .simulate_taker_order_rpc(&taker_pubkey, &order_params, Some(&delegate_pubkey), 1_000)
-            .await;
-        assert!(result.is_err_and(|(status, msg, _)| {
-            dbg!(&msg);
-            status == axum::http::StatusCode::BAD_REQUEST
-                && msg.contains("signer is not configured delegate")
+    #[test]
+    fn test_validate_market_type() {
+        let min_order_size = 1 * LAMPORTS_PER_SOL;
+
+        // Test valid market type
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((1, 99, 100)),
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Test invalid market type
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Spot,
+            min_order_size,
+            PositionDirection::Long,
+            Some((1, 99, 100)),
+        );
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderMarketType)
+        );
+    }
+
+    #[test]
+    fn test_validate_order_size() {
+        let min_order_size = 1 * LAMPORTS_PER_SOL;
+
+        // Test valid order size
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((1, 99, 100)),
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Test invalid order size
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Perp,
+            min_order_size - 1,
+            PositionDirection::Long,
+            None,
+        );
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderSizeTooSmall)
+        );
+    }
+
+    #[test]
+    fn test_validate_auction_params() {
+        let min_order_size = 1 * LAMPORTS_PER_SOL;
+
+        // Test valid auction params for long position
+        let params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((100, 1000, 1100)), // start < end for long
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Test valid auction params for short position
+        let params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Short,
+            Some((100, 1100, 1000)), // start > end for short
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Test invalid auction params for long position
+        let params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((100, 1100, 1000)), // start > end for long (invalid)
+        );
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
+
+        // Test invalid auction params for short position
+        let params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Short,
+            Some((100, 1000, 1100)), // start < end for short (invalid)
+        );
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
+
+        // Test limit order with no auction params
+        let params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        let params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((100, 1000, 1100)),
+        );
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_extract_signed_message_info_delegated() {
+        let taker_authority = Pubkey::new_unique();
+        let current_slot = 1000;
+
+        // Test successful case
+        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+            taker_pubkey: Pubkey::new_unique(),
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+        });
+
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        assert!(result.is_ok_and(|info| {
+            info.slot == current_slot
+                && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
+                && info.order_params.order_type == OrderType::Market
         }));
 
-        let result = server_params
-            .simulate_taker_order_rpc(&taker_pubkey2, &order_params, Some(&delegate_pubkey), 1_000)
-            .await;
-        // it fails later at remote sim since the account is not a real drift account
-        assert!(result.is_err_and(|(status, msg, _)| {
-            dbg!(&msg);
-            status == axum::http::StatusCode::BAD_REQUEST
-                && msg.contains("invalid order: AccountNotFound")
+        // Test invalid order amount case
+        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+            taker_pubkey: Pubkey::new_unique(),
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: Some(SignedMsgTriggerOrderParams {
+                base_asset_amount: 0,
+                ..Default::default()
+            }),
+            take_profit_order_params: None,
+        });
+
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        assert!(result.is_err_and(|x| {
+            x.0 == axum::http::StatusCode::BAD_REQUEST
+                && x.1.message == PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT
+                && x.1.error.is_none()
         }));
+    }
+
+    #[test]
+    fn test_extract_signed_message_info_authority() {
+        let taker_authority = Pubkey::new_unique();
+        let current_slot = 1000;
+        let sub_account_id = 1;
+
+        // Test successful case
+        let authority_msg = SignedOrderType::Authority(SignedMsgOrderParamsMessage {
+            sub_account_id,
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+        });
+
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        assert!(result.is_ok_and(|info| {
+            info.slot == current_slot
+                && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
+                && info.order_params.order_type == OrderType::Market
+                && info.taker_pubkey
+                    == Wallet::derive_user_account(&taker_authority, sub_account_id)
+        }));
+
+        // Test invalid order amount case
+        let authority_msg = SignedOrderType::Authority(SignedMsgOrderParamsMessage {
+            sub_account_id,
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: Some(SignedMsgTriggerOrderParams {
+                base_asset_amount: 0,
+                ..Default::default()
+            }),
+        });
+
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        assert!(result.is_err_and(|x| {
+            x.0 == axum::http::StatusCode::BAD_REQUEST
+                && x.1.message == PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT
+                && x.1.error.is_none()
+        }));
+    }
+
+    #[test]
+    fn test_extract_signed_message_info_slot_validation() {
+        let taker_authority = Pubkey::new_unique();
+        let current_slot = 1000;
+
+        // Test slot too old
+        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+            taker_pubkey: Pubkey::new_unique(),
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot - 501, // Slot too old
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+        });
+
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        assert!(result.is_err_and(|x| x
+            == (
+                axum::http::StatusCode::BAD_REQUEST,
+                ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
+                    error: Some(PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD.into())
+                }
+            )));
     }
 }
