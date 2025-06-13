@@ -1171,9 +1171,11 @@ fn extract_signed_message_info(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use drift_rs::types::{
-        SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+        accounts::User, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
         SignedMsgTriggerOrderParams,
     };
     use solana_sdk::native_token::LAMPORTS_PER_SOL;
@@ -1495,5 +1497,86 @@ mod tests {
                     error: Some(PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD.into())
                 }
             )));
+    }
+
+    #[tokio::test]
+    async fn test_simulate_taker_order_rpc() {
+        let _ = env_logger::try_init();
+        // Create mock server params
+        let drift = DriftClient::new(
+            drift_rs::Context::DevNet,
+            RpcClient::new("https://api.devnet.solana.com".to_string()),
+            Keypair::new().into(),
+        )
+        .await
+        .unwrap();
+
+        let taker_pubkey = Keypair::new().pubkey();
+        let taker_pubkey2 = Keypair::new().pubkey();
+        let delegate_pubkey = Keypair::new().pubkey();
+        let users: HashMap<Pubkey, User> = [
+            (
+                taker_pubkey,
+                User {
+                    authority: taker_pubkey,
+                    delegate: Pubkey::default(),
+                    ..Default::default()
+                },
+            ),
+            (
+                taker_pubkey2,
+                User {
+                    authority: taker_pubkey2,
+                    delegate: delegate_pubkey,
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into();
+
+        dbg!(users.contains_key(&taker_pubkey));
+        dbg!(users.contains_key(&taker_pubkey2));
+
+        let server_params = ServerParams {
+            slot_subscriber: Arc::new(SuperSlotSubscriber::new(vec![], drift.rpc())),
+            metrics: SwiftServerMetrics::new(),
+            user_account_fetcher: UserAccountFetcher::mock(users),
+            config: Arc::new(crate::swift_server::Config::from_env()),
+            drift,
+            farmer_pubkeys: Default::default(),
+            kafka_producer: Default::default(),
+            redis_pool: Default::default(),
+        };
+
+        // Create mock order params
+        let order_params = OrderParams {
+            market_index: 0,
+            market_type: MarketType::Perp,
+            order_type: OrderType::Market,
+            base_asset_amount: 1 * LAMPORTS_PER_SOL,
+            price: 1_000,
+            direction: PositionDirection::Short,
+            ..Default::default()
+        };
+
+        // Test
+        let result = server_params
+            .simulate_taker_order_rpc(&taker_pubkey, &order_params, Some(&delegate_pubkey), 1_000)
+            .await;
+        assert!(result.is_err_and(|(status, msg, _)| {
+            dbg!(&msg);
+            status == axum::http::StatusCode::BAD_REQUEST
+                && msg.contains("signer is not configured delegate")
+        }));
+
+        let result = server_params
+            .simulate_taker_order_rpc(&taker_pubkey2, &order_params, Some(&delegate_pubkey), 1_000)
+            .await;
+        // it fails later at remote sim since the account is not a real drift account
+        assert!(result.is_err_and(|(status, msg, _)| {
+            dbg!(&msg);
+            status == axum::http::StatusCode::BAD_REQUEST
+                && msg.contains("invalid order: AccountNotFound")
+        }));
     }
 }
