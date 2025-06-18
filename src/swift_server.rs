@@ -33,6 +33,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use base64::Engine;
 use dotenv::dotenv;
 use drift_rs::{
     constants::high_leverage_mode_account,
@@ -40,9 +41,11 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
     types::{
-        accounts::HighLeverageModeConfig, errors::ErrorCode, CommitmentConfig, MarketId,
-        MarketType, OrderParams, OrderType, PositionDirection, ProgramError, SdkError,
-        SignedMsgTriggerOrderParams, VersionedMessage, VersionedTransaction,
+        accounts::{HighLeverageModeConfig, User},
+        errors::ErrorCode,
+        CommitmentConfig, MarketId, MarketType, OrderParams, OrderType, PositionDirection,
+        ProgramError, SdkError, SignedMsgTriggerOrderParams, VersionedMessage,
+        VersionedTransaction,
     },
     utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -190,7 +193,7 @@ pub async fn process_order(
 
     let current_slot = server_params.slot_subscriber.current_slot();
     let SignedMessageInfo {
-        slot: taker_slot,
+        slot: _taker_slot,
         order_params,
         taker_pubkey,
         uuid,
@@ -998,6 +1001,15 @@ impl ServerParams {
                                         }
                                     }
                                 }
+                                if log::log_enabled!(target: "accountState", log::Level::Debug) {
+                                    dump_account_state(
+                                        &self.drift,
+                                        taker_subaccount_pubkey,
+                                        user,
+                                        &taker_order_params,
+                                        res.context.slot,
+                                    );
+                                }
                             }
                             Err((
                                 axum::http::StatusCode::BAD_REQUEST,
@@ -1167,6 +1179,90 @@ fn extract_signed_message_info(
             })
         }
     }
+}
+
+fn dump_account_state(
+    drift: &DriftClient,
+    taker_subaccount_pubkey: &Pubkey,
+    user: User,
+    taker_order_params: &OrderParams,
+    slot: Slot,
+) {
+    log::info!(
+    target: "accountState",
+    "dumping account state: user:{},authority:{},slot:{}", taker_subaccount_pubkey.to_string(), user.authority.to_string(), slot
+    );
+    let mut debug_log = String::with_capacity(8192 * 2);
+    debug_log.push_str("user:");
+    base64::engine::general_purpose::STANDARD
+        .encode_string(drift_rs::utils::zero_account_to_bytes(user), &mut debug_log);
+    debug_log.push_str("|");
+    for p in user.spot_positions.iter().filter(|p| !p.is_available()) {
+        if let Ok(market) = drift.try_get_spot_market_account(p.market_index) {
+            debug_log.push_str(&format!("spotMarket-{}:", p.market_index,));
+            base64::engine::general_purpose::STANDARD.encode_string(
+                drift_rs::utils::zero_account_to_bytes(market),
+                &mut debug_log,
+            );
+            debug_log.push_str("|");
+        }
+        if let Some(oracle) =
+            drift.try_get_oracle_price_data_and_slot(MarketId::spot(p.market_index))
+        {
+            debug_log.push_str(&format!(
+                "oracle-{:?}-{}:",
+                oracle.source,
+                oracle.pubkey.to_string()
+            ));
+            base64::engine::general_purpose::STANDARD.encode_string(oracle.raw, &mut debug_log);
+            debug_log.push_str("|");
+        }
+    }
+    for p in user.perp_positions.iter().filter(|p| !p.is_open_position()) {
+        if let Ok(market) = drift.try_get_perp_market_account(p.market_index) {
+            debug_log.push_str(&format!("perpMarket-{}:", p.market_index,));
+            base64::engine::general_purpose::STANDARD.encode_string(
+                drift_rs::utils::zero_account_to_bytes(market),
+                &mut debug_log,
+            );
+            debug_log.push_str("|");
+        }
+        if let Some(oracle) =
+            drift.try_get_oracle_price_data_and_slot(MarketId::perp(p.market_index))
+        {
+            debug_log.push_str(&format!(
+                "oracle-{:?}-{}:",
+                oracle.source,
+                oracle.pubkey.to_string()
+            ));
+            base64::engine::general_purpose::STANDARD.encode_string(oracle.raw, &mut debug_log);
+            debug_log.push_str("|");
+        }
+    }
+
+    if let Ok(market) = drift.try_get_perp_market_account(taker_order_params.market_index) {
+        debug_log.push_str(&format!("perpMarket-{}:", taker_order_params.market_index,));
+        base64::engine::general_purpose::STANDARD.encode_string(
+            drift_rs::utils::zero_account_to_bytes(market),
+            &mut debug_log,
+        );
+        debug_log.push_str("|");
+    }
+
+    if let Some(oracle) =
+        drift.try_get_oracle_price_data_and_slot(MarketId::perp(taker_order_params.market_index))
+    {
+        debug_log.push_str(&format!(
+            "oracle-{:?}-{}:",
+            oracle.source,
+            oracle.pubkey.to_string()
+        ));
+        base64::engine::general_purpose::STANDARD.encode_string(oracle.raw, &mut debug_log);
+        debug_log.push_str("|");
+    }
+
+    let compressed = zstd::encode_all(debug_log.as_bytes(), 0).expect("encoded");
+    log::debug!(target: "accountState", "{}", base64::engine::general_purpose::STANDARD.encode(compressed));
 }
 
 #[cfg(test)]
