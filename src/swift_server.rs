@@ -1218,7 +1218,7 @@ fn dump_account_state(
             debug_log.push_str("|");
         }
     }
-    for p in user.perp_positions.iter().filter(|p| !p.is_open_position()) {
+    for p in user.perp_positions.iter().filter(|p| p.is_open_position()) {
         if let Ok(market) = drift.try_get_perp_market_account(p.market_index) {
             debug_log.push_str(&format!("perpMarket-{}:", p.market_index,));
             base64::engine::general_purpose::STANDARD.encode_string(
