@@ -1118,8 +1118,8 @@ fn validate_order(
     current_slot: Slot,
 ) -> Result<(), (axum::http::StatusCode, ProcessOrderResponse)> {
     // Validate order parameters
-    if stop_loss.is_some_and(|x| x.base_asset_amount == 0)
-        || take_profit.is_some_and(|x| x.base_asset_amount == 0)
+    if stop_loss.is_some_and(|x| x.base_asset_amount == 0 || x.trigger_price == 0)
+        || take_profit.is_some_and(|x| x.base_asset_amount == 0 || x.trigger_price == 0)
     {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
