@@ -9,7 +9,7 @@ on:
 jobs:
   build_and_test:
     runs-on: ubicloud
-    container: rust:1.84.1
+    container: rust:1.87.0
     timeout-minutes: 10
     strategy:
       matrix:
