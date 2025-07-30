@@ -1,4 +1,4 @@
-FROM rust:1.84.1 AS builder
+FROM rust:1.87.0 AS builder
 
 RUN apt update -y && \
   apt install -y git libssl-dev libsasl2-dev cmake jq

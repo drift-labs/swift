@@ -185,7 +185,7 @@ async fn determine_fast_ws(ws_delegate: &Pubkey, stake_pubkey: &Pubkey) -> Resul
     log::debug!(
         target: "ws",
         "Gov stake for {}: {}",
-        stake_pubkey.to_string(),
+        stake_pubkey,
         user_stats.if_staked_gov_token_amount
     );
 
@@ -272,10 +272,7 @@ impl WsConnection {
                 action,
             }) => {
                 if !self.is_authenticated() {
-                    debug!(
-                        "{}: subscribe when not authenticated",
-                        self.pubkey.to_string()
-                    );
+                    debug!("{}: subscribe when not authenticated", self.pubkey,);
                     self.send_message(
                         WsMessage::auth().set_error("Not authenticated to subscribe"),
                     )?;
@@ -288,10 +285,7 @@ impl WsConnection {
                 );
 
                 if market_index.is_none() {
-                    log::debug!(
-                        "{}: subscribe for market that doesn't exist",
-                        self.pubkey.to_string()
-                    );
+                    log::debug!("{}: subscribe for market that doesn't exist", self.pubkey,);
                     self.send_message(
                         WsMessage::subscribe().set_error(&format!("Market {market_name} invalid")),
                     )?;
@@ -311,7 +305,7 @@ impl WsConnection {
                             log::info!(
                                 target: "ws",
                                 "{}: subscribing to topic: {topic}",
-                                self.pubkey.to_string()
+                                self.pubkey,
                             );
                             self.subscribed_topics.insert(topic.clone(), tx.subscribe());
                             Ok(())
@@ -319,7 +313,7 @@ impl WsConnection {
                             log::info!(
                                 target: "ws",
                                 "{}: trying to subscribe to topic not found: {topic}",
-                                self.pubkey.to_string()
+                                self.pubkey,
                             );
                             self.send_message(
                                 WsMessage::auth()
@@ -334,7 +328,7 @@ impl WsConnection {
                             target: "ws",
 
                             "{}: unsubscribing from topic: {topic}",
-                            self.pubkey.to_string()
+                            self.pubkey,
                         );
                         self.subscribed_topics.remove(&topic);
                         Ok(())
@@ -369,7 +363,7 @@ impl WsConnection {
                                 if let Err(ref err) = is_fast_ws {
                                     log::error!(
                                         "{}: Failed to determine if fast ws: {err:?}",
-                                        pubkey.to_string()
+                                        pubkey,
                                     );
                                     shared_state
                                         .metrics
@@ -380,7 +374,7 @@ impl WsConnection {
                                     log::info!(
                                         target: "ws",
                                         "{}: Is fast ws: {is_fast_ws:?}",
-                                        pubkey.to_string()
+                                        pubkey,
                                     );
                                     let is_fast_ws = is_fast_ws.unwrap();
                                     shared_state
