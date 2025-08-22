@@ -49,7 +49,6 @@ use drift_rs::{
         ProgramError, SdkError, SignedMsgTriggerOrderParams, VersionedMessage,
         VersionedTransaction,
     },
-    utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
 use log::warn;
@@ -393,9 +392,7 @@ pub async fn deposit_trade(
     // verify deposit ix exists and amount
     let ix = &req.deposit_tx.message.instructions[0];
     if &ix.data[..8] == drift_idl::instructions::Deposit::DISCRIMINATOR {
-        if let Ok(deposit_ix) =
-            drift_idl::instructions::Deposit::deserialize(&mut ix.data.as_slice())
-        {
+        if let Ok(deposit_ix) = drift_idl::instructions::Deposit::deserialize(&mut &ix.data[8..]) {
             let spot_oracle = server_params
                 .drift
                 .try_get_oracle_price_data_and_slot(MarketId::spot(deposit_ix.market_index))
@@ -415,7 +412,7 @@ pub async fn deposit_trade(
                 StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
                     message: "",
-                    error: Some("invalid deposit ix".into()),
+                    error: Some("invalid deposit ix encoding".into()),
                 }),
             );
         }
@@ -521,13 +518,6 @@ pub async fn start_server() {
 
     dotenv().ok();
 
-    let keypair =
-        load_keypair_multi_format(env::var("PRIVATE_KEY").expect("PRIVATE_KEY set").as_str());
-    if let Err(err) = keypair {
-        log::error!(target: "server", "Failed to load swift private key: {err:?}");
-        return;
-    }
-
     let use_kafka: bool = env::var("USE_KAFKA").unwrap_or_else(|_| "false".to_string()) == "true";
     let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string()) == "true";
     let drift_env = env::var("ENV").unwrap_or("devnet".to_string());
@@ -592,7 +582,7 @@ pub async fn start_server() {
         "mainnet-beta" => Context::MainNet,
         _ => panic!("Invalid drift environment: {drift_env}"),
     };
-    let wallet = Wallet::new(keypair.unwrap());
+    let wallet = Wallet::new(Keypair::new());
     let client = DriftClient::new(context, RpcClient::new(rpc_endpoint), wallet)
         .await
         .expect("initialized client");
