@@ -193,12 +193,6 @@ impl<'a> WsMessage<'a> {
         WsMessage::new("subscribe")
     }
 
-    pub const fn deposit_trade(tx: &'a str) -> Self {
-        let mut this = WsMessage::new("deposit_trade");
-        this.deposit = Some(tx);
-        this
-    }
-
     pub const fn new(channel: &'a str) -> Self {
         Self {
             channel,
@@ -208,6 +202,11 @@ impl<'a> WsMessage<'a> {
             message: None,
             error: None,
         }
+    }
+
+    pub fn set_deposit(mut self, tx: &'a str) -> Self {
+        self.deposit = Some(tx);
+        self
     }
 
     pub fn set_order(mut self, order: &'a OrderMetadataAndMessage) -> Self {

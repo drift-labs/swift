@@ -445,7 +445,7 @@ pub async fn deposit_trade(
                 metrics_labels[0], metrics_labels[1]
             );
             let payload = serde_json::json!({
-                "depositTx": base64::prelude::BASE64_STANDARD
+                "deposit": base64::prelude::BASE64_STANDARD
                 .encode(bincode::serialize(&req.deposit_tx).unwrap()),
                 "order": order_metadata.encode(),
             })

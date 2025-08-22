@@ -33,6 +33,7 @@ use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     Message as KafkaMessage,
 };
+use serde::Deserialize;
 use tokio::{
     io::AsyncWriteExt,
     sync::{
@@ -645,8 +646,29 @@ async fn subscribe_kafka_consumer(
                 let payload_str = std::str::from_utf8(payload)
                     .context("Failed to convert payload to string")
                     .unwrap();
-                let order_metadata = OrderMetadataAndMessage::decode(payload_str)
-                    .context("Failed to decode order metadata");
+
+                let (order_metadata, deposit) = if !topic.contains("deposit") {
+                    (
+                        OrderMetadataAndMessage::decode(payload_str)
+                            .context("Failed to decode order metadata"),
+                        None,
+                    )
+                } else {
+                    #[derive(Deserialize)]
+                    struct DepositOrder<'a> {
+                        #[serde(borrow)]
+                        deposit: &'a str,
+                        #[serde(borrow)]
+                        order: &'a str,
+                    }
+                    let value: DepositOrder = serde_json::from_str(payload_str).unwrap();
+                    (
+                        OrderMetadataAndMessage::decode(value.order)
+                            .context("Failed to decode order metadata"),
+                        Some(value.deposit),
+                    )
+                };
+
                 if let Err(ref err) = order_metadata {
                     log::error!(target: "kafka", "Failed to decode order metadata: {err:?}, {order_metadata:?}");
                     continue;
@@ -664,7 +686,13 @@ async fn subscribe_kafka_consumer(
                     "received message: {message_uuid} after: {:?}",
                     unix_now_ms() - order_metadata.ts,
                 );
-                let message = WsMessage::new(topic).set_order(&order_metadata);
+
+                let mut message = WsMessage::new(topic).set_order(&order_metadata);
+                // order has a deposit tx attached
+                if let Some(deposit) = deposit {
+                    message = message.set_deposit(deposit);
+                }
+
                 log::debug!("message jsonify(): {:?}", message);
                 match tx.send(OrderNotification {
                     json: message.jsonify(),
