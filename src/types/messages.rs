@@ -13,7 +13,14 @@ use drift_rs::{
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
+
+#[derive(serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct DepositAndPlaceRequest {
+    #[serde(deserialize_with = "deser_transaction")]
+    pub deposit_tx: Transaction,
+    pub swift_order: IncomingSignedMessage,
+}
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct IncomingSignedMessage {
@@ -166,6 +173,7 @@ pub enum WsClientMessage {
 #[derive(Clone, Debug)]
 pub struct WsMessage<'a> {
     channel: &'a str,
+    deposit: Option<&'a str>,
     order: Option<&'a OrderMetadataAndMessage>,
     nonce: Option<&'a str>,
     message: Option<&'a str>,
@@ -185,9 +193,16 @@ impl<'a> WsMessage<'a> {
         WsMessage::new("subscribe")
     }
 
+    pub const fn deposit_trade(tx: &'a str) -> Self {
+        let mut this = WsMessage::new("deposit_trade");
+        this.deposit = Some(tx);
+        this
+    }
+
     pub const fn new(channel: &'a str) -> Self {
         Self {
             channel,
+            deposit: None,
             order: None,
             nonce: None,
             message: None,
@@ -236,6 +251,10 @@ impl<'a> WsMessage<'a> {
             message["error"] = json!(error);
         }
 
+        if let Some(deposit) = self.deposit {
+            message["deposit"] = json!(deposit);
+        }
+
         message.to_string()
     }
 }
@@ -268,6 +287,18 @@ where
 {
     let market_type: &str = serde::Deserialize::deserialize(deserializer)?;
     MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
+}
+
+/// Deserialize solana transaction
+pub fn deser_transaction<'de, D>(deserializer: D) -> Result<Transaction, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let payload: &str = serde::Deserialize::deserialize(deserializer)?;
+    let buf = base64::prelude::BASE64_STANDARD
+        .decode(payload)
+        .map_err(serde::de::Error::custom)?;
+    bincode::deserialize(&buf).map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]

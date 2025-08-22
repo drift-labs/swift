@@ -297,6 +297,11 @@ impl WsConnection {
                     market_type.as_str(),
                     market_index.unwrap()
                 );
+                let deposit_topic = format!(
+                    "swift_deposit_orders_{}_{}",
+                    market_type.as_str(),
+                    market_index.unwrap()
+                );
 
                 match action {
                     SubscribeActions::Subscribe => {
@@ -308,6 +313,11 @@ impl WsConnection {
                                 self.pubkey,
                             );
                             self.subscribed_topics.insert(topic.clone(), tx.subscribe());
+
+                            if let Some(tx) = shared_state.subscriptions.get(&deposit_topic) {
+                                self.subscribed_topics
+                                    .insert(deposit_topic.clone(), tx.subscribe());
+                            }
                             Ok(())
                         } else {
                             log::info!(
@@ -331,6 +341,7 @@ impl WsConnection {
                             self.pubkey,
                         );
                         self.subscribed_topics.remove(&topic);
+                        self.subscribed_topics.remove(&deposit_topic);
                         Ok(())
                     }
                 }
@@ -813,8 +824,14 @@ pub async fn start_server() {
             market.market_type(),
             market.market_index
         );
-        topic_names.push(topic.clone());
+        let deposit_topic = format!(
+            "swift_orders_deposit_{}_{}",
+            market.market_type(),
+            market.market_index
+        );
+        topic_names.extend_from_slice(&[topic.clone(), deposit_topic.clone()]);
         subscriptions.insert(topic, broadcast::channel(10).0);
+        subscriptions.insert(deposit_topic, broadcast::channel(10).0);
     }
 
     // Registry for metrics
