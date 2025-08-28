@@ -13,12 +13,12 @@ use drift_rs::{
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
+use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct DepositAndPlaceRequest {
     #[serde(deserialize_with = "deser_transaction")]
-    pub deposit_tx: Transaction,
+    pub deposit_tx: VersionedTransaction,
     pub swift_order: IncomingSignedMessage,
 }
 
@@ -289,7 +289,7 @@ where
 }
 
 /// Deserialize solana transaction
-pub fn deser_transaction<'de, D>(deserializer: D) -> Result<Transaction, D::Error>
+pub fn deser_transaction<'de, D>(deserializer: D) -> Result<VersionedTransaction, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
