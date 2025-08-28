@@ -374,11 +374,11 @@ pub async fn deposit_trade(
     State(server_params): State<&'static ServerParams>,
     Json(req): Json<DepositAndPlaceRequest>,
 ) -> impl axum::response::IntoResponse {
-    let min_trade_value = 100 * PRICE_PRECISION as u64;
+    let min_deposit_value = 100 * PRICE_PRECISION as u64;
 
     if req.deposit_tx.signatures.is_empty()
-        || req.deposit_tx.message.instructions.len() != 1
-        || req.deposit_tx.verify().is_err()
+        || req.deposit_tx.message.instructions().len() != 1
+        || req.deposit_tx.verify_with_results().iter().all(|x| *x)
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -390,7 +390,7 @@ pub async fn deposit_trade(
     }
 
     // verify deposit ix exists and amount
-    let ix = &req.deposit_tx.message.instructions[0];
+    let ix = &req.deposit_tx.message.instructions()[0];
     if &ix.data[..8] == drift_idl::instructions::Deposit::DISCRIMINATOR {
         if let Ok(deposit_ix) = drift_idl::instructions::Deposit::deserialize(&mut &ix.data[8..]) {
             let spot_oracle = server_params
@@ -398,12 +398,12 @@ pub async fn deposit_trade(
                 .try_get_oracle_price_data_and_slot(MarketId::spot(deposit_ix.market_index))
                 .expect("got price");
             let deposit_value = spot_oracle.data.price as u64 * deposit_ix.amount;
-            if deposit_value < min_trade_value {
+            if deposit_value < min_deposit_value {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
                         message: "",
-                        error: Some(format!("deposit size must be > ${min_trade_value}")),
+                        error: Some(format!("deposit size must be > ${min_deposit_value}")),
                     }),
                 );
             }
@@ -424,6 +424,28 @@ pub async fn deposit_trade(
                 error: Some("invalid deposit ix".into()),
             }),
         );
+    }
+
+    match server_params
+        .drift
+        .simulate_tx(req.deposit_tx.message.clone())
+        .await
+    {
+        Ok(res) => {
+            if let Some(err) = res.err {
+                log::info!(target: "server", "deposit sim failed: {err:?}");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ProcessOrderResponse {
+                        message: "",
+                        error: Some("invalid deposit tx".into()),
+                    }),
+                );
+            }
+        }
+        Err(err) => {
+            log::info!(target: "server", "deposit sim network err: {err:?}");
+        }
     }
 
     let context = RequestContext::from_incoming_message(&req.swift_order);
