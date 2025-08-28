@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env,
     net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, LazyLock},
     time::{Duration, SystemTime},
 };
 
@@ -370,6 +370,20 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
     }
 }
 
+static DEPOSIT_IX_WHITELIST: LazyLock<HashSet<[u8; 8]>> = LazyLock::new(|| {
+    HashSet::<[u8; 8]>::from_iter([
+        drift_idl::instructions::Deposit::DISCRIMINATOR
+            .try_into()
+            .unwrap(),
+        drift_idl::instructions::EnableUserHighLeverageMode::DISCRIMINATOR
+            .try_into()
+            .unwrap(),
+        drift_idl::instructions::InitializeSignedMsgUserOrders::DISCRIMINATOR
+            .try_into()
+            .unwrap(),
+    ])
+});
+
 pub async fn deposit_trade(
     State(server_params): State<&'static ServerParams>,
     Json(req): Json<DepositAndPlaceRequest>,
@@ -390,38 +404,56 @@ pub async fn deposit_trade(
     }
 
     // verify deposit ix exists and amount
-    let ix = &req.deposit_tx.message.instructions()[0];
-    if &ix.data[..8] == drift_idl::instructions::Deposit::DISCRIMINATOR {
-        if let Ok(deposit_ix) = drift_idl::instructions::Deposit::deserialize(&mut &ix.data[8..]) {
-            let spot_oracle = server_params
-                .drift
-                .try_get_oracle_price_data_and_slot(MarketId::spot(deposit_ix.market_index))
-                .expect("got price");
-            let deposit_value = spot_oracle.data.price as u64 * deposit_ix.amount;
-            if deposit_value < min_deposit_value {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ProcessOrderResponse {
-                        message: "",
-                        error: Some(format!("deposit size must be > ${min_deposit_value}")),
-                    }),
-                );
-            }
-        } else {
+    let mut has_deposit = false;
+    for ix in req.deposit_tx.message.instructions() {
+        let ix_disc = &ix.data[..8];
+        if !DEPOSIT_IX_WHITELIST.contains(ix_disc) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
                     message: "",
-                    error: Some("invalid deposit ix encoding".into()),
+                    error: Some("unsupported deposit ix".into()),
                 }),
             );
         }
-    } else {
+
+        if ix_disc == drift_idl::instructions::Deposit::DISCRIMINATOR {
+            has_deposit = true;
+            if let Ok(deposit_ix) =
+                drift_idl::instructions::Deposit::deserialize(&mut &ix.data[8..])
+            {
+                let spot_oracle = server_params
+                    .drift
+                    .try_get_oracle_price_data_and_slot(MarketId::spot(deposit_ix.market_index))
+                    .expect("got price");
+                let deposit_value = spot_oracle.data.price as u64 * deposit_ix.amount;
+                if deposit_value < min_deposit_value {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ProcessOrderResponse {
+                            message: "",
+                            error: Some(format!("deposit value must be > ${min_deposit_value}")),
+                        }),
+                    );
+                }
+            } else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ProcessOrderResponse {
+                        message: "",
+                        error: Some("invalid deposit ix encoding".into()),
+                    }),
+                );
+            }
+        }
+    }
+
+    if !has_deposit {
         return (
             StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
                 message: "",
-                error: Some("invalid deposit ix".into()),
+                error: Some("missing deposit ix".into()),
             }),
         );
     }
