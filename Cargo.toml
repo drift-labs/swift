@@ -49,6 +49,7 @@ uuid = { version = "1.10.0", features = ["v4", "fast-rng", "macro-diagnostics", 
 tower-http = { version = "0.6.2", features= ["cors"] }
 strum_macros = "0.27.0"
 zstd = "0.13.3"
+solana-account-decoder-client-types = "2.3.0"
 
 [features]
 default = ["rdkafka/cmake-build"]
