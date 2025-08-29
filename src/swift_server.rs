@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env,
     net::SocketAddr,
-    sync::{atomic::AtomicBool, Arc, LazyLock},
+    sync::{atomic::AtomicBool, Arc},
     time::{Duration, SystemTime},
 };
 
@@ -27,7 +27,7 @@ use crate::{
         metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
     },
 };
-use anchor_lang::{AnchorDeserialize, Discriminator};
+use anchor_lang::AnchorDeserialize;
 use axum::{
     extract::State,
     http::{self, Method, StatusCode},
@@ -38,15 +38,14 @@ use base64::Engine;
 use dotenv::dotenv;
 use drift_rs::{
     constants::high_leverage_mode_account,
-    drift_idl,
     event_subscriber::PubsubClient,
-    math::{account_list_builder::AccountsListBuilder, constants::PRICE_PRECISION},
+    math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
     types::{
         accounts::{HighLeverageModeConfig, User},
         errors::ErrorCode,
         CommitmentConfig, MarketId, MarketType, OrderParams, OrderType, PositionDirection,
-        ProgramError, SdkError, SignedMsgTriggerOrderParams, VersionedMessage,
+        ProgramError, SdkError, SdkResult, SignedMsgTriggerOrderParams, VersionedMessage,
         VersionedTransaction,
     },
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -58,7 +57,12 @@ use rdkafka::{
     util::Timeout,
 };
 use redis::{aio::MultiplexedConnection, AsyncCommands};
-use solana_rpc_client_api::{client_error, config::RpcSimulateTransactionConfig};
+use solana_account_decoder_client_types::UiAccountEncoding;
+use solana_rpc_client_api::{
+    client_error,
+    config::{RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig},
+    response::RpcSimulateTransactionResult,
+};
 use solana_sdk::{
     clock::Slot,
     hash::Hash,
@@ -123,7 +127,8 @@ pub async fn process_order_wrapper(
     let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
     let context = RequestContext::from_incoming_message(&incoming_message);
 
-    let (status, resp) = match process_order(server_params, incoming_message, &context).await {
+    let (status, resp) = match process_order(server_params, incoming_message, false, &context).await
+    {
         Ok(order_metadata) => {
             let metrics_labels = &[
                 context.market_type,
@@ -160,6 +165,7 @@ pub async fn process_order_wrapper(
 pub async fn process_order(
     server_params: &'static ServerParams,
     incoming_message: IncomingSignedMessage,
+    skip_sim: bool,
     context: &RequestContext,
 ) -> Result<OrderMetadataAndMessage, (http::StatusCode, ProcessOrderResponse)> {
     let IncomingSignedMessage {
@@ -258,44 +264,46 @@ pub async fn process_order(
         ));
     }
 
-    match server_params
-        .simulate_taker_order_rpc(&taker_pubkey, &order_params, delegate_signer, current_slot)
-        .await
-    {
-        Ok(sim_res) => {
-            server_params
-                .metrics
-                .rpc_simulation_status
-                .with_label_values(&[sim_res.as_str()])
-                .inc();
-        }
-        Err((status, sim_err_str, logs)) => {
-            server_params
-                .metrics
-                .rpc_simulation_status
-                .with_label_values(&["invalid"])
-                .inc();
-            log::warn!(
-                target: "server",
-                "{}: Order sim failed (taker: {taker_pubkey:?}, delegate: {delegate_signer:?}, market: {}-{}): {sim_err_str}. Logs: {logs:?}",
-                context.log_prefix,
-                order_params.market_type.as_str(),
-                order_params.market_index,
-            );
-            log::warn!(
-                target: "server",
-                "{}: failed order params: {order_params:?}",
-                context.log_prefix,
-            );
-            return Err((
-                status,
-                ProcessOrderResponse {
-                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-                    error: Some(sim_err_str),
-                },
-            ));
-        }
-    };
+    if !skip_sim {
+        match server_params
+            .simulate_taker_order_rpc(&taker_pubkey, &order_params, delegate_signer, current_slot)
+            .await
+        {
+            Ok(sim_res) => {
+                server_params
+                    .metrics
+                    .rpc_simulation_status
+                    .with_label_values(&[sim_res.as_str()])
+                    .inc();
+            }
+            Err((status, sim_err_str, logs)) => {
+                server_params
+                    .metrics
+                    .rpc_simulation_status
+                    .with_label_values(&["invalid"])
+                    .inc();
+                log::warn!(
+                    target: "server",
+                    "{}: Order sim failed (taker: {taker_pubkey:?}, delegate: {delegate_signer:?}, market: {}-{}): {sim_err_str}. Logs: {logs:?}",
+                    context.log_prefix,
+                    order_params.market_type.as_str(),
+                    order_params.market_index,
+                );
+                log::warn!(
+                    target: "server",
+                    "{}: failed order params: {order_params:?}",
+                    context.log_prefix,
+                );
+                return Err((
+                    status,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                        error: Some(sim_err_str),
+                    },
+                ));
+            }
+        };
+    }
 
     // If fat fingered order that requires sanitization, then just send the order
     let will_sanitize = server_params.simulate_will_auction_params_sanitize(&order_params);
@@ -370,30 +378,27 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
     }
 }
 
-static DEPOSIT_IX_WHITELIST: LazyLock<HashSet<[u8; 8]>> = LazyLock::new(|| {
-    HashSet::<[u8; 8]>::from_iter([
-        drift_idl::instructions::Deposit::DISCRIMINATOR
-            .try_into()
-            .unwrap(),
-        drift_idl::instructions::EnableUserHighLeverageMode::DISCRIMINATOR
-            .try_into()
-            .unwrap(),
-        drift_idl::instructions::InitializeSignedMsgUserOrders::DISCRIMINATOR
-            .try_into()
-            .unwrap(),
-    ])
-});
-
 pub async fn deposit_trade(
     State(server_params): State<&'static ServerParams>,
     Json(req): Json<DepositAndPlaceRequest>,
 ) -> impl axum::response::IntoResponse {
-    let min_deposit_value = 100 * PRICE_PRECISION as u64;
+    let signed_order_info = req
+        .swift_order
+        .message
+        .info(&req.swift_order.taker_authority);
+
+    let uuid = core::str::from_utf8(&signed_order_info.uuid).unwrap_or("<bad uuid>");
+    log::info!(
+        target: "server",
+        "[{uuid}] depositToTrade request | authority={:?},subaccount={:?}",
+        req.swift_order.taker_authority,
+        req.swift_order.taker_pubkey
+    );
 
     if req.deposit_tx.signatures.is_empty()
-        || req.deposit_tx.message.instructions().len() != 1
-        || req.deposit_tx.verify_with_results().iter().all(|x| *x)
+        || req.deposit_tx.verify_with_results().iter().any(|x| !*x)
     {
+        log::info!(target: "server", "[{uuid}] invalid deposit tx");
         return (
             StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -403,69 +408,18 @@ pub async fn deposit_trade(
         );
     }
 
-    // verify deposit ix exists and amount
-    let mut has_deposit = false;
-    for ix in req.deposit_tx.message.instructions() {
-        let ix_disc = &ix.data[..8];
-        if !DEPOSIT_IX_WHITELIST.contains(ix_disc) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ProcessOrderResponse {
-                    message: "",
-                    error: Some("unsupported deposit ix".into()),
-                }),
-            );
-        }
-
-        if ix_disc == drift_idl::instructions::Deposit::DISCRIMINATOR {
-            has_deposit = true;
-            if let Ok(deposit_ix) =
-                drift_idl::instructions::Deposit::deserialize(&mut &ix.data[8..])
-            {
-                let spot_oracle = server_params
-                    .drift
-                    .try_get_oracle_price_data_and_slot(MarketId::spot(deposit_ix.market_index))
-                    .expect("got price");
-                let deposit_value = spot_oracle.data.price as u64 * deposit_ix.amount;
-                if deposit_value < min_deposit_value {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ProcessOrderResponse {
-                            message: "",
-                            error: Some(format!("deposit value must be > ${min_deposit_value}")),
-                        }),
-                    );
-                }
-            } else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ProcessOrderResponse {
-                        message: "",
-                        error: Some("invalid deposit ix encoding".into()),
-                    }),
-                );
-            }
-        }
-    }
-
-    if !has_deposit {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
-                message: "",
-                error: Some("missing deposit ix".into()),
-            }),
-        );
-    }
-
-    match server_params
-        .drift
-        .simulate_tx(req.deposit_tx.message.clone())
-        .await
+    // ensure deposit tx is valid
+    let mut user_after_deposit = None;
+    match simulate_tx(
+        &server_params.drift,
+        req.deposit_tx.message.clone(),
+        &[req.swift_order.taker_pubkey],
+    )
+    .await
     {
         Ok(res) => {
             if let Some(err) = res.err {
-                log::info!(target: "server", "deposit sim failed: {err:?}");
+                log::info!(target: "server", "[{uuid}] deposit sim failed: {err:?}, logs: {:?}", res.logs);
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
@@ -474,14 +428,32 @@ pub async fn deposit_trade(
                     }),
                 );
             }
+            if let Some(acc) = res.accounts {
+                user_after_deposit =
+                    User::try_from_slice(&acc[0].as_ref().unwrap().data.decode().unwrap()).ok();
+            }
         }
         Err(err) => {
-            log::info!(target: "server", "deposit sim network err: {err:?}");
+            log::info!(target: "server", "[{uuid}] deposit sim network err: {uuid}: {err:?}");
+        }
+    }
+
+    if let Some(user) = user_after_deposit {
+        if !server_params.simulate_taker_order_local(&signed_order_info.order_params, &user) {
+            log::info!(target: "server", "[{uuid}] local order sim failed");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ProcessOrderResponse {
+                    message: "",
+                    error: Some("invalid order".into()),
+                }),
+            );
         }
     }
 
     let context = RequestContext::from_incoming_message(&req.swift_order);
-    let (status, resp) = match process_order(server_params, req.swift_order, &context).await {
+    // TODO: deposit tx should enable sim to pass, if it didn't before otherwise order is invalid
+    let (status, resp) = match process_order(server_params, req.swift_order, true, &context).await {
         Ok(order_metadata) => {
             let metrics_labels = &[
                 context.market_type,
@@ -1420,6 +1392,34 @@ fn dump_account_state(
 
     let compressed = zstd::encode_all(debug_log.as_bytes(), 0).expect("encoded");
     log::debug!(target: "accountState", "{}", base64::engine::general_purpose::STANDARD.encode(compressed));
+}
+
+/// Simulate the tx on remote RPC node
+pub async fn simulate_tx(
+    drift: &DriftClient,
+    tx: VersionedMessage,
+    accounts: &[Pubkey],
+) -> SdkResult<RpcSimulateTransactionResult> {
+    let response = drift
+        .rpc()
+        .simulate_transaction_with_config(
+            &VersionedTransaction {
+                message: tx,
+                // must provide a signature for the RPC call to work
+                signatures: vec![Signature::new_unique()],
+            },
+            RpcSimulateTransactionConfig {
+                sig_verify: false,
+                replace_recent_blockhash: true,
+                accounts: Some(RpcSimulateTransactionAccountsConfig {
+                    encoding: Some(UiAccountEncoding::Base64Zstd),
+                    addresses: accounts.iter().map(|x| x.to_string()).collect(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    response.map(|r| r.value).map_err(Into::into)
 }
 
 #[cfg(test)]
