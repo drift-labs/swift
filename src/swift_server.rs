@@ -390,13 +390,13 @@ pub async fn deposit_trade(
     let uuid = core::str::from_utf8(&signed_order_info.uuid).unwrap_or("<bad uuid>");
     log::info!(
         target: "server",
-        "[{uuid}] depositToTrade request | authority:{:?},subaccount:{:?}",
+        "[{uuid}] depositToTrade request | authority={:?},subaccount={:?}",
         req.swift_order.taker_authority,
         req.swift_order.taker_pubkey
     );
 
     if req.deposit_tx.signatures.is_empty()
-        || req.deposit_tx.verify_with_results().iter().all(|x| *x)
+        || req.deposit_tx.verify_with_results().iter().any(|x| !*x)
     {
         log::info!(target: "server", "[{uuid}] invalid deposit tx");
         return (
@@ -419,7 +419,7 @@ pub async fn deposit_trade(
     {
         Ok(res) => {
             if let Some(err) = res.err {
-                log::info!(target: "server", "[{uuid}] deposit sim failed: {err:?}");
+                log::info!(target: "server", "[{uuid}] deposit sim failed: {err:?}, logs: {:?}", res.logs);
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
