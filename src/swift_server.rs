@@ -27,7 +27,7 @@ use crate::{
         metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
     },
 };
-use anchor_lang::AnchorDeserialize;
+use anchor_lang::{AnchorDeserialize, Discriminator};
 use axum::{
     extract::State,
     http::{self, Method, StatusCode},
@@ -38,6 +38,7 @@ use base64::Engine;
 use dotenv::dotenv;
 use drift_rs::{
     constants::high_leverage_mode_account,
+    drift_idl,
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
@@ -404,6 +405,25 @@ pub async fn deposit_trade(
             Json(ProcessOrderResponse {
                 message: "",
                 error: Some("invalid deposit tx".into()),
+            }),
+        );
+    }
+
+    // verify deposit ix exists and amount
+    let mut has_place_ix = false;
+    for ix in req.deposit_tx.message.instructions() {
+        if &ix.data[..8] == drift_idl::instructions::PlaceSignedMsgTakerOrder::DISCRIMINATOR {
+            has_place_ix = true;
+        }
+    }
+
+    if !has_place_ix {
+        log::info!(target: "server", "[{uuid}] missing place order ix");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ProcessOrderResponse {
+                message: "",
+                error: Some("missing placeSignedMsgTakerOrder ix".into()),
             }),
         );
     }
