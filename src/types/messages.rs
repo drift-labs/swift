@@ -8,12 +8,62 @@ use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
 use drift_rs::{
-    swift_order_subscriber::{deser_signed_msg_type, SignedOrderType},
-    types::MarketType,
+    swift_order_subscriber::{SignedOrderType, SWIFT_DELEGATE_MSG_PREFIX},
+    types::{MarketType, SignedMsgOrderParamsDelegateMessage},
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignedOrderTypeWithLen {
+    /// length of the signed order when borsh encoded
+    pub signed_len: usize,
+    /// signed order message
+    pub order: SignedOrderType,
+}
+
+/// Deserialize hex-ified, borsh bytes as a `SignedOrderType`
+pub fn deser_signed_msg_type_with_len<'de, D>(
+    deserializer: D,
+) -> Result<SignedOrderTypeWithLen, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let payload: &str = serde::Deserialize::deserialize(deserializer)?;
+    if payload.len() % 2 != 0 {
+        return Err(serde::de::Error::custom("Hex string length must be even"));
+    }
+
+    // decode expecting the largest possible variant
+    let borsh_len = payload.len() / 2;
+    if (borsh_len > SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8) || payload.is_empty() {
+        return Err(serde::de::Error::custom("invalid signed message hex"));
+    }
+
+    // messages from older clients that are too short will naturally pad to the largest message size
+    let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
+    faster_hex::hex_decode(payload.as_bytes(), &mut borsh_buf[..borsh_len])
+        .map_err(serde::de::Error::custom)?;
+
+    // this is basically the same as if we derived AnchorDeserialize on `SignedOrderType` _expect_ it does not
+    // add a u8 to distinguish the enum
+    if borsh_buf[..8] == SWIFT_DELEGATE_MSG_PREFIX {
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
+            .map(|o| SignedOrderTypeWithLen {
+                signed_len: borsh_len,
+                order: SignedOrderType::Delegated(o),
+            })
+            .map_err(serde::de::Error::custom)
+    } else {
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
+            .map(|o| SignedOrderTypeWithLen {
+                signed_len: borsh_len,
+                order: SignedOrderType::Authority(o),
+            })
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct DepositAndPlaceRequest {
@@ -28,8 +78,8 @@ pub struct IncomingSignedMessage {
     pub taker_pubkey: Pubkey,
     #[serde(deserialize_with = "deser_signature")]
     pub signature: Signature,
-    #[serde(deserialize_with = "deser_signed_msg_type")]
-    pub message: SignedOrderType,
+    #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
+    pub message: SignedOrderTypeWithLen,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub signing_authority: Pubkey,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
@@ -37,6 +87,10 @@ pub struct IncomingSignedMessage {
 }
 
 impl IncomingSignedMessage {
+    /// Return the swift signed order
+    pub fn order(&self) -> SignedOrderType {
+        self.message.order
+    }
     /// Verify taker signature against hex encoded `message`
     pub fn verify_signature(&self) -> Result<()> {
         let pubkey = if self.signing_authority != Pubkey::default() {
@@ -48,7 +102,9 @@ impl IncomingSignedMessage {
         }?;
 
         // client hex encodes msg before signing so use that as comparison
-        let msg_data = &self.message.to_borsh();
+        // since we allow older clients with  potentially shorter messages than the current IDL
+        // need to truncate the message to the size the client signed (exclude default padded bytes)
+        let msg_data = &self.order().to_borsh()[..self.message.signed_len];
         let mut hex_bytes = vec![0; msg_data.len() * 2]; // 2 hex bytes per msg byte
         let _ = faster_hex::hex_encode(msg_data, &mut hex_bytes).expect("hexified");
 
@@ -58,7 +114,7 @@ impl IncomingSignedMessage {
     }
     pub fn verify_and_get_signed_message(&self) -> Result<&SignedOrderType> {
         self.verify_signature()?;
-        Ok(&self.message)
+        Ok(&self.message.order)
     }
 }
 
@@ -327,7 +383,7 @@ mod tests {
             actual.signing_authority
                 == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
         );
-        if let SignedOrderType::Delegated(signed_msg) = actual.message {
+        if let SignedOrderType::Delegated(signed_msg) = actual.order() {
             let expected = SignedMsgOrderParamsDelegateMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -353,6 +409,7 @@ mod tests {
                 uuid: [115, 56, 108, 117, 74, 76, 90, 101],
                 take_profit_order_params: None,
                 stop_loss_order_params: None,
+                max_margin_ratio: None,
             };
             assert_eq!(signed_msg, expected);
         } else {
@@ -405,6 +462,8 @@ mod tests {
 
     #[test]
     fn deserialize_incoming_signed_message_with_signing_authority() {
+        // NB: this message verifies backwards compatibility with older clients
+        // it was not built/signed with the max_margin_ratio field or newer additions so verifies the padding mechanisms
         let message = r#"{
             "market_index": 2,
             "market_type": "perp",
@@ -422,7 +481,7 @@ mod tests {
                 == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
         );
 
-        if let SignedOrderType::Authority(signed_msg) = actual.message {
+        if let SignedOrderType::Authority(signed_msg) = actual.order() {
             let expected = SignedMsgOrderParamsMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -448,6 +507,7 @@ mod tests {
                 uuid: [115, 56, 108, 117, 74, 76, 90, 101],
                 take_profit_order_params: None,
                 stop_loss_order_params: None,
+                max_margin_ratio: None,
             };
             assert_eq!(signed_msg, expected);
         } else {
