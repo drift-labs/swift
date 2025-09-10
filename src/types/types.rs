@@ -48,7 +48,7 @@ pub struct RequestContext {
 impl RequestContext {
     pub fn from_incoming_message(msg: &IncomingSignedMessage) -> Self {
         let recv_ts = unix_now_ms();
-        let info = msg.message.info(&msg.taker_authority);
+        let info = msg.order().info(&msg.taker_authority);
 
         Self {
             market_index: info.order_params.market_index,

@@ -124,7 +124,7 @@ pub async fn process_order_wrapper(
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
-    let uuid_raw = extract_uuid(&incoming_message.message);
+    let uuid_raw = extract_uuid(&incoming_message.order());
     let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
     let context = RequestContext::from_incoming_message(&incoming_message);
 
@@ -385,7 +385,7 @@ pub async fn deposit_trade(
 ) -> impl axum::response::IntoResponse {
     let signed_order_info = req
         .swift_order
-        .message
+        .order()
         .info(&req.swift_order.taker_authority);
 
     let uuid = core::str::from_utf8(&signed_order_info.uuid).unwrap_or("<bad uuid>");
@@ -1638,6 +1638,7 @@ mod tests {
             slot: current_slot,
             stop_loss_order_params: None,
             take_profit_order_params: None,
+            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1666,6 +1667,7 @@ mod tests {
                 ..Default::default()
             }),
             take_profit_order_params: None,
+            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1698,6 +1700,7 @@ mod tests {
             slot: current_slot,
             stop_loss_order_params: None,
             take_profit_order_params: None,
+            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1728,6 +1731,7 @@ mod tests {
                 base_asset_amount: 0,
                 ..Default::default()
             }),
+            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1759,6 +1763,7 @@ mod tests {
             slot: current_slot - 501, // Slot too old
             stop_loss_order_params: None,
             take_profit_order_params: None,
+            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
