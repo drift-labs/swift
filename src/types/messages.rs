@@ -361,6 +361,7 @@ mod tests {
     use drift_rs::types::{
         OrderParams, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
         SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+        SignedMsgTriggerOrderParams,
     };
     use nanoid::nanoid;
 
@@ -597,5 +598,113 @@ mod tests {
         );
 
         assert_eq!(order_metadata_json["will_sanitize"], false,);
+    }
+
+    #[test]
+    fn deser_signed_msg_type_with_len_from_raw_bytes_v0() {
+        // v0 message, before we started adding fields to the message
+        let payload: Vec<u8> = vec![
+            200, 213, 166, 94, 34, 52, 245, 93, 0, 1, 0, 3, 0, 96, 254, 205, 0, 0, 0, 0, 64, 85,
+            32, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 128, 133, 181, 13, 0, 0, 0, 0,
+            1, 64, 85, 32, 14, 0, 0, 0, 0, 2, 0, 41, 9, 0, 0, 0, 0, 0, 0, 67, 82, 79, 51, 105, 114,
+            71, 49, 1, 0, 28, 78, 14, 0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0, 1, 64, 58, 105, 13,
+            0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0,
+        ];
+
+        let hex = faster_hex::hex_string(&payload);
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
+            message: SignedOrderTypeWithLen,
+        }
+
+        let json = format!(r#"{{"message":"{}"}}"#, hex);
+        let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
+
+        assert_eq!(wrapper.message.signed_len, payload.len());
+
+        match wrapper.message.order {
+            SignedOrderType::Authority(m) => {
+                assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
+                assert_eq!(
+                    m.signed_msg_order_params.auction_start_price,
+                    Some(230000000)
+                );
+                assert_eq!(m.signed_msg_order_params.auction_end_price, Some(237000000));
+                assert_eq!(m.sub_account_id, 2);
+                assert_eq!(m.slot, 2345);
+                assert_eq!(
+                    m.take_profit_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 240000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(
+                    m.stop_loss_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 225000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(m.max_margin_ratio, None);
+            }
+            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+        }
+    }
+
+    #[test]
+    fn deser_signed_msg_type_with_len_from_raw_bytes_v1() {
+        // v1 message, added max_margin_ratio field
+        let payload: Vec<u8> = vec![
+            200, 213, 166, 94, 34, 52, 245, 93, 0, 1, 0, 3, 0, 96, 254, 205, 0, 0, 0, 0, 64, 85,
+            32, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 128, 133, 181, 13, 0, 0, 0, 0,
+            1, 64, 85, 32, 14, 0, 0, 0, 0, 2, 0, 41, 9, 0, 0, 0, 0, 0, 0, 67, 82, 79, 51, 105, 114,
+            71, 49, 1, 0, 28, 78, 14, 0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0, 1, 64, 58, 105, 13,
+            0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0, 1, 255, 255,
+        ];
+
+        let hex = faster_hex::hex_string(&payload);
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
+            message: SignedOrderTypeWithLen,
+        }
+
+        let json = format!(r#"{{"message":"{}"}}"#, hex);
+        let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
+
+        assert_eq!(wrapper.message.signed_len, payload.len());
+
+        match wrapper.message.order {
+            SignedOrderType::Authority(m) => {
+                assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
+                assert_eq!(
+                    m.signed_msg_order_params.auction_start_price,
+                    Some(230000000)
+                );
+                assert_eq!(m.signed_msg_order_params.auction_end_price, Some(237000000));
+                assert_eq!(m.sub_account_id, 2);
+                assert_eq!(m.slot, 2345);
+                assert_eq!(
+                    m.take_profit_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 240000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(
+                    m.stop_loss_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 225000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(m.max_margin_ratio, Some(65535));
+            }
+            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+        }
     }
 }
