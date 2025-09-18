@@ -241,6 +241,7 @@ pub async fn process_order(
         order_params,
         taker_pubkey,
         uuid,
+        max_margin_ratio,
     } = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
 
     // check the order is valid for execution by program
@@ -267,7 +268,13 @@ pub async fn process_order(
 
     if !skip_sim {
         match server_params
-            .simulate_taker_order_rpc(&taker_pubkey, &order_params, delegate_signer, current_slot)
+            .simulate_taker_order_rpc(
+                &taker_pubkey,
+                &order_params,
+                delegate_signer,
+                current_slot,
+                max_margin_ratio,
+            )
             .await
         {
             Ok(sim_res) => {
@@ -458,8 +465,12 @@ pub async fn deposit_trade(
         }
     }
 
-    if let Some(user) = user_after_deposit {
-        if !server_params.simulate_taker_order_local(&signed_order_info.order_params, &user) {
+    if let Some(mut user) = user_after_deposit {
+        if !server_params.simulate_taker_order_local(
+            &signed_order_info.order_params,
+            &mut user,
+            None,
+        ) {
             log::info!(target: "server", "[{uuid}] local order sim failed");
             return (
                 StatusCode::BAD_REQUEST,
@@ -879,7 +890,8 @@ impl ServerParams {
     fn simulate_taker_order_local(
         &self,
         order_params: &OrderParams,
-        user: &drift_rs::types::accounts::User,
+        user: &mut drift_rs::types::accounts::User,
+        max_margin_ratio: Option<u16>,
     ) -> bool {
         let state = match self.drift.state_account() {
             Ok(s) => s,
@@ -917,6 +929,7 @@ impl ServerParams {
             &state,
             order_params,
             Some(&mut hlm),
+            max_margin_ratio,
         ) {
             Ok(_) => true,
             Err(err) => {
@@ -932,6 +945,7 @@ impl ServerParams {
         taker_order_params: &OrderParams,
         delegate_signer: Option<&Pubkey>,
         slot: Slot,
+        max_margin_ratio: Option<u16>,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
 
@@ -951,7 +965,7 @@ impl ServerParams {
         }
 
         let user_result = user_with_timeout.unwrap();
-        let user = user_result.map_err(|err| {
+        let mut user = user_result.map_err(|err| {
             (
                 axum::http::StatusCode::NOT_FOUND,
                 format!("unable to fetch user: {err:?}"),
@@ -983,7 +997,7 @@ impl ServerParams {
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
-        if self.simulate_taker_order_local(taker_order_params, &user) {
+        if self.simulate_taker_order_local(taker_order_params, &mut user, max_margin_ratio) {
             sim_result = SimulationStatus::Success;
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
             return Ok(sim_result);
@@ -1323,6 +1337,7 @@ fn extract_signed_message_info(
                 order_params: x.signed_msg_order_params,
                 uuid: x.uuid,
                 slot: x.slot,
+                max_margin_ratio: x.max_margin_ratio,
             })
         }
         SignedOrderType::Authority(x) => {
@@ -1337,6 +1352,7 @@ fn extract_signed_message_info(
                 order_params: x.signed_msg_order_params,
                 uuid: x.uuid,
                 slot: x.slot,
+                max_margin_ratio: x.max_margin_ratio,
             })
         }
     }
@@ -1789,9 +1805,9 @@ mod tests {
         .await
         .unwrap();
 
-        let taker_pubkey = Keypair::new().pubkey();
-        let taker_pubkey2 = Keypair::new().pubkey();
-        let delegate_pubkey = Keypair::new().pubkey();
+        let mut taker_pubkey = Keypair::new().pubkey();
+        let mut taker_pubkey2 = Keypair::new().pubkey();
+        let mut delegate_pubkey = Keypair::new().pubkey();
         let users: HashMap<Pubkey, User> = [
             (
                 taker_pubkey,
@@ -1839,7 +1855,13 @@ mod tests {
 
         // Test
         let result = server_params
-            .simulate_taker_order_rpc(&taker_pubkey, &order_params, Some(&delegate_pubkey), 1_000)
+            .simulate_taker_order_rpc(
+                &mut taker_pubkey,
+                &order_params,
+                Some(&delegate_pubkey),
+                1_000,
+                None,
+            )
             .await;
         assert!(result.is_err_and(|(status, msg, _)| {
             dbg!(&msg);
@@ -1848,7 +1870,13 @@ mod tests {
         }));
 
         let result = server_params
-            .simulate_taker_order_rpc(&taker_pubkey2, &order_params, Some(&delegate_pubkey), 1_000)
+            .simulate_taker_order_rpc(
+                &mut taker_pubkey2,
+                &order_params,
+                Some(&delegate_pubkey),
+                1_000,
+                None,
+            )
             .await;
         // it fails later at remote sim since the account is not a real drift account
         assert!(result.is_err_and(|(status, msg, _)| {
