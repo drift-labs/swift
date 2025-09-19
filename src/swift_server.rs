@@ -236,13 +236,15 @@ pub async fn process_order(
     };
 
     let current_slot = server_params.slot_subscriber.current_slot();
-    let SignedMessageInfo {
-        slot: _taker_slot,
-        order_params,
-        taker_pubkey,
-        uuid,
+    let (
+        SignedMessageInfo {
+            slot: _taker_slot,
+            order_params,
+            taker_pubkey,
+            uuid,
+        },
         max_margin_ratio,
-    } = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
+    ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
 
     // check the order is valid for execution by program
     let market = server_params
@@ -1004,15 +1006,20 @@ impl ServerParams {
         }
 
         // fallback to network sim
-        let message = TransactionBuilder::new(
+        let mut tx = TransactionBuilder::new(
             self.drift.program_data(),
             *taker_subaccount_pubkey,
             std::borrow::Cow::Owned(user),
             false,
         )
-        .with_priority_fee(5_000, Some(1_400_000))
-        .place_orders(vec![*taker_order_params])
-        .build();
+        .with_priority_fee(5_000, Some(1_400_000));
+        if let Some(margin_ratio) = max_margin_ratio {
+            tx = tx.update_user_perp_position_custom_margin_ratio(
+                taker_order_params.market_index,
+                margin_ratio,
+            );
+        }
+        let message = tx.place_orders(vec![*taker_order_params]).build();
 
         let simulate_result_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
@@ -1323,7 +1330,7 @@ fn extract_signed_message_info(
     signed_msg: &SignedOrderType,
     taker_authority: &Pubkey,
     current_slot: Slot,
-) -> Result<SignedMessageInfo, (axum::http::StatusCode, ProcessOrderResponse)> {
+) -> Result<(SignedMessageInfo, Option<u16>), (axum::http::StatusCode, ProcessOrderResponse)> {
     match signed_msg {
         SignedOrderType::Delegated(x) => {
             validate_order(
@@ -1332,13 +1339,15 @@ fn extract_signed_message_info(
                 x.slot,
                 current_slot,
             )?;
-            Ok(SignedMessageInfo {
-                taker_pubkey: x.taker_pubkey,
-                order_params: x.signed_msg_order_params,
-                uuid: x.uuid,
-                slot: x.slot,
-                max_margin_ratio: x.max_margin_ratio,
-            })
+            Ok((
+                SignedMessageInfo {
+                    taker_pubkey: x.taker_pubkey,
+                    order_params: x.signed_msg_order_params,
+                    uuid: x.uuid,
+                    slot: x.slot,
+                },
+                x.max_margin_ratio,
+            ))
         }
         SignedOrderType::Authority(x) => {
             validate_order(
@@ -1347,13 +1356,15 @@ fn extract_signed_message_info(
                 x.slot,
                 current_slot,
             )?;
-            Ok(SignedMessageInfo {
-                taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
-                order_params: x.signed_msg_order_params,
-                uuid: x.uuid,
-                slot: x.slot,
-                max_margin_ratio: x.max_margin_ratio,
-            })
+            Ok((
+                SignedMessageInfo {
+                    taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
+                    order_params: x.signed_msg_order_params,
+                    uuid: x.uuid,
+                    slot: x.slot,
+                },
+                x.max_margin_ratio,
+            ))
         }
     }
 }
@@ -1658,7 +1669,7 @@ mod tests {
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|info| {
+        assert!(result.is_ok_and(|(info, _)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
