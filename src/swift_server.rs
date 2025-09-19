@@ -396,6 +396,16 @@ pub async fn deposit_trade(
         .swift_order
         .order()
         .info(&req.swift_order.taker_authority);
+    let current_slot = server_params.slot_subscriber.current_slot();
+
+    let max_margin_ratio = match extract_signed_message_info(
+        &req.swift_order.order(),
+        &req.swift_order.taker_authority,
+        current_slot,
+    ) {
+        Ok((_info, max_margin_ratio)) => max_margin_ratio,
+        Err((_status, err)) => return (StatusCode::BAD_REQUEST, Json(err)),
+    };
 
     let uuid = core::str::from_utf8(&signed_order_info.uuid).unwrap_or("<bad uuid>");
     log::info!(
@@ -471,7 +481,7 @@ pub async fn deposit_trade(
         if !server_params.simulate_taker_order_local(
             &signed_order_info.order_params,
             &mut user,
-            None,
+            max_margin_ratio,
         ) {
             log::info!(target: "server", "[{uuid}] local order sim failed");
             return (
@@ -1818,7 +1828,7 @@ mod tests {
 
         let mut taker_pubkey = Keypair::new().pubkey();
         let mut taker_pubkey2 = Keypair::new().pubkey();
-        let mut delegate_pubkey = Keypair::new().pubkey();
+        let delegate_pubkey = Keypair::new().pubkey();
         let users: HashMap<Pubkey, User> = [
             (
                 taker_pubkey,
