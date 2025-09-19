@@ -1731,7 +1731,7 @@ mod tests {
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|info| {
+        assert!(result.is_ok_and(|(info, _margin_ratio)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
