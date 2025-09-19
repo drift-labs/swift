@@ -236,12 +236,15 @@ pub async fn process_order(
     };
 
     let current_slot = server_params.slot_subscriber.current_slot();
-    let SignedMessageInfo {
-        slot: _taker_slot,
-        order_params,
-        taker_pubkey,
-        uuid,
-    } = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
+    let (
+        SignedMessageInfo {
+            slot: _taker_slot,
+            order_params,
+            taker_pubkey,
+            uuid,
+        },
+        max_margin_ratio,
+    ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
 
     // check the order is valid for execution by program
     let market = server_params
@@ -267,7 +270,13 @@ pub async fn process_order(
 
     if !skip_sim {
         match server_params
-            .simulate_taker_order_rpc(&taker_pubkey, &order_params, delegate_signer, current_slot)
+            .simulate_taker_order_rpc(
+                &taker_pubkey,
+                &order_params,
+                delegate_signer,
+                current_slot,
+                max_margin_ratio,
+            )
             .await
         {
             Ok(sim_res) => {
@@ -387,6 +396,16 @@ pub async fn deposit_trade(
         .swift_order
         .order()
         .info(&req.swift_order.taker_authority);
+    let current_slot = server_params.slot_subscriber.current_slot();
+
+    let max_margin_ratio = match extract_signed_message_info(
+        &req.swift_order.order(),
+        &req.swift_order.taker_authority,
+        current_slot,
+    ) {
+        Ok((_info, max_margin_ratio)) => max_margin_ratio,
+        Err((_status, err)) => return (StatusCode::BAD_REQUEST, Json(err)),
+    };
 
     let uuid = core::str::from_utf8(&signed_order_info.uuid).unwrap_or("<bad uuid>");
     log::info!(
@@ -458,8 +477,12 @@ pub async fn deposit_trade(
         }
     }
 
-    if let Some(user) = user_after_deposit {
-        if !server_params.simulate_taker_order_local(&signed_order_info.order_params, &user) {
+    if let Some(mut user) = user_after_deposit {
+        if !server_params.simulate_taker_order_local(
+            &signed_order_info.order_params,
+            &mut user,
+            max_margin_ratio,
+        ) {
             log::info!(target: "server", "[{uuid}] local order sim failed");
             return (
                 StatusCode::BAD_REQUEST,
@@ -879,7 +902,8 @@ impl ServerParams {
     fn simulate_taker_order_local(
         &self,
         order_params: &OrderParams,
-        user: &drift_rs::types::accounts::User,
+        user: &mut drift_rs::types::accounts::User,
+        max_margin_ratio: Option<u16>,
     ) -> bool {
         let state = match self.drift.state_account() {
             Ok(s) => s,
@@ -917,6 +941,7 @@ impl ServerParams {
             &state,
             order_params,
             Some(&mut hlm),
+            max_margin_ratio,
         ) {
             Ok(_) => true,
             Err(err) => {
@@ -932,6 +957,7 @@ impl ServerParams {
         taker_order_params: &OrderParams,
         delegate_signer: Option<&Pubkey>,
         slot: Slot,
+        max_margin_ratio: Option<u16>,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
 
@@ -951,7 +977,7 @@ impl ServerParams {
         }
 
         let user_result = user_with_timeout.unwrap();
-        let user = user_result.map_err(|err| {
+        let mut user = user_result.map_err(|err| {
             (
                 axum::http::StatusCode::NOT_FOUND,
                 format!("unable to fetch user: {err:?}"),
@@ -983,22 +1009,27 @@ impl ServerParams {
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
-        if self.simulate_taker_order_local(taker_order_params, &user) {
+        if self.simulate_taker_order_local(taker_order_params, &mut user, max_margin_ratio) {
             sim_result = SimulationStatus::Success;
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
             return Ok(sim_result);
         }
 
         // fallback to network sim
-        let message = TransactionBuilder::new(
+        let mut tx = TransactionBuilder::new(
             self.drift.program_data(),
             *taker_subaccount_pubkey,
             std::borrow::Cow::Owned(user),
             false,
         )
-        .with_priority_fee(5_000, Some(1_400_000))
-        .place_orders(vec![*taker_order_params])
-        .build();
+        .with_priority_fee(5_000, Some(1_400_000));
+        if let Some(margin_ratio) = max_margin_ratio {
+            tx = tx.update_user_perp_position_custom_margin_ratio(
+                taker_order_params.market_index,
+                margin_ratio,
+            );
+        }
+        let message = tx.place_orders(vec![*taker_order_params]).build();
 
         let simulate_result_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
@@ -1309,7 +1340,7 @@ fn extract_signed_message_info(
     signed_msg: &SignedOrderType,
     taker_authority: &Pubkey,
     current_slot: Slot,
-) -> Result<SignedMessageInfo, (axum::http::StatusCode, ProcessOrderResponse)> {
+) -> Result<(SignedMessageInfo, Option<u16>), (axum::http::StatusCode, ProcessOrderResponse)> {
     match signed_msg {
         SignedOrderType::Delegated(x) => {
             validate_order(
@@ -1318,12 +1349,15 @@ fn extract_signed_message_info(
                 x.slot,
                 current_slot,
             )?;
-            Ok(SignedMessageInfo {
-                taker_pubkey: x.taker_pubkey,
-                order_params: x.signed_msg_order_params,
-                uuid: x.uuid,
-                slot: x.slot,
-            })
+            Ok((
+                SignedMessageInfo {
+                    taker_pubkey: x.taker_pubkey,
+                    order_params: x.signed_msg_order_params,
+                    uuid: x.uuid,
+                    slot: x.slot,
+                },
+                x.max_margin_ratio,
+            ))
         }
         SignedOrderType::Authority(x) => {
             validate_order(
@@ -1332,12 +1366,15 @@ fn extract_signed_message_info(
                 x.slot,
                 current_slot,
             )?;
-            Ok(SignedMessageInfo {
-                taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
-                order_params: x.signed_msg_order_params,
-                uuid: x.uuid,
-                slot: x.slot,
-            })
+            Ok((
+                SignedMessageInfo {
+                    taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
+                    order_params: x.signed_msg_order_params,
+                    uuid: x.uuid,
+                    slot: x.slot,
+                },
+                x.max_margin_ratio,
+            ))
         }
     }
 }
@@ -1642,7 +1679,7 @@ mod tests {
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|info| {
+        assert!(result.is_ok_and(|(info, _)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
@@ -1704,7 +1741,7 @@ mod tests {
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|info| {
+        assert!(result.is_ok_and(|(info, _margin_ratio)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
@@ -1789,8 +1826,8 @@ mod tests {
         .await
         .unwrap();
 
-        let taker_pubkey = Keypair::new().pubkey();
-        let taker_pubkey2 = Keypair::new().pubkey();
+        let mut taker_pubkey = Keypair::new().pubkey();
+        let mut taker_pubkey2 = Keypair::new().pubkey();
         let delegate_pubkey = Keypair::new().pubkey();
         let users: HashMap<Pubkey, User> = [
             (
@@ -1839,7 +1876,13 @@ mod tests {
 
         // Test
         let result = server_params
-            .simulate_taker_order_rpc(&taker_pubkey, &order_params, Some(&delegate_pubkey), 1_000)
+            .simulate_taker_order_rpc(
+                &mut taker_pubkey,
+                &order_params,
+                Some(&delegate_pubkey),
+                1_000,
+                None,
+            )
             .await;
         assert!(result.is_err_and(|(status, msg, _)| {
             dbg!(&msg);
@@ -1848,7 +1891,13 @@ mod tests {
         }));
 
         let result = server_params
-            .simulate_taker_order_rpc(&taker_pubkey2, &order_params, Some(&delegate_pubkey), 1_000)
+            .simulate_taker_order_rpc(
+                &mut taker_pubkey2,
+                &order_params,
+                Some(&delegate_pubkey),
+                1_000,
+                None,
+            )
             .await;
         // it fails later at remote sim since the account is not a real drift account
         assert!(result.is_err_and(|(status, msg, _)| {
