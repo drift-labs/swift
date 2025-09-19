@@ -1043,7 +1043,7 @@ impl ServerParams {
                     sig_verify: false,
                     replace_recent_blockhash: true,
                     commitment: Some(CommitmentConfig::confirmed()),
-                    min_context_slot: Some(slot),
+                    min_context_slot: Some(slot - 30), // allow tx sim on up to 30 slots stale context
                     ..Default::default()
                 },
             ),
