@@ -11,15 +11,15 @@ use crate::{
     super_slot_subscriber::SuperSlotSubscriber,
     types::{
         messages::{
-            DepositAndPlaceRequest, IncomingSignedMessage, OrderMetadataAndMessage,
-            ProcessOrderResponse, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            IncomingSignedMessage, OrderMetadataAndMessage, ProcessOrderResponse,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
             PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
         },
-        types::{unix_now_ms, RequestContext},
+        types::unix_now_ms,
     },
     user_account_fetcher::UserAccountFetcher,
     util::{
@@ -27,10 +27,9 @@ use crate::{
         metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
     },
 };
-use anchor_lang::{AnchorDeserialize, Discriminator};
 use axum::{
     extract::State,
-    http::{self, Method, StatusCode},
+    http::{self, Method},
     routing::{get, post},
     Json, Router,
 };
@@ -38,7 +37,6 @@ use base64::Engine;
 use dotenv::dotenv;
 use drift_rs::{
     constants::high_leverage_mode_account,
-    drift_idl,
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
@@ -46,9 +44,10 @@ use drift_rs::{
         accounts::{HighLeverageModeConfig, User},
         errors::ErrorCode,
         CommitmentConfig, MarketId, MarketType, OrderParams, OrderType, PositionDirection,
-        ProgramError, SdkError, SdkResult, SignedMsgTriggerOrderParams, VersionedMessage,
+        ProgramError, SdkError, SignedMsgTriggerOrderParams, VersionedMessage,
         VersionedTransaction,
     },
+    utils::load_keypair_multi_format,
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
 use log::warn;
@@ -58,12 +57,7 @@ use rdkafka::{
     util::Timeout,
 };
 use redis::{aio::MultiplexedConnection, AsyncCommands};
-use solana_account_decoder_client_types::UiAccountEncoding;
-use solana_rpc_client_api::{
-    client_error,
-    config::{RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig},
-    response::RpcSimulateTransactionResult,
-};
+use solana_rpc_client_api::{client_error, config::RpcSimulateTransactionConfig};
 use solana_sdk::{
     clock::Slot,
     hash::Hash,
@@ -124,37 +118,9 @@ pub async fn process_order_wrapper(
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
-    let uuid_raw = extract_uuid(&incoming_message.order());
+    let uuid_raw = extract_uuid(&incoming_message.message);
     let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
-    let context = RequestContext::from_incoming_message(&incoming_message);
-
-    let (status, resp) = match process_order(server_params, incoming_message, false, &context).await
-    {
-        Ok(order_metadata) => {
-            let metrics_labels = &[
-                context.market_type,
-                &context.market_index.to_string(),
-                match order_metadata.will_sanitize {
-                    true => "true",
-                    false => "false",
-                },
-            ];
-            let topic = format!("swift_orders_{}_{}", metrics_labels[0], metrics_labels[1]);
-            let payload = order_metadata.encode();
-
-            server_params
-                .publish_order(
-                    &topic,
-                    &payload,
-                    order_metadata.uuid(),
-                    metrics_labels,
-                    &context,
-                )
-                .await
-        }
-        Err(err) => err,
-    };
-
+    let (status, resp) = process_order(server_params, incoming_message).await;
     log::info!(
         target: "server", "{status}|{uuid}|{:?}|ui={}",
         resp.error.as_deref().unwrap_or(""),
@@ -166,9 +132,8 @@ pub async fn process_order_wrapper(
 pub async fn process_order(
     server_params: &'static ServerParams,
     incoming_message: IncomingSignedMessage,
-    skip_sim: bool,
-    context: &RequestContext,
-) -> Result<OrderMetadataAndMessage, (http::StatusCode, ProcessOrderResponse)> {
+) -> (http::StatusCode, ProcessOrderResponse) {
+    let process_order_time = unix_now_ms();
     let IncomingSignedMessage {
         taker_pubkey,
         signature: taker_signature,
@@ -188,13 +153,13 @@ pub async fn process_order(
             target: "server",
             "Ignoring order from farmer pubkey: {taker_authority}"
         );
-        return Err((
+        return (
             axum::http::StatusCode::BAD_REQUEST,
             ProcessOrderResponse {
                 message: PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY,
                 error: None,
             },
-        ));
+        );
     }
 
     server_params.metrics.taker_orders_counter.inc();
@@ -205,46 +170,37 @@ pub async fn process_order(
         signing_authority
     };
 
+    let log_prefix = format!("[process_order {taker_authority}: {process_order_time}]");
     log::trace!(
         target: "server",
-        "{}: Received order with signing pubkey: {signing_pubkey}",
-        context.log_prefix,
+        "{log_prefix}: Received order with signing pubkey: {signing_pubkey}"
     );
 
     let signed_msg = match incoming_message.verify_and_get_signed_message() {
         Ok(m) => m,
         Err(e) => {
-            log::warn!(
-                "{}: Error verifying signed message: {e:?}, signer: {}, taker_authority: {}",
-                context.log_prefix,
-                incoming_message.signing_authority,
-                incoming_message.taker_authority
-            );
-            return Err((
+            log::warn!("{log_prefix}: Error verifying signed message: {e:?}, signer: {}, taker_authority: {}", incoming_message.signing_authority, incoming_message.taker_authority);
+            return (
                 axum::http::StatusCode::BAD_REQUEST,
                 ProcessOrderResponse {
                     message: PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
                     error: Some(e.to_string()),
                 },
-            ));
+            );
         }
     };
-    let delegate_signer = if signed_msg.is_delegated() {
-        Some(&signing_pubkey)
-    } else {
-        None
-    };
+    let is_delegated = signed_msg.is_delegated();
 
     let current_slot = server_params.slot_subscriber.current_slot();
-    let (
-        SignedMessageInfo {
-            slot: _taker_slot,
-            order_params,
-            taker_pubkey,
-            uuid,
-        },
-        max_margin_ratio,
-    ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
+    let SignedMessageInfo {
+        slot: _taker_slot,
+        order_params,
+        taker_pubkey,
+        uuid,
+    } = match extract_signed_message_info(signed_msg, &taker_authority, current_slot) {
+        Ok(info) => info,
+        Err(err) => return err,
+    };
 
     // check the order is valid for execution by program
     let market = server_params
@@ -256,64 +212,59 @@ pub async fn process_order(
     ) {
         log::warn!(
             target: "server",
-            "{}: Order did not validate: {err:?}, {order_params:?}",
-            context.log_prefix
+            "{log_prefix}: Order did not validate: {err:?}, {order_params:?}",
         );
-        return Err((
+        return (
             axum::http::StatusCode::BAD_REQUEST,
             ProcessOrderResponse {
                 message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
                 error: Some(err.to_string()),
             },
-        ));
+        );
     }
 
-    if !skip_sim {
-        match server_params
-            .simulate_taker_order_rpc(
-                &taker_pubkey,
-                &order_params,
-                delegate_signer,
-                current_slot,
-                max_margin_ratio,
-            )
-            .await
-        {
-            Ok(sim_res) => {
-                server_params
-                    .metrics
-                    .rpc_simulation_status
-                    .with_label_values(&[sim_res.as_str()])
-                    .inc();
-            }
-            Err((status, sim_err_str, logs)) => {
-                server_params
-                    .metrics
-                    .rpc_simulation_status
-                    .with_label_values(&["invalid"])
-                    .inc();
-                log::warn!(
-                    target: "server",
-                    "{}: Order sim failed (taker: {taker_pubkey:?}, delegate: {delegate_signer:?}, market: {}-{}): {sim_err_str}. Logs: {logs:?}",
-                    context.log_prefix,
-                    order_params.market_type.as_str(),
-                    order_params.market_index,
-                );
-                log::warn!(
-                    target: "server",
-                    "{}: failed order params: {order_params:?}",
-                    context.log_prefix,
-                );
-                return Err((
-                    status,
-                    ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-                        error: Some(sim_err_str),
-                    },
-                ));
-            }
-        };
-    }
+    let delegate_signer = if is_delegated {
+        Some(&signing_pubkey)
+    } else {
+        None
+    };
+
+    match server_params
+        .simulate_taker_order_rpc(&taker_pubkey, &order_params, delegate_signer, current_slot)
+        .await
+    {
+        Ok(sim_res) => {
+            server_params
+                .metrics
+                .rpc_simulation_status
+                .with_label_values(&[sim_res.as_str()])
+                .inc();
+        }
+        Err((status, sim_err_str, logs)) => {
+            server_params
+                .metrics
+                .rpc_simulation_status
+                .with_label_values(&["invalid"])
+                .inc();
+            log::warn!(
+                target: "server",
+                "{log_prefix}: Order sim failed (taker: {taker_pubkey:?}, delegate: {delegate_signer:?}, market: {:?}-{}): {sim_err_str}. Logs: {logs:?}",
+                order_params.market_type,
+                order_params.market_index,
+            );
+            log::warn!(
+                target: "server",
+                "{log_prefix}: failed order params: {order_params:?}"
+            );
+            return (
+                status,
+                ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
+                    error: Some(sim_err_str),
+                },
+            );
+        }
+    };
 
     // If fat fingered order that requires sanitization, then just send the order
     let will_sanitize = server_params.simulate_will_auction_params_sanitize(&order_params);
@@ -322,27 +273,153 @@ pub async fn process_order(
         taker_authority,
         order_message: *signed_msg,
         order_signature: taker_signature.into(),
-        ts: context.recv_ts,
+        ts: process_order_time,
         uuid,
         will_sanitize,
     };
+    let encoded = order_metadata.encode();
+    let market_index = order_params.market_index;
+    let market_type = order_params.market_type;
 
-    server_params
-        .metrics
-        .current_slot_gauge
-        .set(current_slot as f64);
+    let topic = format!("swift_orders_{}_{market_index}", market_type.as_str());
 
-    Ok(order_metadata)
+    if let Some(kafka_producer) = &server_params.kafka_producer {
+        let enqueue_result = match kafka_producer
+            .send_result(FutureRecord::<String, String>::to(&topic).payload(&encoded))
+        {
+            Ok(fut) => fut.await,
+            Err((err, _)) => {
+                log::error!(
+                    target: "kafka",
+                    "{log_prefix}: Failed to queue order: {order_metadata:?}, error: {err:?}"
+                );
+                server_params.metrics.kafka_forward_fail_counter.inc();
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some(format!("kafka publish error: {err:?}")),
+                    },
+                );
+            }
+        };
+
+        match enqueue_result {
+            Ok(Ok(_delivery_result)) => {
+                log::trace!(target: "kafka", "{log_prefix}: Sent message for order: {order_metadata:?}");
+                server_params
+                    .metrics
+                    .current_slot_gauge
+                    .set(current_slot as f64);
+
+                server_params
+                    .metrics
+                    .order_type_counter
+                    .with_label_values(&[
+                        market_type.as_str(),
+                        &market_index.to_string(),
+                        match will_sanitize {
+                            true => "true",
+                            false => "false",
+                        },
+                    ])
+                    .inc();
+
+                server_params
+                    .metrics
+                    .kafka_inflight_count
+                    .set(kafka_producer.in_flight_count() as i64);
+
+                server_params
+                    .metrics
+                    .response_time_histogram
+                    .observe((unix_now_ms() - process_order_time) as f64);
+
+                log::info!(target: "kafka", "published to kafka: {}", order_metadata.uuid());
+                (
+                    axum::http::StatusCode::OK,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    },
+                )
+            }
+            Ok(Err((e, _))) => {
+                log::error!(
+                    target: "kafka",
+                    "{log_prefix}: Failed to deliver order: {order_metadata:?}, error: {e:?}"
+                );
+                server_params.metrics.kafka_forward_fail_counter.inc();
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some(format!("kafka publish error: {e:?}")),
+                    },
+                )
+            }
+            Err(_) => {
+                log::error!(
+                    target: "kafka",
+                    "{log_prefix}: Failed to queue order: {order_metadata:?}"
+                );
+                server_params.metrics.kafka_forward_fail_counter.inc();
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                        error: Some("kafka publish error".into()),
+                    },
+                )
+            }
+        }
+    } else {
+        let mut conn = server_params.redis_pool.clone().unwrap();
+        match conn.publish::<String, String, i64>(topic, encoded).await {
+            Ok(_) => {
+                log::trace!(target: "redis", "{log_prefix}: Sent redis message for order: {order_metadata:?}");
+                server_params
+                    .metrics
+                    .current_slot_gauge
+                    .set(current_slot as f64);
+                server_params
+                    .metrics
+                    .order_type_counter
+                    .with_label_values(&[market_type.as_str(), &market_index.to_string(), "false"])
+                    .inc();
+
+                server_params
+                    .metrics
+                    .response_time_histogram
+                    .observe((unix_now_ms() - process_order_time) as f64);
+
+                (
+                    axum::http::StatusCode::OK,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    },
+                )
+            }
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                    error: Some(format!("redis publish error: {e:?}")),
+                },
+            ),
+        }
+    }
 }
 
 pub async fn send_heartbeat(server_params: &'static ServerParams) {
-    let heartbeat_time = unix_now_ms();
-    let log_prefix = format!("[heartbeat: {heartbeat_time}]");
+    let hearbeat_time = unix_now_ms();
+    let log_prefix = format!("[hearbeat: {hearbeat_time}]");
 
     if let Some(kafka_producer) = &server_params.kafka_producer {
         match kafka_producer
             .send(
-                FutureRecord::<String, String>::to("heartbeat").payload(&"love you".to_string()),
+                FutureRecord::<String, String>::to("hearbeat").payload(&"love you".to_string()),
                 Timeout::After(Duration::ZERO),
             )
             .await
@@ -386,151 +463,6 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
             }
         }
     }
-}
-
-pub async fn deposit_trade(
-    State(server_params): State<&'static ServerParams>,
-    Json(req): Json<DepositAndPlaceRequest>,
-) -> impl axum::response::IntoResponse {
-    let signed_order_info = req
-        .swift_order
-        .order()
-        .info(&req.swift_order.taker_authority);
-    let current_slot = server_params.slot_subscriber.current_slot();
-
-    let max_margin_ratio = match extract_signed_message_info(
-        &req.swift_order.order(),
-        &req.swift_order.taker_authority,
-        current_slot,
-    ) {
-        Ok((_info, max_margin_ratio)) => max_margin_ratio,
-        Err((_status, err)) => return (StatusCode::BAD_REQUEST, Json(err)),
-    };
-
-    let uuid = core::str::from_utf8(&signed_order_info.uuid).unwrap_or("<bad uuid>");
-    log::info!(
-        target: "server",
-        "[{uuid}] depositToTrade request | authority={:?},subaccount={:?}",
-        req.swift_order.taker_authority,
-        req.swift_order.taker_pubkey
-    );
-
-    if req.deposit_tx.signatures.is_empty()
-        || req.deposit_tx.verify_with_results().iter().any(|x| !*x)
-    {
-        log::info!(target: "server", "[{uuid}] invalid deposit tx");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
-                message: "",
-                error: Some("invalid deposit tx".into()),
-            }),
-        );
-    }
-
-    // verify deposit ix exists and amount
-    let mut has_place_ix = false;
-    for ix in req.deposit_tx.message.instructions() {
-        if &ix.data[..8] == drift_idl::instructions::PlaceSignedMsgTakerOrder::DISCRIMINATOR {
-            has_place_ix = true;
-        }
-    }
-
-    if !has_place_ix {
-        log::info!(target: "server", "[{uuid}] missing place order ix");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ProcessOrderResponse {
-                message: "",
-                error: Some("missing placeSignedMsgTakerOrder ix".into()),
-            }),
-        );
-    }
-
-    // ensure deposit tx is valid
-    let mut user_after_deposit = None;
-    match simulate_tx(
-        &server_params.drift,
-        req.deposit_tx.message.clone(),
-        &[req.swift_order.taker_pubkey],
-    )
-    .await
-    {
-        Ok(res) => {
-            if let Some(err) = res.err {
-                log::info!(target: "server", "[{uuid}] deposit sim failed: {err:?}, logs: {:?}", res.logs);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ProcessOrderResponse {
-                        message: "",
-                        error: Some("invalid deposit tx".into()),
-                    }),
-                );
-            }
-            if let Some(acc) = res.accounts {
-                user_after_deposit =
-                    User::try_from_slice(&acc[0].as_ref().unwrap().data.decode().unwrap()).ok();
-            }
-        }
-        Err(err) => {
-            log::info!(target: "server", "[{uuid}] deposit sim network err: {uuid}: {err:?}");
-        }
-    }
-
-    if let Some(mut user) = user_after_deposit {
-        if !server_params.simulate_taker_order_local(
-            &signed_order_info.order_params,
-            &mut user,
-            max_margin_ratio,
-        ) {
-            log::info!(target: "server", "[{uuid}] local order sim failed");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ProcessOrderResponse {
-                    message: "",
-                    error: Some("invalid order".into()),
-                }),
-            );
-        }
-    }
-
-    let context = RequestContext::from_incoming_message(&req.swift_order);
-    // TODO: deposit tx should enable sim to pass, if it didn't before otherwise order is invalid
-    let (status, resp) = match process_order(server_params, req.swift_order, true, &context).await {
-        Ok(order_metadata) => {
-            let metrics_labels = &[
-                context.market_type,
-                &context.market_index.to_string(),
-                match order_metadata.will_sanitize {
-                    true => "true",
-                    false => "false",
-                },
-            ];
-            let topic = format!(
-                "swift_orders_deposit_{}_{}",
-                metrics_labels[0], metrics_labels[1]
-            );
-            let payload = serde_json::json!({
-                "deposit": base64::prelude::BASE64_STANDARD
-                .encode(bincode::serialize(&req.deposit_tx).unwrap()),
-                "order": order_metadata.encode(),
-            })
-            .to_string();
-
-            server_params
-                .publish_order(
-                    &topic,
-                    &payload,
-                    order_metadata.uuid(),
-                    metrics_labels,
-                    &context,
-                )
-                .await
-        }
-        Err(err) => err,
-    };
-
-    (status, Json(resp))
 }
 
 pub async fn health_check(
@@ -586,6 +518,13 @@ pub async fn start_server() {
     // Start server
 
     dotenv().ok();
+
+    let keypair =
+        load_keypair_multi_format(env::var("PRIVATE_KEY").expect("PRIVATE_KEY set").as_str());
+    if let Err(err) = keypair {
+        log::error!(target: "server", "Failed to load swift private key: {err:?}");
+        return;
+    }
 
     let use_kafka: bool = env::var("USE_KAFKA").unwrap_or_else(|_| "false".to_string()) == "true";
     let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string()) == "true";
@@ -651,7 +590,7 @@ pub async fn start_server() {
         "mainnet-beta" => Context::MainNet,
         _ => panic!("Invalid drift environment: {drift_env}"),
     };
-    let wallet = Wallet::new(Keypair::new());
+    let wallet = Wallet::new(keypair.unwrap());
     let client = DriftClient::new(context, RpcClient::new(rpc_endpoint), wallet)
         .await
         .expect("initialized client");
@@ -724,7 +663,6 @@ pub async fn start_server() {
     let app = Router::new()
         .fallback(fallback)
         .route("/orders", post(process_order_wrapper))
-        .route("/depositTrade", post(deposit_trade))
         .route("/health", get(health_check))
         .layer(cors)
         .with_state(state);
@@ -905,8 +843,7 @@ impl ServerParams {
     fn simulate_taker_order_local(
         &self,
         order_params: &OrderParams,
-        user: &mut drift_rs::types::accounts::User,
-        max_margin_ratio: Option<u16>,
+        user: &drift_rs::types::accounts::User,
     ) -> bool {
         let state = match self.drift.state_account() {
             Ok(s) => s,
@@ -944,7 +881,6 @@ impl ServerParams {
             &state,
             order_params,
             Some(&mut hlm),
-            max_margin_ratio,
         ) {
             Ok(_) => true,
             Err(err) => {
@@ -960,7 +896,6 @@ impl ServerParams {
         taker_order_params: &OrderParams,
         delegate_signer: Option<&Pubkey>,
         slot: Slot,
-        max_margin_ratio: Option<u16>,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
 
@@ -980,7 +915,7 @@ impl ServerParams {
         }
 
         let user_result = user_with_timeout.unwrap();
-        let mut user = user_result.map_err(|err| {
+        let user = user_result.map_err(|err| {
             (
                 axum::http::StatusCode::NOT_FOUND,
                 format!("unable to fetch user: {err:?}"),
@@ -1012,27 +947,22 @@ impl ServerParams {
         let t1 = SystemTime::now();
         log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
 
-        if self.simulate_taker_order_local(taker_order_params, &mut user, max_margin_ratio) {
+        if self.simulate_taker_order_local(taker_order_params, &user) {
             sim_result = SimulationStatus::Success;
             log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
             return Ok(sim_result);
         }
 
         // fallback to network sim
-        let mut tx = TransactionBuilder::new(
+        let message = TransactionBuilder::new(
             self.drift.program_data(),
             *taker_subaccount_pubkey,
             std::borrow::Cow::Owned(user),
             false,
         )
-        .with_priority_fee(5_000, Some(1_400_000));
-        if let Some(margin_ratio) = max_margin_ratio {
-            tx = tx.update_user_perp_position_custom_margin_ratio(
-                taker_order_params.market_index,
-                margin_ratio,
-            );
-        }
-        let message = tx.place_orders(vec![*taker_order_params]).build();
+        .with_priority_fee(5_000, Some(1_400_000))
+        .place_orders(vec![*taker_order_params])
+        .build();
 
         let simulate_result_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
@@ -1046,7 +976,7 @@ impl ServerParams {
                     sig_verify: false,
                     replace_recent_blockhash: true,
                     commitment: Some(CommitmentConfig::confirmed()),
-                    min_context_slot: Some(slot - 30), // allow tx sim on up to 30 slots stale context
+                    min_context_slot: Some(slot),
                     ..Default::default()
                 },
             ),
@@ -1149,128 +1079,6 @@ impl ServerParams {
             }
         }
     }
-
-    async fn publish_order(
-        &self,
-        topic: &str,
-        payload: &String,
-        uuid: &str,
-        metrics_labels: &[&str; 3],
-        context: &RequestContext,
-    ) -> (axum::http::StatusCode, ProcessOrderResponse) {
-        if let Some(kafka_producer) = &self.kafka_producer {
-            let enqueue_result = match kafka_producer
-                .send_result(FutureRecord::<String, String>::to(topic).payload(payload))
-            {
-                Ok(fut) => fut.await,
-                Err((err, _)) => {
-                    log::error!(
-                        target: "kafka",
-                        "{}: Failed to queue order: {uuid}, error: {err:?}",
-                        context.log_prefix,
-                    );
-                    self.metrics.kafka_forward_fail_counter.inc();
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                            error: Some(format!("kafka publish error: {err:?}")),
-                        },
-                    );
-                }
-            };
-
-            match enqueue_result {
-                Ok(Ok(_delivery_result)) => {
-                    log::trace!(target: "kafka", "{}: Sent message for order: {uuid}", context.log_prefix);
-                    self.metrics
-                        .order_type_counter
-                        .with_label_values(metrics_labels)
-                        .inc();
-
-                    self.metrics
-                        .kafka_inflight_count
-                        .set(kafka_producer.in_flight_count() as i64);
-
-                    self.metrics
-                        .response_time_histogram
-                        .observe((unix_now_ms() - context.recv_ts) as f64);
-
-                    log::info!(target: "kafka", "published to kafka: {uuid}");
-                    (
-                        axum::http::StatusCode::OK,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                            error: None,
-                        },
-                    )
-                }
-                Ok(Err((e, _))) => {
-                    log::error!(
-                        target: "kafka",
-                        "{}: Failed to deliver order: {uuid}, error: {e:?}",
-                        context.log_prefix
-                    );
-                    self.metrics.kafka_forward_fail_counter.inc();
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                            error: Some(format!("kafka publish error: {e:?}")),
-                        },
-                    )
-                }
-                Err(_) => {
-                    log::error!(
-                        target: "kafka",
-                        "{}: Failed to queue order: {uuid}",
-                        context.log_prefix,
-                    );
-                    self.metrics.kafka_forward_fail_counter.inc();
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                            error: Some("kafka publish error".into()),
-                        },
-                    )
-                }
-            }
-        } else {
-            let mut conn = self.redis_pool.clone().unwrap();
-            match conn
-                .publish::<String, String, i64>(topic.to_string(), payload.to_string())
-                .await
-            {
-                Ok(_) => {
-                    log::trace!(target: "redis", "{}: Sent redis message for order: {uuid}", context.log_prefix);
-                    self.metrics
-                        .order_type_counter
-                        .with_label_values(metrics_labels)
-                        .inc();
-
-                    self.metrics
-                        .response_time_histogram
-                        .observe((unix_now_ms() - context.recv_ts) as f64);
-
-                    (
-                        axum::http::StatusCode::OK,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                            error: None,
-                        },
-                    )
-                }
-                Err(e) => (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    ProcessOrderResponse {
-                        message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                        error: Some(format!("redis publish error: {e:?}")),
-                    },
-                ),
-            }
-        }
-    }
 }
 
 /// extract collateral ratio from program sim logs
@@ -1343,7 +1151,7 @@ fn extract_signed_message_info(
     signed_msg: &SignedOrderType,
     taker_authority: &Pubkey,
     current_slot: Slot,
-) -> Result<(SignedMessageInfo, Option<u16>), (axum::http::StatusCode, ProcessOrderResponse)> {
+) -> Result<SignedMessageInfo, (axum::http::StatusCode, ProcessOrderResponse)> {
     match signed_msg {
         SignedOrderType::Delegated(x) => {
             validate_order(
@@ -1352,15 +1160,12 @@ fn extract_signed_message_info(
                 x.slot,
                 current_slot,
             )?;
-            Ok((
-                SignedMessageInfo {
-                    taker_pubkey: x.taker_pubkey,
-                    order_params: x.signed_msg_order_params,
-                    uuid: x.uuid,
-                    slot: x.slot,
-                },
-                x.max_margin_ratio,
-            ))
+            Ok(SignedMessageInfo {
+                taker_pubkey: x.taker_pubkey,
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            })
         }
         SignedOrderType::Authority(x) => {
             validate_order(
@@ -1369,15 +1174,12 @@ fn extract_signed_message_info(
                 x.slot,
                 current_slot,
             )?;
-            Ok((
-                SignedMessageInfo {
-                    taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
-                    order_params: x.signed_msg_order_params,
-                    uuid: x.uuid,
-                    slot: x.slot,
-                },
-                x.max_margin_ratio,
-            ))
+            Ok(SignedMessageInfo {
+                taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
+                order_params: x.signed_msg_order_params,
+                uuid: x.uuid,
+                slot: x.slot,
+            })
         }
     }
 }
@@ -1452,34 +1254,6 @@ fn dump_account_state(
 
     let compressed = zstd::encode_all(debug_log.as_bytes(), 0).expect("encoded");
     log::debug!(target: "accountState", "{}", base64::engine::general_purpose::STANDARD.encode(compressed));
-}
-
-/// Simulate the tx on remote RPC node
-pub async fn simulate_tx(
-    drift: &DriftClient,
-    tx: VersionedMessage,
-    accounts: &[Pubkey],
-) -> SdkResult<RpcSimulateTransactionResult> {
-    let response = drift
-        .rpc()
-        .simulate_transaction_with_config(
-            &VersionedTransaction {
-                message: tx,
-                // must provide a signature for the RPC call to work
-                signatures: vec![Signature::new_unique()],
-            },
-            RpcSimulateTransactionConfig {
-                sig_verify: false,
-                replace_recent_blockhash: true,
-                accounts: Some(RpcSimulateTransactionAccountsConfig {
-                    encoding: Some(UiAccountEncoding::Base64Zstd),
-                    addresses: accounts.iter().map(|x| x.to_string()).collect(),
-                }),
-                ..Default::default()
-            },
-        )
-        .await;
-    response.map(|r| r.value).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1678,11 +1452,10 @@ mod tests {
             slot: current_slot,
             stop_loss_order_params: None,
             take_profit_order_params: None,
-            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(info, _)| {
+        assert!(result.is_ok_and(|info| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
@@ -1707,7 +1480,6 @@ mod tests {
                 ..Default::default()
             }),
             take_profit_order_params: None,
-            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1740,11 +1512,10 @@ mod tests {
             slot: current_slot,
             stop_loss_order_params: None,
             take_profit_order_params: None,
-            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(info, _margin_ratio)| {
+        assert!(result.is_ok_and(|info| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
@@ -1771,7 +1542,6 @@ mod tests {
                 base_asset_amount: 0,
                 ..Default::default()
             }),
-            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1803,7 +1573,6 @@ mod tests {
             slot: current_slot - 501, // Slot too old
             stop_loss_order_params: None,
             take_profit_order_params: None,
-            max_margin_ratio: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1829,8 +1598,8 @@ mod tests {
         .await
         .unwrap();
 
-        let mut taker_pubkey = Keypair::new().pubkey();
-        let mut taker_pubkey2 = Keypair::new().pubkey();
+        let taker_pubkey = Keypair::new().pubkey();
+        let taker_pubkey2 = Keypair::new().pubkey();
         let delegate_pubkey = Keypair::new().pubkey();
         let users: HashMap<Pubkey, User> = [
             (
@@ -1879,13 +1648,7 @@ mod tests {
 
         // Test
         let result = server_params
-            .simulate_taker_order_rpc(
-                &mut taker_pubkey,
-                &order_params,
-                Some(&delegate_pubkey),
-                1_000,
-                None,
-            )
+            .simulate_taker_order_rpc(&taker_pubkey, &order_params, Some(&delegate_pubkey), 1_000)
             .await;
         assert!(result.is_err_and(|(status, msg, _)| {
             dbg!(&msg);
@@ -1894,13 +1657,7 @@ mod tests {
         }));
 
         let result = server_params
-            .simulate_taker_order_rpc(
-                &mut taker_pubkey2,
-                &order_params,
-                Some(&delegate_pubkey),
-                1_000,
-                None,
-            )
+            .simulate_taker_order_rpc(&taker_pubkey2, &order_params, Some(&delegate_pubkey), 1_000)
             .await;
         // it fails later at remote sim since the account is not a real drift account
         assert!(result.is_err_and(|(status, msg, _)| {
