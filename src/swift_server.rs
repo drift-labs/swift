@@ -995,11 +995,12 @@ impl ServerParams {
 
         log::info!(
             target: "server",
-            "{:?}: max_leverage={},margin_mode={:?},activate_hlm={}",
+            "{:?}: max_leverage={},margin_mode={:?},activate_hlm={},delegated={}",
             user.authority,
             taker_order_params.base_asset_amount == u64::MAX,
             user.margin_mode,
             taker_order_params.high_leverage_mode(),
+            delegate_signer.is_some(),
         );
 
         if self.is_rpc_sim_disabled() {
