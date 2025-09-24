@@ -26,7 +26,7 @@ bincode = "1"
 clap = { version = "4.0", features = ["derive"] }
 dashmap = "6.1.0"
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs.git" , rev = "cd60371" }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs.git" , rev = "bd276394fcf1ff3d076607cd8dde922ebd7038c7" }
 ed25519-dalek = "1.0.1"
 env_logger = "0.11"
 faster-hex = "0.10.0"
