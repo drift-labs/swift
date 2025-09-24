@@ -8,12 +8,69 @@ use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
 use drift_rs::{
-    swift_order_subscriber::{deser_signed_msg_type, SignedOrderType},
-    types::MarketType,
+    swift_order_subscriber::{SignedOrderType, SWIFT_DELEGATE_MSG_PREFIX},
+    types::{MarketType, SignedMsgOrderParamsDelegateMessage},
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SignedOrderTypeWithLen {
+    /// length of the signed order when borsh encoded
+    pub signed_len: usize,
+    /// signed order message
+    pub order: SignedOrderType,
+}
+
+/// Deserialize hex-ified, borsh bytes as a `SignedOrderType`
+pub fn deser_signed_msg_type_with_len<'de, D>(
+    deserializer: D,
+) -> Result<SignedOrderTypeWithLen, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let payload: &str = serde::Deserialize::deserialize(deserializer)?;
+    if payload.len() % 2 != 0 {
+        return Err(serde::de::Error::custom("Hex string length must be even"));
+    }
+
+    // decode expecting the largest possible variant
+    let borsh_len = payload.len() / 2;
+    if (borsh_len > SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8) || payload.is_empty() {
+        return Err(serde::de::Error::custom("invalid signed message hex"));
+    }
+
+    // messages from older clients that are too short will naturally pad to the largest message size
+    let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
+    faster_hex::hex_decode(payload.as_bytes(), &mut borsh_buf[..borsh_len])
+        .map_err(serde::de::Error::custom)?;
+
+    // this is basically the same as if we derived AnchorDeserialize on `SignedOrderType` _expect_ it does not
+    // add a u8 to distinguish the enum
+    if borsh_buf[..8] == SWIFT_DELEGATE_MSG_PREFIX {
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
+            .map(|o| SignedOrderTypeWithLen {
+                signed_len: borsh_len,
+                order: SignedOrderType::Delegated(o),
+            })
+            .map_err(serde::de::Error::custom)
+    } else {
+        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
+            .map(|o| SignedOrderTypeWithLen {
+                signed_len: borsh_len,
+                order: SignedOrderType::Authority(o),
+            })
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct DepositAndPlaceRequest {
+    #[serde(deserialize_with = "deser_transaction")]
+    pub deposit_tx: VersionedTransaction,
+    pub swift_order: IncomingSignedMessage,
+}
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct IncomingSignedMessage {
@@ -21,8 +78,8 @@ pub struct IncomingSignedMessage {
     pub taker_pubkey: Pubkey,
     #[serde(deserialize_with = "deser_signature")]
     pub signature: Signature,
-    #[serde(deserialize_with = "deser_signed_msg_type")]
-    pub message: SignedOrderType,
+    #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
+    pub message: SignedOrderTypeWithLen,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub signing_authority: Pubkey,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
@@ -30,6 +87,10 @@ pub struct IncomingSignedMessage {
 }
 
 impl IncomingSignedMessage {
+    /// Return the swift signed order
+    pub fn order(&self) -> SignedOrderType {
+        self.message.order
+    }
     /// Verify taker signature against hex encoded `message`
     pub fn verify_signature(&self) -> Result<()> {
         let pubkey = if self.signing_authority != Pubkey::default() {
@@ -41,7 +102,9 @@ impl IncomingSignedMessage {
         }?;
 
         // client hex encodes msg before signing so use that as comparison
-        let msg_data = &self.message.to_borsh();
+        // since we allow older clients with  potentially shorter messages than the current IDL
+        // need to truncate the message to the size the client signed (exclude default padded bytes)
+        let msg_data = &self.order().to_borsh()[..self.message.signed_len];
         let mut hex_bytes = vec![0; msg_data.len() * 2]; // 2 hex bytes per msg byte
         let _ = faster_hex::hex_encode(msg_data, &mut hex_bytes).expect("hexified");
 
@@ -51,7 +114,7 @@ impl IncomingSignedMessage {
     }
     pub fn verify_and_get_signed_message(&self) -> Result<&SignedOrderType> {
         self.verify_signature()?;
-        Ok(&self.message)
+        Ok(&self.message.order)
     }
 }
 
@@ -166,6 +229,7 @@ pub enum WsClientMessage {
 #[derive(Clone, Debug)]
 pub struct WsMessage<'a> {
     channel: &'a str,
+    deposit: Option<&'a str>,
     order: Option<&'a OrderMetadataAndMessage>,
     nonce: Option<&'a str>,
     message: Option<&'a str>,
@@ -188,11 +252,17 @@ impl<'a> WsMessage<'a> {
     pub const fn new(channel: &'a str) -> Self {
         Self {
             channel,
+            deposit: None,
             order: None,
             nonce: None,
             message: None,
             error: None,
         }
+    }
+
+    pub fn set_deposit(mut self, tx: &'a str) -> Self {
+        self.deposit = Some(tx);
+        self
     }
 
     pub fn set_order(mut self, order: &'a OrderMetadataAndMessage) -> Self {
@@ -236,6 +306,10 @@ impl<'a> WsMessage<'a> {
             message["error"] = json!(error);
         }
 
+        if let Some(deposit) = self.deposit {
+            message["deposit"] = json!(deposit);
+        }
+
         message.to_string()
     }
 }
@@ -270,11 +344,24 @@ where
     MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
 }
 
+/// Deserialize solana transaction
+pub fn deser_transaction<'de, D>(deserializer: D) -> Result<VersionedTransaction, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let payload: &str = serde::Deserialize::deserialize(deserializer)?;
+    let buf = base64::prelude::BASE64_STANDARD
+        .decode(payload)
+        .map_err(serde::de::Error::custom)?;
+    bincode::deserialize(&buf).map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
     use drift_rs::types::{
         OrderParams, OrderTriggerCondition, OrderType, PositionDirection, PostOnlyParam,
         SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
+        SignedMsgTriggerOrderParams,
     };
     use nanoid::nanoid;
 
@@ -297,7 +384,7 @@ mod tests {
             actual.signing_authority
                 == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
         );
-        if let SignedOrderType::Delegated(signed_msg) = actual.message {
+        if let SignedOrderType::Delegated(signed_msg) = actual.order() {
             let expected = SignedMsgOrderParamsDelegateMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -323,6 +410,7 @@ mod tests {
                 uuid: [115, 56, 108, 117, 74, 76, 90, 101],
                 take_profit_order_params: None,
                 stop_loss_order_params: None,
+                max_margin_ratio: None,
             };
             assert_eq!(signed_msg, expected);
         } else {
@@ -375,6 +463,8 @@ mod tests {
 
     #[test]
     fn deserialize_incoming_signed_message_with_signing_authority() {
+        // NB: this message verifies backwards compatibility with older clients
+        // it was not built/signed with the max_margin_ratio field or newer additions so verifies the padding mechanisms
         let message = r#"{
             "market_index": 2,
             "market_type": "perp",
@@ -392,7 +482,7 @@ mod tests {
                 == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
         );
 
-        if let SignedOrderType::Authority(signed_msg) = actual.message {
+        if let SignedOrderType::Authority(signed_msg) = actual.order() {
             let expected = SignedMsgOrderParamsMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -418,6 +508,7 @@ mod tests {
                 uuid: [115, 56, 108, 117, 74, 76, 90, 101],
                 take_profit_order_params: None,
                 stop_loss_order_params: None,
+                max_margin_ratio: None,
             };
             assert_eq!(signed_msg, expected);
         } else {
@@ -507,5 +598,113 @@ mod tests {
         );
 
         assert_eq!(order_metadata_json["will_sanitize"], false,);
+    }
+
+    #[test]
+    fn deser_signed_msg_type_with_len_from_raw_bytes_v0() {
+        // v0 message, before we started adding fields to the message
+        let payload: Vec<u8> = vec![
+            200, 213, 166, 94, 34, 52, 245, 93, 0, 1, 0, 3, 0, 96, 254, 205, 0, 0, 0, 0, 64, 85,
+            32, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 128, 133, 181, 13, 0, 0, 0, 0,
+            1, 64, 85, 32, 14, 0, 0, 0, 0, 2, 0, 41, 9, 0, 0, 0, 0, 0, 0, 67, 82, 79, 51, 105, 114,
+            71, 49, 1, 0, 28, 78, 14, 0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0, 1, 64, 58, 105, 13,
+            0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0,
+        ];
+
+        let hex = faster_hex::hex_string(&payload);
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
+            message: SignedOrderTypeWithLen,
+        }
+
+        let json = format!(r#"{{"message":"{}"}}"#, hex);
+        let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
+
+        assert_eq!(wrapper.message.signed_len, payload.len());
+
+        match wrapper.message.order {
+            SignedOrderType::Authority(m) => {
+                assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
+                assert_eq!(
+                    m.signed_msg_order_params.auction_start_price,
+                    Some(230000000)
+                );
+                assert_eq!(m.signed_msg_order_params.auction_end_price, Some(237000000));
+                assert_eq!(m.sub_account_id, 2);
+                assert_eq!(m.slot, 2345);
+                assert_eq!(
+                    m.take_profit_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 240000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(
+                    m.stop_loss_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 225000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(m.max_margin_ratio, None);
+            }
+            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+        }
+    }
+
+    #[test]
+    fn deser_signed_msg_type_with_len_from_raw_bytes_v1() {
+        // v1 message, added max_margin_ratio field
+        let payload: Vec<u8> = vec![
+            200, 213, 166, 94, 34, 52, 245, 93, 0, 1, 0, 3, 0, 96, 254, 205, 0, 0, 0, 0, 64, 85,
+            32, 14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 10, 1, 128, 133, 181, 13, 0, 0, 0, 0,
+            1, 64, 85, 32, 14, 0, 0, 0, 0, 2, 0, 41, 9, 0, 0, 0, 0, 0, 0, 67, 82, 79, 51, 105, 114,
+            71, 49, 1, 0, 28, 78, 14, 0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0, 1, 64, 58, 105, 13,
+            0, 0, 0, 0, 0, 96, 254, 205, 0, 0, 0, 0, 1, 255, 255,
+        ];
+
+        let hex = faster_hex::hex_string(&payload);
+
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
+            message: SignedOrderTypeWithLen,
+        }
+
+        let json = format!(r#"{{"message":"{}"}}"#, hex);
+        let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
+
+        assert_eq!(wrapper.message.signed_len, payload.len());
+
+        match wrapper.message.order {
+            SignedOrderType::Authority(m) => {
+                assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
+                assert_eq!(
+                    m.signed_msg_order_params.auction_start_price,
+                    Some(230000000)
+                );
+                assert_eq!(m.signed_msg_order_params.auction_end_price, Some(237000000));
+                assert_eq!(m.sub_account_id, 2);
+                assert_eq!(m.slot, 2345);
+                assert_eq!(
+                    m.take_profit_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 240000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(
+                    m.stop_loss_order_params,
+                    Some(SignedMsgTriggerOrderParams {
+                        trigger_price: 225000000,
+                        base_asset_amount: 3456000000,
+                    })
+                );
+                assert_eq!(m.max_margin_ratio, Some(65535));
+            }
+            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+        }
     }
 }
