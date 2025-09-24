@@ -15,6 +15,9 @@ use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 
+pub const MAX_SIGNED_MSG_BORSH_LEN: usize = SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8;
+pub const MAX_SIGNED_MSG_HEX_LEN: usize = MAX_SIGNED_MSG_BORSH_LEN * 2;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignedOrderTypeWithLen {
     /// length of the signed order when borsh encoded
@@ -121,7 +124,7 @@ impl IncomingSignedMessage {
 pub struct OrderMetadataAndMessage {
     pub signing_authority: Pubkey,
     pub taker_authority: Pubkey,
-    #[max_len(2*(SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8))]
+    #[max_len(MAX_SIGNED_MSG_HEX_LEN)]
     pub order_message: Vec<u8>,
     pub deserialized_order_message: SignedOrderType,
     pub order_signature: [u8; 64],
