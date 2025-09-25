@@ -33,6 +33,7 @@ use rdkafka::{
     consumer::{Consumer, StreamConsumer},
     Message as KafkaMessage,
 };
+use serde::Deserialize;
 use tokio::{
     io::AsyncWriteExt,
     sync::{
@@ -297,6 +298,11 @@ impl WsConnection {
                     market_type.as_str(),
                     market_index.unwrap()
                 );
+                let deposit_topic = format!(
+                    "swift_orders_deposit_{}_{}",
+                    market_type.as_str(),
+                    market_index.unwrap()
+                );
 
                 match action {
                     SubscribeActions::Subscribe => {
@@ -308,6 +314,13 @@ impl WsConnection {
                                 self.pubkey,
                             );
                             self.subscribed_topics.insert(topic.clone(), tx.subscribe());
+
+                            if let Some(tx) = shared_state.subscriptions.get(&deposit_topic) {
+                                self.subscribed_topics
+                                    .insert(deposit_topic.clone(), tx.subscribe());
+                            } else {
+                                log::info!(target: "ws", "deposit topic not subbed");
+                            }
                             Ok(())
                         } else {
                             log::info!(
@@ -331,6 +344,7 @@ impl WsConnection {
                             self.pubkey,
                         );
                         self.subscribed_topics.remove(&topic);
+                        self.subscribed_topics.remove(&deposit_topic);
                         Ok(())
                     }
                 }
@@ -634,8 +648,29 @@ async fn subscribe_kafka_consumer(
                 let payload_str = std::str::from_utf8(payload)
                     .context("Failed to convert payload to string")
                     .unwrap();
-                let order_metadata = OrderMetadataAndMessage::decode(payload_str)
-                    .context("Failed to decode order metadata");
+
+                let (order_metadata, deposit) = if !topic.contains("deposit") {
+                    (
+                        OrderMetadataAndMessage::decode(payload_str)
+                            .context("Failed to decode order metadata"),
+                        None,
+                    )
+                } else {
+                    #[derive(Deserialize)]
+                    struct DepositOrder<'a> {
+                        #[serde(borrow)]
+                        deposit: &'a str,
+                        #[serde(borrow)]
+                        order: &'a str,
+                    }
+                    let value: DepositOrder = serde_json::from_str(payload_str).unwrap();
+                    (
+                        OrderMetadataAndMessage::decode(value.order)
+                            .context("Failed to decode order metadata"),
+                        Some(value.deposit),
+                    )
+                };
+
                 if let Err(ref err) = order_metadata {
                     log::error!(target: "kafka", "Failed to decode order metadata: {err:?}, {order_metadata:?}");
                     continue;
@@ -653,7 +688,13 @@ async fn subscribe_kafka_consumer(
                     "received message: {message_uuid} after: {:?}",
                     unix_now_ms() - order_metadata.ts,
                 );
-                let message = WsMessage::new(topic).set_order(&order_metadata);
+
+                let mut message = WsMessage::new(topic).set_order(&order_metadata);
+                // order has a deposit tx attached
+                if let Some(deposit) = deposit {
+                    message = message.set_deposit(deposit);
+                }
+
                 log::debug!("message jsonify(): {:?}", message);
                 match tx.send(OrderNotification {
                     json: message.jsonify(),
@@ -738,13 +779,35 @@ async fn subscribe_redis_pubsub(
         let payload_str = std::str::from_utf8(payload)
             .context("Failed to convert payload to string")
             .unwrap();
-        let order_metadata =
-            OrderMetadataAndMessage::decode(payload_str).context("Failed to decode order metadata");
+
+        let (order_metadata, deposit) = if !topic.contains("deposit") {
+            (
+                OrderMetadataAndMessage::decode(payload_str)
+                    .context("Failed to decode order metadata"),
+                None,
+            )
+        } else {
+            #[derive(Deserialize)]
+            struct DepositOrder<'a> {
+                #[serde(borrow)]
+                deposit: &'a str,
+                #[serde(borrow)]
+                order: &'a str,
+            }
+            let value: DepositOrder = serde_json::from_str(payload_str).unwrap();
+            (
+                OrderMetadataAndMessage::decode(value.order)
+                    .context("Failed to decode order metadata"),
+                Some(value.deposit),
+            )
+        };
+
         if let Err(ref err) = order_metadata {
             log::error!(target: "ws", "Failed to decode order metadata: {err:?}, {order_metadata:?}");
             continue;
         }
         let order_metadata = order_metadata.unwrap();
+
         server_params
             .metrics
             .kafka_message_forward_latency
@@ -757,7 +820,11 @@ async fn subscribe_redis_pubsub(
             "received message: {message_uuid} after: {:?}",
             unix_now_ms() - order_metadata.ts,
         );
-        let message = WsMessage::new(topic).set_order(&order_metadata);
+        let mut message = WsMessage::new(topic).set_order(&order_metadata);
+        // order has a deposit tx attached
+        if let Some(deposit) = deposit {
+            message = message.set_deposit(deposit);
+        }
         log::trace!("message jsonify(): {:?}", message);
         match tx.send(OrderNotification {
             json: message.jsonify(),
@@ -813,8 +880,14 @@ pub async fn start_server() {
             market.market_type(),
             market.market_index
         );
-        topic_names.push(topic.clone());
+        let deposit_topic = format!(
+            "swift_orders_deposit_{}_{}",
+            market.market_type(),
+            market.market_index
+        );
+        topic_names.extend_from_slice(&[topic.clone(), deposit_topic.clone()]);
         subscriptions.insert(topic, broadcast::channel(10).0);
+        subscriptions.insert(deposit_topic, broadcast::channel(10).0);
     }
 
     // Registry for metrics
