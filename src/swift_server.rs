@@ -320,7 +320,8 @@ pub async fn process_order(
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority,
-        order_message: *signed_msg,
+        order_message: incoming_message.message.original_message.clone(),
+        deserialized_order_message: *signed_msg,
         order_signature: taker_signature.into(),
         ts: context.recv_ts,
         uuid,

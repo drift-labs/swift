@@ -15,12 +15,17 @@ use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde_json::json;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 
+pub const MAX_SIGNED_MSG_BORSH_LEN: usize = SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8;
+pub const MAX_SIGNED_MSG_HEX_LEN: usize = MAX_SIGNED_MSG_BORSH_LEN * 2;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SignedOrderTypeWithLen {
     /// length of the signed order when borsh encoded
     pub signed_len: usize,
     /// signed order message
     pub order: SignedOrderType,
+    /// Original message bytes for ed25519
+    pub original_message: Vec<u8>,
 }
 
 /// Deserialize hex-ified, borsh bytes as a `SignedOrderType`
@@ -46,6 +51,8 @@ where
     faster_hex::hex_decode(payload.as_bytes(), &mut borsh_buf[..borsh_len])
         .map_err(serde::de::Error::custom)?;
 
+    let original_message = payload.as_bytes().to_vec();
+
     // this is basically the same as if we derived AnchorDeserialize on `SignedOrderType` _expect_ it does not
     // add a u8 to distinguish the enum
     if borsh_buf[..8] == SWIFT_DELEGATE_MSG_PREFIX {
@@ -53,6 +60,7 @@ where
             .map(|o| SignedOrderTypeWithLen {
                 signed_len: borsh_len,
                 order: SignedOrderType::Delegated(o),
+                original_message,
             })
             .map_err(serde::de::Error::custom)
     } else {
@@ -60,6 +68,7 @@ where
             .map(|o| SignedOrderTypeWithLen {
                 signed_len: borsh_len,
                 order: SignedOrderType::Authority(o),
+                original_message,
             })
             .map_err(serde::de::Error::custom)
     }
@@ -101,15 +110,8 @@ impl IncomingSignedMessage {
             PublicKey::from_bytes(self.taker_pubkey.as_array())
         }?;
 
-        // client hex encodes msg before signing so use that as comparison
-        // since we allow older clients with  potentially shorter messages than the current IDL
-        // need to truncate the message to the size the client signed (exclude default padded bytes)
-        let msg_data = &self.order().to_borsh()[..self.message.signed_len];
-        let mut hex_bytes = vec![0; msg_data.len() * 2]; // 2 hex bytes per msg byte
-        let _ = faster_hex::hex_encode(msg_data, &mut hex_bytes).expect("hexified");
-
         pubkey
-            .verify(&hex_bytes, &self.signature)
+            .verify(&self.message.original_message, &self.signature)
             .context("Signature did not verify")
     }
     pub fn verify_and_get_signed_message(&self) -> Result<&SignedOrderType> {
@@ -122,7 +124,9 @@ impl IncomingSignedMessage {
 pub struct OrderMetadataAndMessage {
     pub signing_authority: Pubkey,
     pub taker_authority: Pubkey,
-    pub order_message: SignedOrderType,
+    #[max_len(MAX_SIGNED_MSG_HEX_LEN)]
+    pub order_message: Vec<u8>,
+    pub deserialized_order_message: SignedOrderType,
     pub order_signature: [u8; 64],
     pub uuid: [u8; 8],
     pub ts: u64,
@@ -156,8 +160,17 @@ impl OrderMetadataAndMessage {
     }
 
     pub fn jsonify(&self) -> serde_json::Value {
-        let taker_order_params = self.order_message.info(&self.taker_authority).order_params;
-        let signed_msg_borsh = self.order_message.to_borsh();
+        let taker_order_params = self
+            .deserialized_order_message
+            .info(&self.taker_authority)
+            .order_params;
+
+        let order_message_str = match core::str::from_utf8(&self.order_message) {
+            Ok(s) if s.as_bytes().iter().all(u8::is_ascii_hexdigit) && (s.len() % 2 == 0) => {
+                s.to_string()
+            }
+            _ => faster_hex::hex_string(self.order_message.as_slice()),
+        };
 
         json!({
             "market_type": match taker_order_params.market_type {
@@ -165,7 +178,7 @@ impl OrderMetadataAndMessage {
                 MarketType::Spot => "spot",
             },
             "market_index": taker_order_params.market_index,
-            "order_message": faster_hex::hex_string(signed_msg_borsh.as_slice()),
+            "order_message": order_message_str,
             "order_signature": base64::prelude::BASE64_STANDARD.encode(self.order_signature),
             "taker_authority": self.taker_authority.to_string(),
             "signing_authority": self.signing_authority.to_string(),
@@ -521,7 +534,8 @@ mod tests {
         let encoded = OrderMetadataAndMessage {
             signing_authority: Pubkey::new_unique(),
             taker_authority: Pubkey::new_unique(),
-            order_message: SignedOrderType::Authority(Default::default()),
+            order_message: vec![0u8; 2 * (SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8)],
+            deserialized_order_message: SignedOrderType::Authority(Default::default()),
             order_signature: [1u8; 64],
             ts: 55555,
             uuid: nanoid!(8).as_bytes().try_into().unwrap(),
@@ -531,7 +545,7 @@ mod tests {
         let order_metadata = OrderMetadataAndMessage::decode(&encoded).unwrap();
         dbg!(base64::prelude::BASE64_STANDARD.encode(
             &order_metadata
-                .order_message
+                .deserialized_order_message
                 .try_to_vec()
                 .unwrap()
                 .as_slice()
@@ -560,13 +574,15 @@ mod tests {
         };
 
         let signed_order_message = SignedOrderType::Authority(order_params);
+        let hex_msg = faster_hex::hex_string(signed_order_message.to_borsh().as_slice());
 
         let order_metadata_json = OrderMetadataAndMessage {
             signing_authority,
             taker_authority,
+            order_message: hex_msg.as_bytes().to_vec(),
             order_signature,
             uuid: order_params.uuid,
-            order_message: signed_order_message.clone(),
+            deserialized_order_message: signed_order_message.clone(),
             ts: 55555,
             will_sanitize: false,
         }
@@ -585,10 +601,7 @@ mod tests {
             base64::prelude::BASE64_STANDARD.encode(order_signature),
         );
 
-        assert_eq!(
-            order_metadata_json["order_message"],
-            faster_hex::hex_string(signed_order_message.to_borsh().as_slice()),
-        );
+        assert_eq!(order_metadata_json["order_message"], hex_msg,);
 
         assert_eq!(order_metadata_json["ts"], 55555);
 
