@@ -830,8 +830,11 @@ fn validate_signed_order_params(
     }
 
     if taker_order_params.base_asset_amount < min_order_size {
-        log::info!(target: "server", "{} < {min_order_size}", taker_order_params.base_asset_amount);
-        return Err(ErrorCode::InvalidOrderSizeTooSmall);
+        // can always close reduce_only
+        if !taker_order_params.reduce_only {
+            log::info!(target: "server", "{} < {min_order_size}", taker_order_params.base_asset_amount);
+            return Err(ErrorCode::InvalidOrderSizeTooSmall);
+        }
     }
 
     // has_valid_auction_params
