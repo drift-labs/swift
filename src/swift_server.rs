@@ -1681,6 +1681,8 @@ mod tests {
             stop_loss_order_params: None,
             take_profit_order_params: None,
             max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1710,6 +1712,8 @@ mod tests {
             }),
             take_profit_order_params: None,
             max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1743,6 +1747,8 @@ mod tests {
             stop_loss_order_params: None,
             take_profit_order_params: None,
             max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1774,6 +1780,8 @@ mod tests {
                 ..Default::default()
             }),
             max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1806,6 +1814,8 @@ mod tests {
             stop_loss_order_params: None,
             take_profit_order_params: None,
             max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
