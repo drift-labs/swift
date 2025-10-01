@@ -424,6 +424,8 @@ mod tests {
                 take_profit_order_params: None,
                 stop_loss_order_params: None,
                 max_margin_ratio: None,
+                builder_fee_tenth_bps: None,
+                builder_idx: None,
             };
             assert_eq!(signed_msg, expected);
         } else {
@@ -522,6 +524,8 @@ mod tests {
                 take_profit_order_params: None,
                 stop_loss_order_params: None,
                 max_margin_ratio: None,
+                builder_fee_tenth_bps: None,
+                builder_idx: None,
             };
             assert_eq!(signed_msg, expected);
         } else {
