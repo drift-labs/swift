@@ -946,6 +946,7 @@ impl ServerParams {
             order_params,
             Some(&mut hlm),
             max_margin_ratio,
+            &mut None,
         ) {
             Ok(_) => true,
             Err(err) => {
