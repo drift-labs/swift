@@ -286,6 +286,7 @@ pub async fn process_order(
                 delegate_signer,
                 current_slot,
                 max_margin_ratio,
+                context,
             )
             .await
         {
@@ -326,7 +327,7 @@ pub async fn process_order(
     }
 
     // If fat fingered order that requires sanitization, then just send the order
-    let will_sanitize = server_params.simulate_will_auction_params_sanitize(&order_params);
+    let will_sanitize = server_params.simulate_will_auction_params_sanitize(&order_params, context);
     let order_metadata = OrderMetadataAndMessage {
         signing_authority: signing_pubkey,
         taker_authority,
@@ -407,6 +408,7 @@ pub async fn deposit_trade(
         .swift_order
         .order()
         .info(&req.swift_order.taker_authority);
+    let context = RequestContext::from_incoming_message(&req.swift_order);
     let current_slot = server_params.slot_subscriber.current_slot();
 
     let max_margin_ratio = match extract_signed_message_info(
@@ -418,10 +420,10 @@ pub async fn deposit_trade(
         Err((_status, err)) => return (StatusCode::BAD_REQUEST, Json(err)),
     };
 
-    let uuid = core::str::from_utf8(&signed_order_info.uuid).unwrap_or("<bad uuid>");
     log::info!(
         target: "server",
-        "[{uuid}] depositToTrade request | authority={:?},subaccount={:?}",
+        "{} depositToTrade request | authority={:?},subaccount={:?}",
+        context.log_prefix,
         req.swift_order.taker_authority,
         req.swift_order.taker_pubkey
     );
@@ -429,7 +431,7 @@ pub async fn deposit_trade(
     if req.deposit_tx.signatures.is_empty()
         || req.deposit_tx.verify_with_results().iter().any(|x| !*x)
     {
-        log::info!(target: "server", "[{uuid}] invalid deposit tx");
+        log::info!(target: "server", "{} invalid deposit tx", context.log_prefix);
         return (
             StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -448,7 +450,7 @@ pub async fn deposit_trade(
     }
 
     if !has_place_ix {
-        log::info!(target: "server", "[{uuid}] missing place order ix");
+        log::info!(target: "server", "{} missing place order ix", context.log_prefix);
         return (
             StatusCode::BAD_REQUEST,
             Json(ProcessOrderResponse {
@@ -469,7 +471,12 @@ pub async fn deposit_trade(
     {
         Ok(res) => {
             if let Some(err) = res.err {
-                log::info!(target: "server", "[{uuid}] deposit sim failed: {err:?}, logs: {:?}", res.logs);
+                log::info!(
+                    target: "server",
+                    "{} deposit sim failed: {err:?}, logs: {:?}",
+                    context.log_prefix,
+                    res.logs
+                );
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ProcessOrderResponse {
@@ -484,7 +491,11 @@ pub async fn deposit_trade(
             }
         }
         Err(err) => {
-            log::info!(target: "server", "[{uuid}] deposit sim network err: {uuid}: {err:?}");
+            log::info!(
+                target: "server",
+                "{} deposit sim network err: {err:?}",
+                context.log_prefix,
+            );
         }
     }
 
@@ -493,8 +504,9 @@ pub async fn deposit_trade(
             &signed_order_info.order_params,
             &mut user,
             max_margin_ratio,
+            &context,
         ) {
-            log::info!(target: "server", "[{uuid}] local order sim failed");
+            log::info!(target: "server", "{} local order sim failed", context.log_prefix);
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ProcessOrderResponse {
@@ -505,7 +517,6 @@ pub async fn deposit_trade(
         }
     }
 
-    let context = RequestContext::from_incoming_message(&req.swift_order);
     // TODO: deposit tx should enable sim to pass, if it didn't before otherwise order is invalid
     let (status, resp) = match process_order(server_params, req.swift_order, true, &context).await {
         Ok(order_metadata) => {
@@ -918,11 +929,16 @@ impl ServerParams {
         order_params: &OrderParams,
         user: &mut drift_rs::types::accounts::User,
         max_margin_ratio: Option<u16>,
+        context: &RequestContext,
     ) -> bool {
         let state = match self.drift.state_account() {
             Ok(s) => s,
             Err(err) => {
-                log::warn!(target: "sim", "state account fetch failed: {err:?}");
+                log::warn!(
+                    target: "sim",
+                    "{}: state account fetch failed: {err:?}",
+                    context.log_prefix
+                );
                 return false;
             }
         };
@@ -930,7 +946,11 @@ impl ServerParams {
             match self.drift.try_get_account(high_leverage_mode_account()) {
                 Ok(s) => s,
                 Err(err) => {
-                    log::warn!(target: "sim", "HLM config account fetch failed: {err:?}");
+                    log::warn!(
+                        target: "sim",
+                        "{}: HLM config account fetch failed: {err:?}",
+                        context.log_prefix
+                    );
                     return false;
                 }
             };
@@ -944,7 +964,11 @@ impl ServerParams {
             )],
         );
         if let Err(err) = accounts {
-            log::warn!(target: "sim", "couldn't build accounts for sim: {err:?}");
+            log::warn!(
+                target: "sim",
+                "{}: couldn't build accounts for sim: {err:?}",
+                context.log_prefix
+            );
             return false;
         }
 
@@ -960,7 +984,11 @@ impl ServerParams {
         ) {
             Ok(_) => true,
             Err(err) => {
-                log::debug!(target: "sim", "local sim failed: {err:?}");
+                log::debug!(
+                    target: "sim",
+                    "{}: local sim failed: {err:?}",
+                    context.log_prefix
+                );
                 false
             }
         }
@@ -973,13 +1001,18 @@ impl ServerParams {
         delegate_signer: Option<&Pubkey>,
         slot: Slot,
         max_margin_ratio: Option<u16>,
+        context: &RequestContext,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
 
         let t0 = SystemTime::now();
 
         if let Some(delegate) = delegate_signer {
-            log::debug!(target: "sim", "delegate signer for sim: {delegate}");
+            log::debug!(
+                target: "sim",
+                "{}: delegate signer for sim: {delegate}",
+                context.log_prefix
+            );
         }
 
         let user_with_timeout = tokio::time::timeout(
@@ -991,7 +1024,11 @@ impl ServerParams {
 
         if user_with_timeout.is_err() {
             sim_result = SimulationStatus::Timeout;
-            warn!(target: "sim", "simulateTransaction degraded (timeout)");
+            warn!(
+                target: "sim",
+                "{}: simulateTransaction degraded (timeout)",
+                context.log_prefix
+            );
             return Ok(sim_result);
         }
 
@@ -1026,11 +1063,22 @@ impl ServerParams {
         }
 
         let t1 = SystemTime::now();
-        log::info!(target: "sim", "fetch user: {:?}", SystemTime::now().duration_since(t0));
+        log::info!(
+            target: "sim",
+            "{}: fetch user: {:?}",
+            context.log_prefix,
+            SystemTime::now().duration_since(t0)
+        );
 
-        if self.simulate_taker_order_local(taker_order_params, &mut user, max_margin_ratio) {
+        if self.simulate_taker_order_local(taker_order_params, &mut user, max_margin_ratio, context)
+        {
             sim_result = SimulationStatus::Success;
-            log::info!(target: "sim", "simulate tx (local): {:?}", SystemTime::now().duration_since(t1));
+            log::info!(
+                target: "sim",
+                "{}: simulate tx (local): {:?}",
+                context.log_prefix,
+                SystemTime::now().duration_since(t1)
+            );
             return Ok(sim_result);
         }
 
@@ -1072,7 +1120,11 @@ impl ServerParams {
         match simulate_result_with_timeout {
             Ok(Ok(res)) => {
                 if let Some(simulate_err) = res.value.err {
-                    log::warn!(target: "sim", "program sim error: {simulate_err:?}");
+                    log::warn!(
+                        target: "sim",
+                        "{}: program sim error: {simulate_err:?}",
+                        context.log_prefix
+                    );
                     let err = SdkError::Rpc(Box::new(client_error::Error {
                         request: None,
                         kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
@@ -1084,8 +1136,17 @@ impl ServerParams {
                                 if let Some(ref logs) = res.value.logs {
                                     if let Some(collateral_ratio) = extract_collateral_ratio(logs) {
                                         if collateral_ratio <= COLLATERAL_BUFFER {
-                                            log::info!(target: "sim", "accepting undercollateralized order: {collateral_ratio}");
-                                            log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
+                                            log::info!(
+                                                target: "sim",
+                                                "{}: accepting undercollateralized order: {collateral_ratio}",
+                                                context.log_prefix
+                                            );
+                                            log::info!(
+                                                target: "sim",
+                                                "{}: simulate tx (rpc): {:?}",
+                                                context.log_prefix,
+                                                SystemTime::now().duration_since(t1)
+                                            );
                                             return Ok(SimulationStatus::SuccessCollateralBuffer);
                                         }
                                     }
@@ -1097,6 +1158,7 @@ impl ServerParams {
                                         user,
                                         taker_order_params,
                                         res.context.slot,
+                                        context,
                                     );
                                 }
                             }
@@ -1113,13 +1175,22 @@ impl ServerParams {
                         )),
                     }
                 } else {
-                    log::info!(target: "sim", "simulate tx (rpc): {:?}", SystemTime::now().duration_since(t1));
+                    log::info!(
+                        target: "sim",
+                        "{}: simulate tx (rpc): {:?}",
+                        context.log_prefix,
+                        SystemTime::now().duration_since(t1)
+                    );
                     sim_result = SimulationStatus::SuccessRpc;
                     Ok(sim_result)
                 }
             }
             Ok(Err(err)) => {
-                log::warn!(target: "sim", "network sim error: {err:?}");
+                log::warn!(
+                    target: "sim",
+                    "{}: network sim error: {err:?}",
+                    context.log_prefix
+                );
                 sim_result = SimulationStatus::Degraded;
                 Ok(sim_result)
             }
@@ -1131,14 +1202,22 @@ impl ServerParams {
     }
 
     /// Simulate if auction params will be sanitized
-    fn simulate_will_auction_params_sanitize(&self, order_params: &OrderParams) -> bool {
+    fn simulate_will_auction_params_sanitize(
+        &self,
+        order_params: &OrderParams,
+        context: &RequestContext,
+    ) -> bool {
         let perp_market = match self
             .drift
             .try_get_perp_market_account(order_params.market_index)
         {
             Ok(m) => m,
             Err(err) => {
-                log::debug!(target: "sim", "couldn't get perp market: {err:?}");
+                log::debug!(
+                    target: "sim",
+                    "{}: couldn't get perp market: {err:?}",
+                    context.log_prefix
+                );
                 return false;
             }
         };
@@ -1147,7 +1226,11 @@ impl ServerParams {
         let oracle_data = match self.drift.try_get_oracle_price_data_and_slot(market_id) {
             Some(p) => p,
             None => {
-                log::debug!(target: "sim", "oracle price is None");
+                log::debug!(
+                    target: "sim",
+                    "{}: oracle price is None",
+                    context.log_prefix
+                );
                 return false;
             }
         };
@@ -1160,7 +1243,11 @@ impl ServerParams {
         ) {
             Ok(result) => result,
             Err(err) => {
-                log::debug!(target: "sim", "local sim failed: {err:?}");
+                log::debug!(
+                    target: "sim",
+                    "{}: local sim failed: {err:?}",
+                    context.log_prefix
+                );
                 true
             }
         }
@@ -1423,10 +1510,15 @@ fn dump_account_state(
     user: User,
     taker_order_params: &OrderParams,
     slot: Slot,
+    context: &RequestContext,
 ) {
     log::info!(
     target: "accountState",
-    "dumping account state: user:{},authority:{},slot:{}", taker_subaccount_pubkey, user.authority, slot
+    "{}: dumping account state: user:{},authority:{},slot:{}",
+    context.log_prefix,
+    taker_subaccount_pubkey,
+    user.authority,
+    slot
     );
     let mut debug_log = String::with_capacity(8192 * 2);
     debug_log.push_str("user:");
@@ -1923,13 +2015,23 @@ mod tests {
         };
 
         // Test
+        let context_primary = RequestContext {
+            recv_ts: unix_now_ms(),
+            log_prefix: format!("[test-order {}]", taker_pubkey),
+            market_index: order_params.market_index,
+            market_type: "perp",
+            taker_authority: taker_pubkey,
+            order_uuid: "TESTORD0".into(),
+        };
+
         let result = server_params
             .simulate_taker_order_rpc(
-                &mut taker_pubkey,
+                &taker_pubkey,
                 &order_params,
                 Some(&delegate_pubkey),
                 1_000,
                 None,
+                &context_primary,
             )
             .await;
         assert!(result.is_err_and(|(status, msg, _)| {
@@ -1938,13 +2040,23 @@ mod tests {
                 && msg.contains("signer is not configured delegate")
         }));
 
+        let context_secondary = RequestContext {
+            recv_ts: unix_now_ms(),
+            log_prefix: format!("[test-order {}]", taker_pubkey2),
+            market_index: order_params.market_index,
+            market_type: "perp",
+            taker_authority: taker_pubkey2,
+            order_uuid: "TESTORD1".into(),
+        };
+
         let result = server_params
             .simulate_taker_order_rpc(
-                &mut taker_pubkey2,
+                &taker_pubkey2,
                 &order_params,
                 Some(&delegate_pubkey),
                 1_000,
                 None,
+                &context_secondary,
             )
             .await;
         // it fails later at remote sim since the account is not a real drift account
