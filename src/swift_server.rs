@@ -111,21 +111,11 @@ pub async fn fallback(uri: axum::http::Uri) -> impl axum::response::IntoResponse
     (axum::http::StatusCode::NOT_FOUND, format!("No route {uri}"))
 }
 
-#[inline]
-fn extract_uuid(msg: &SignedOrderType) -> [u8; 8] {
-    match msg {
-        SignedOrderType::Authority(x) => x.uuid,
-        SignedOrderType::Delegated(x) => x.uuid,
-    }
-}
-
 pub async fn process_order_wrapper(
     x_swift_client_header: Option<axum_extra::TypedHeader<XSwiftClientConsumer>>,
     State(server_params): State<&'static ServerParams>,
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
-    let uuid_raw = extract_uuid(&incoming_message.order());
-    let uuid = core::str::from_utf8(&uuid_raw).unwrap_or("00000000");
     let context = RequestContext::from_incoming_message(&incoming_message);
 
     let (status, resp) = match process_order(server_params, incoming_message, false, &context).await
@@ -156,9 +146,13 @@ pub async fn process_order_wrapper(
     };
 
     log::info!(
-        target: "server", "{status}|{uuid}|{:?}|ui={}",
+        target: "server",
+        "{} status={status} err={} ui={} uuid={} taker={}",
+        context.log_prefix,
         resp.error.as_deref().unwrap_or(""),
-        x_swift_client_header.is_some_and(|x| x.is_app_order())
+        x_swift_client_header.is_some_and(|x| x.is_app_order()),
+        context.order_uuid,
+        context.taker_authority,
     );
     (status, Json(resp))
 }
@@ -238,13 +232,29 @@ pub async fn process_order(
     let current_slot = server_params.slot_subscriber.current_slot();
     let (
         SignedMessageInfo {
-            slot: _taker_slot,
+            slot: taker_slot,
             order_params,
             taker_pubkey,
             uuid,
         },
         max_margin_ratio,
     ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
+
+    log::info!(
+        target: "server",
+        "{} signer={} taker_subaccount={} slot={} side={:?} base={} price={} order_type={:?} reduce_only={} post_only={:?} delegate_signer={:?}",
+        context.log_prefix,
+        signing_pubkey,
+        taker_pubkey,
+        taker_slot,
+        order_params.direction,
+        order_params.base_asset_amount,
+        order_params.price,
+        order_params.order_type,
+        order_params.reduce_only,
+        order_params.post_only,
+        delegate_signer,
+    );
 
     // check the order is valid for execution by program
     let market = server_params
@@ -968,6 +978,10 @@ impl ServerParams {
 
         let t0 = SystemTime::now();
 
+        if let Some(delegate) = delegate_signer {
+            log::debug!(target: "sim", "delegate signer for sim: {delegate}");
+        }
+
         let user_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
             self.user_account_fetcher
@@ -1168,7 +1182,7 @@ impl ServerParams {
                 Err((err, _)) => {
                     log::error!(
                         target: "kafka",
-                        "{}: Failed to queue order: {uuid}, error: {err:?}",
+                        "{} topic={topic}: failed to queue order {uuid}, error: {err:?}",
                         context.log_prefix,
                     );
                     self.metrics.kafka_forward_fail_counter.inc();
@@ -1184,7 +1198,11 @@ impl ServerParams {
 
             match enqueue_result {
                 Ok(Ok(_delivery_result)) => {
-                    log::trace!(target: "kafka", "{}: Sent message for order: {uuid}", context.log_prefix);
+                    log::trace!(
+                        target: "kafka",
+                        "{} topic={topic}: queued message for order {uuid}",
+                        context.log_prefix
+                    );
                     self.metrics
                         .order_type_counter
                         .with_label_values(metrics_labels)
@@ -1198,7 +1216,12 @@ impl ServerParams {
                         .response_time_histogram
                         .observe((unix_now_ms() - context.recv_ts) as f64);
 
-                    log::info!(target: "kafka", "published to kafka: {uuid}");
+                    let publish_latency = unix_now_ms().saturating_sub(context.recv_ts);
+                    log::info!(
+                        target: "kafka",
+                        "{} topic={topic}: published order {uuid} latency_ms={publish_latency}",
+                        context.log_prefix
+                    );
                     (
                         axum::http::StatusCode::OK,
                         ProcessOrderResponse {
@@ -1210,7 +1233,7 @@ impl ServerParams {
                 Ok(Err((e, _))) => {
                     log::error!(
                         target: "kafka",
-                        "{}: Failed to deliver order: {uuid}, error: {e:?}",
+                        "{} topic={topic}: failed to deliver order {uuid}, error: {e:?}",
                         context.log_prefix
                     );
                     self.metrics.kafka_forward_fail_counter.inc();
@@ -1225,7 +1248,7 @@ impl ServerParams {
                 Err(_) => {
                     log::error!(
                         target: "kafka",
-                        "{}: Failed to queue order: {uuid}",
+                        "{} topic={topic}: failed to queue order {uuid}",
                         context.log_prefix,
                     );
                     self.metrics.kafka_forward_fail_counter.inc();
@@ -1245,7 +1268,11 @@ impl ServerParams {
                 .await
             {
                 Ok(_) => {
-                    log::trace!(target: "redis", "{}: Sent redis message for order: {uuid}", context.log_prefix);
+                    log::trace!(
+                        target: "redis",
+                        "{} topic={topic}: queued redis message for order {uuid}",
+                        context.log_prefix
+                    );
                     self.metrics
                         .order_type_counter
                         .with_label_values(metrics_labels)
@@ -1255,6 +1282,12 @@ impl ServerParams {
                         .response_time_histogram
                         .observe((unix_now_ms() - context.recv_ts) as f64);
 
+                    let publish_latency = unix_now_ms().saturating_sub(context.recv_ts);
+                    log::info!(
+                        target: "redis",
+                        "{} topic={topic}: published order {uuid} latency_ms={publish_latency}",
+                        context.log_prefix
+                    );
                     (
                         axum::http::StatusCode::OK,
                         ProcessOrderResponse {

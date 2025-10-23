@@ -4,7 +4,10 @@ use std::{
     env,
     net::SocketAddr,
     str::FromStr,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -64,6 +67,21 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const FAST_SLOW_WS_DIFF: Duration = Duration::from_secs(1);
+
+const HEARTBEAT_LOG_INTERVAL_MS: u64 = 30_000;
+static LAST_KAFKA_HEARTBEAT_LOG_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_REDIS_HEARTBEAT_LOG_MS: AtomicU64 = AtomicU64::new(0);
+
+fn should_log_heartbeat(last_log: &AtomicU64) -> bool {
+    let now = unix_now_ms();
+    let previous = last_log.load(Ordering::Relaxed);
+    if now.saturating_sub(previous) >= HEARTBEAT_LOG_INTERVAL_MS {
+        last_log.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
 
 const ENDPOINT: LazyCell<String> = LazyCell::new(|| {
     env::var("ENDPOINT").unwrap_or_else(|_| "https://api.devnet.solana.com".to_string())
@@ -433,7 +451,7 @@ impl WsConnection {
             return Err(WsError::ChannelClosed);
         }
 
-        let mut outbox = Vec::<String>::with_capacity(16); // buffer messages for sending
+        let mut outbox = Vec::<String>::with_capacity(100); // buffer messages for sending
 
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         let _ = heartbeat_interval.tick().await; // skip first immediate tick
@@ -628,7 +646,7 @@ async fn subscribe_kafka_consumer(
                     log::info!(target: "kafka", "loaded new topic: {topic}");
                     server_params
                         .subscriptions
-                        .insert(topic.to_string(), broadcast::channel(10).0);
+                        .insert(topic.to_string(), broadcast::channel(20).0);
                 };
 
                 let tx = server_params
@@ -636,11 +654,15 @@ async fn subscribe_kafka_consumer(
                     .get(topic)
                     .expect("topic channel exists");
 
-                if (tx.receiver_count() as u32) < 1 {
+                let receiver_count = tx.receiver_count();
+                if receiver_count == 0 {
                     if topic != "heartbeat" {
-                        log::warn!(target: "kafka", "No receiver found for topic: {topic}, order message lost!");
-                    } else {
-                        log::debug!(target: "kafka", "Received heartbeat message");
+                        log::warn!(
+                            target: "kafka",
+                            "No receiver found for topic: {topic}, dropping order message"
+                        );
+                    } else if should_log_heartbeat(&LAST_KAFKA_HEARTBEAT_LOG_MS) {
+                        log::trace!(target: "kafka", "Received heartbeat message");
                     }
                     continue;
                 }
@@ -676,17 +698,35 @@ async fn subscribe_kafka_consumer(
                     continue;
                 }
                 let order_metadata = order_metadata.unwrap();
+                let now_ms = unix_now_ms();
+                let forward_latency = now_ms.saturating_sub(order_metadata.ts);
                 server_params
                     .metrics
                     .kafka_message_forward_latency
                     .with_label_values(&[topic])
-                    .observe((unix_now_ms() - order_metadata.ts) as f64);
+                    .observe(forward_latency as f64);
 
-                let message_uuid = order_metadata.uuid();
-                log::debug!(
+                let signed_info = order_metadata
+                    .deserialized_order_message
+                    .info(&order_metadata.taker_authority);
+                let taker_subaccount = signed_info.taker_pubkey;
+                let order_params = signed_info.order_params;
+
+                log::info!(
                     target: "kafka",
-                    "received message: {message_uuid} after: {:?}",
-                    unix_now_ms() - order_metadata.ts,
+                    "topic={topic} uuid={} market_type={} market_index={} direction={:?} base={} price={} order_type={:?} taker_authority={} signer={} taker_subaccount={} will_sanitize={} deposit_present={} recv_lag_ms={forward_latency} receivers={receiver_count}",
+                    order_metadata.uuid(),
+                    order_params.market_type.as_str(),
+                    order_params.market_index,
+                    order_params.direction,
+                    order_params.base_asset_amount,
+                    order_params.price,
+                    order_params.order_type,
+                    order_metadata.taker_authority,
+                    order_metadata.signing_authority,
+                    taker_subaccount,
+                    order_metadata.will_sanitize,
+                    deposit.is_some(),
                 );
 
                 let mut message = WsMessage::new(topic).set_order(&order_metadata);
@@ -695,23 +735,25 @@ async fn subscribe_kafka_consumer(
                     message = message.set_deposit(deposit);
                 }
 
-                log::debug!("message jsonify(): {:?}", message);
+                log::trace!("message jsonify(): {:?}", message);
                 match tx.send(OrderNotification {
                     json: message.jsonify(),
-                    recv_lag: unix_now_ms().saturating_sub(order_metadata.ts),
+                    recv_lag: forward_latency,
                 }) {
                     Ok(_) => {
                         log::debug!(
                             target: "kafka",
-                            "Forwarded message: {message_uuid} at {}",
-                            unix_now_ms(),
+                            "topic={topic} uuid={} forwarded at {} receivers={receiver_count}",
+                            order_metadata.uuid(),
+                            now_ms,
                         );
                     }
                     Err(e) => {
                         log::error!(
                             target: "kafka",
-                            "Failed to forward message: {message_uuid} at {}. Error: {e:?}",
-                            unix_now_ms(),
+                            "topic={topic} uuid={} failed to forward at {} error={e:?}",
+                            order_metadata.uuid(),
+                            now_ms,
                         );
                     }
                 }
@@ -759,7 +801,7 @@ async fn subscribe_redis_pubsub(
             log::info!(target: "ws", "loaded new topic: {topic}");
             server_params
                 .subscriptions
-                .insert(topic.to_string(), broadcast::channel(10).0);
+                .insert(topic.to_string(), broadcast::channel(20).0);
         };
 
         let tx = server_params
@@ -767,11 +809,12 @@ async fn subscribe_redis_pubsub(
             .get(topic)
             .expect("topic channel exists");
 
-        if (tx.receiver_count() as u32) < 1 {
+        let receiver_count = tx.receiver_count();
+        if receiver_count == 0 {
             if topic != "heartbeat" {
-                log::warn!(target: "ws", "No receiver found for topic: {topic}, order message lost!");
-            } else {
-                log::debug!(target: "ws", "Received heartbeat message");
+                log::warn!(target: "ws", "No receiver found for topic: {topic}, dropping order message!");
+            } else if should_log_heartbeat(&LAST_REDIS_HEARTBEAT_LOG_MS) {
+                log::trace!(target: "ws", "Received heartbeat message");
             }
             continue;
         }
@@ -807,18 +850,36 @@ async fn subscribe_redis_pubsub(
             continue;
         }
         let order_metadata = order_metadata.unwrap();
+        let now_ms = unix_now_ms();
+        let forward_latency = now_ms.saturating_sub(order_metadata.ts);
 
         server_params
             .metrics
             .kafka_message_forward_latency
             .with_label_values(&[topic])
-            .observe((unix_now_ms() - order_metadata.ts) as f64);
+            .observe(forward_latency as f64);
 
-        let message_uuid = order_metadata.uuid();
-        log::debug!(
-            target: "ws",
-            "received message: {message_uuid} after: {:?}",
-            unix_now_ms() - order_metadata.ts,
+        let signed_info = order_metadata
+            .deserialized_order_message
+            .info(&order_metadata.taker_authority);
+        let taker_subaccount = signed_info.taker_pubkey;
+        let order_params = signed_info.order_params;
+
+        log::info!(
+            target: "redis",
+            "topic={topic} uuid={} market_type={} market_index={} direction={:?} base={} price={} order_type={:?} taker_authority={} signer={} taker_subaccount={} will_sanitize={} deposit_present={} recv_lag_ms={forward_latency} receivers={receiver_count}",
+            order_metadata.uuid(),
+            order_params.market_type.as_str(),
+            order_params.market_index,
+            order_params.direction,
+            order_params.base_asset_amount,
+            order_params.price,
+            order_params.order_type,
+            order_metadata.taker_authority,
+            order_metadata.signing_authority,
+            taker_subaccount,
+            order_metadata.will_sanitize,
+            deposit.is_some(),
         );
         let mut message = WsMessage::new(topic).set_order(&order_metadata);
         // order has a deposit tx attached
@@ -828,20 +889,22 @@ async fn subscribe_redis_pubsub(
         log::trace!("message jsonify(): {:?}", message);
         match tx.send(OrderNotification {
             json: message.jsonify(),
-            recv_lag: unix_now_ms().saturating_sub(order_metadata.ts),
+            recv_lag: forward_latency,
         }) {
             Ok(_) => {
                 log::debug!(
                     target: "redis",
-                    "Forwarded message: {message_uuid} at {}",
-                    unix_now_ms(),
+                    "topic={topic} uuid={} forwarded at {} receivers={receiver_count}",
+                    order_metadata.uuid(),
+                    now_ms,
                 );
             }
             Err(e) => {
                 log::error!(
                     target: "redis",
-                    "Failed to forward message: {message_uuid} at {}. Error: {e:?}",
-                    unix_now_ms(),
+                    "topic={topic} uuid={} failed to forward at {}. Error: {e:?}",
+                    order_metadata.uuid(),
+                    now_ms,
                 );
             }
         }
@@ -886,8 +949,8 @@ pub async fn start_server() {
             market.market_index
         );
         topic_names.extend_from_slice(&[topic.clone(), deposit_topic.clone()]);
-        subscriptions.insert(topic, broadcast::channel(10).0);
-        subscriptions.insert(deposit_topic, broadcast::channel(10).0);
+        subscriptions.insert(topic, broadcast::channel(20).0);
+        subscriptions.insert(deposit_topic, broadcast::channel(20).0);
     }
 
     // Registry for metrics
