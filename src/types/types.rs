@@ -1,6 +1,7 @@
 use std::time::UNIX_EPOCH;
 
 use drift_rs::types::MarketType;
+use solana_sdk::pubkey::Pubkey;
 
 use crate::types::messages::IncomingSignedMessage;
 
@@ -43,21 +44,37 @@ pub struct RequestContext {
     pub log_prefix: String,
     pub market_index: u16,
     pub market_type: &'static str,
+    pub taker_authority: Pubkey,
+    pub order_uuid: String,
 }
 
 impl RequestContext {
     pub fn from_incoming_message(msg: &IncomingSignedMessage) -> Self {
         let recv_ts = unix_now_ms();
         let info = msg.order().info(&msg.taker_authority);
+        let market_index = info.order_params.market_index;
+        let market_type = match info.order_params.market_type {
+            MarketType::Perp => "perp",
+            MarketType::Spot => "spot",
+        };
+        let order_uuid = core::str::from_utf8(&info.uuid)
+            .unwrap_or("no uuid ????????")
+            .to_string();
+        let taker_authority = if msg.taker_authority != Pubkey::default() {
+            msg.taker_authority
+        } else {
+            msg.taker_pubkey
+        };
 
         Self {
-            market_index: info.order_params.market_index,
-            market_type: match info.order_params.market_type {
-                MarketType::Perp => "perp",
-                MarketType::Spot => "spot",
-            },
+            market_index,
+            market_type,
             recv_ts,
-            log_prefix: format!("[process_order {}: {recv_ts}]", msg.taker_authority),
+            log_prefix: format!(
+                "[order uuid={order_uuid} market={market_type}:{market_index} taker={taker_authority}]"
+            ),
+            taker_authority,
+            order_uuid,
         }
     }
 }
