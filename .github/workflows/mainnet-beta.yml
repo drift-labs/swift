@@ -68,4 +68,4 @@ jobs:
         run: |
           kubectl rollout restart -n $BRANCH_NAME deployment/swift-server-app
           kubectl rollout restart -n $BRANCH_NAME deployment/swift-confirmation-server-app
-          kubectl rollout restart -n $BRANCH_NAME statefulset/swift-ws-server-app
+          kubectl rollout restart -n $BRANCH_NAME deployment/swift-ws-server-app
