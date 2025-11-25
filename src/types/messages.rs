@@ -201,6 +201,7 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE: &str =
     "Error verifying signed message";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD: &str = "Order slot too old";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER: &str = "Invalid order";
+pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELISTED_MARKET: &str = "Delisted market";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT: &str =
     "Invalid base_asset_amount in tp/sl";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";

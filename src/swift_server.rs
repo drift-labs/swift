@@ -12,7 +12,8 @@ use crate::{
     types::{
         messages::{
             DepositAndPlaceRequest, IncomingSignedMessage, OrderMetadataAndMessage,
-            ProcessOrderResponse, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+            ProcessOrderResponse, PROCESS_ORDER_RESPONSE_ERROR_MSG_DELISTED_MARKET,
+            PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
@@ -45,9 +46,9 @@ use drift_rs::{
     types::{
         accounts::{HighLeverageModeConfig, User},
         errors::ErrorCode,
-        CommitmentConfig, MarketId, MarketType, OrderParams, OrderType, PositionDirection,
-        ProgramError, SdkError, SdkResult, SignedMsgTriggerOrderParams, VersionedMessage,
-        VersionedTransaction,
+        CommitmentConfig, MarketId, MarketStatus, MarketType, OrderParams, OrderType,
+        PositionDirection, ProgramError, SdkError, SdkResult, SignedMsgTriggerOrderParams,
+        VersionedMessage, VersionedTransaction,
     },
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
@@ -260,6 +261,20 @@ pub async fn process_order(
     let market = server_params
         .drift
         .try_get_perp_market_account(order_params.market_index);
+
+    if market
+        .as_ref()
+        .is_ok_and(|m| m.status == MarketStatus::Delisted)
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELISTED_MARKET,
+                error: format!("market {} delisted", order_params.market_index).into(),
+            },
+        ));
+    }
+
     if let Err(err) = validate_signed_order_params(
         &order_params,
         market.map(|m| m.amm.min_order_size).unwrap_or(0),
@@ -623,7 +638,6 @@ pub async fn health_check(
 
 pub async fn start_server() {
     // Start server
-
     dotenv().ok();
 
     let use_kafka: bool = env::var("USE_KAFKA").unwrap_or_else(|_| "false".to_string()) == "true";
