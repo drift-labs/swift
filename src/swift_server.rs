@@ -583,6 +583,22 @@ pub async fn health_check(
         true
     };
 
+    // Check if server has metadata available for all spot and perp markets
+    let market_subs_healthy = server_params.drift.state_account().is_ok_and(|s| {
+        s.number_of_spot_markets
+            == server_params
+                .drift
+                .program_data()
+                .spot_market_configs()
+                .len() as u16
+            && s.number_of_markets
+                == server_params
+                    .drift
+                    .program_data()
+                    .perp_market_configs()
+                    .len() as u16
+    });
+
     // Check if rpc is healthy
     let rpc_healthy = server_params.drift.rpc().get_health().await.is_ok();
 
@@ -591,13 +607,14 @@ pub async fn health_check(
         && user_account_fetcher_redis_health
         && redis_health
         && rpc_healthy
+        && market_subs_healthy
     {
         (axum::http::StatusCode::OK, "ok".into())
     } else {
         let msg = format!(
             "slot_sub_healthy={slot_sub_healthy} | ws_sub_healthy={ws_healthy} 
             | user_account_fetcher_healthy={user_account_fetcher_redis_health} |
-            redis_healthy={redis_health}|rpc_healthy={rpc_healthy}",
+            redis_healthy={redis_health}|rpc_healthy={rpc_healthy}|market_subs={market_subs_healthy}",
         );
         log::error!(target: "server", "Failed health check {}", &msg);
         (axum::http::StatusCode::PRECONDITION_FAILED, msg)
