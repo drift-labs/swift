@@ -264,7 +264,7 @@ pub async fn process_order(
 
     if market
         .as_ref()
-        .is_ok_and(|m| m.status == MarketStatus::Delisted)
+        .is_ok_and(|m| matches!(m.status, MarketStatus::Delisted | MarketStatus::Settlement))
     {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -459,7 +459,9 @@ pub async fn deposit_trade(
     // verify deposit ix exists and amount
     let mut has_place_ix = false;
     for ix in req.deposit_tx.message.instructions() {
-        if &ix.data[..8] == drift_idl::instructions::PlaceSignedMsgTakerOrder::DISCRIMINATOR {
+        if ix.data.len() > 8
+            && &ix.data[..8] == drift_idl::instructions::PlaceSignedMsgTakerOrder::DISCRIMINATOR
+        {
             has_place_ix = true;
         }
     }
