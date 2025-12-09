@@ -456,7 +456,7 @@ pub async fn deposit_trade(
         );
     }
 
-    // verify deposit ix exists and amount
+    // verify place order ix exists
     let mut has_place_ix = false;
     for ix in req.deposit_tx.message.instructions() {
         if ix.data.len() > 8
@@ -751,7 +751,21 @@ pub async fn start_server() {
 
     // start oracle/market subscriptions (async)
     tokio::spawn(async move {
-        let all_markets = state.drift.get_all_market_ids();
+        let mut all_markets = state.drift.get_all_market_ids();
+
+        // keep markets in settlement mode for tx simulation
+        for market in state.drift.program_data().perp_market_configs() {
+            if market.status == MarketStatus::Settlement {
+                all_markets.push(MarketId::perp(market.market_index));
+            }
+        }
+
+        for market in state.drift.program_data().spot_market_configs() {
+            if market.status == MarketStatus::Settlement {
+                all_markets.push(MarketId::spot(market.market_index));
+            }
+        }
+
         log::info!("subscribing markets: {:?}", &all_markets);
         if let Err(err) = state.drift.subscribe_markets(&all_markets).await {
             log::error!("couldn't subscribe markets: {err:?}, RPC sim disabled!");
