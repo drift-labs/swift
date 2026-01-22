@@ -59,7 +59,10 @@ where
         AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
             .map(|o| SignedOrderTypeWithLen {
                 signed_len: borsh_len,
-                order: SignedOrderType::Delegated(o),
+                order: SignedOrderType::Delegated {
+                    inner: o,
+                    raw: Some(payload.to_string()),
+                },
                 original_message,
             })
             .map_err(serde::de::Error::custom)
@@ -67,7 +70,10 @@ where
         AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
             .map(|o| SignedOrderTypeWithLen {
                 signed_len: borsh_len,
-                order: SignedOrderType::Authority(o),
+                order: SignedOrderType::Authority {
+                    inner: o,
+                    raw: Some(payload.to_string()),
+                },
                 original_message,
             })
             .map_err(serde::de::Error::custom)
@@ -98,7 +104,7 @@ pub struct IncomingSignedMessage {
 impl IncomingSignedMessage {
     /// Return the swift signed order
     pub fn order(&self) -> SignedOrderType {
-        self.message.order
+        self.message.order.clone()
     }
     /// Verify taker signature against hex encoded `message`
     pub fn verify_signature(&self) -> Result<()> {
@@ -398,7 +404,7 @@ mod tests {
             actual.signing_authority
                 == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
         );
-        if let SignedOrderType::Delegated(signed_msg) = actual.order() {
+        if let SignedOrderType::Delegated { inner, .. } = actual.order() {
             let expected = SignedMsgOrderParamsDelegateMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -427,8 +433,9 @@ mod tests {
                 max_margin_ratio: None,
                 builder_fee_tenth_bps: None,
                 builder_idx: None,
+                isolated_position_deposit: None,
             };
-            assert_eq!(signed_msg, expected);
+            assert_eq!(inner, expected);
         } else {
             assert!(false, "unexpected variant");
         }

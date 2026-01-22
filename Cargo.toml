@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.86"
 arrayvec = "0.7.6"
-anchor-lang = "0.31.0"
+anchor-lang = "0.32.1"
 aws-config = { version = "1", default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
@@ -26,7 +26,8 @@ bincode = "1"
 clap = { version = "4.0", features = ["derive"] }
 dashmap = "6.1.0"
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs.git", rev = "a39fe7c" }
+#drift-rs = { git = "https://github.com/drift-labs/drift-rs.git", rev = "35e0b11" }
+drift-rs = { path = "../drift-rs" }
 ed25519-dalek = "1.0.1"
 env_logger = "0.11"
 faster-hex = "0.10.0"

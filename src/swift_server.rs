@@ -347,7 +347,7 @@ pub async fn process_order(
         signing_authority: signing_pubkey,
         taker_authority,
         order_message: incoming_message.message.original_message.clone(),
-        deserialized_order_message: *signed_msg,
+        deserialized_order_message: signed_msg.clone(),
         order_signature: taker_signature.into(),
         ts: context.recv_ts,
         uuid,
@@ -1512,38 +1512,41 @@ fn extract_signed_message_info(
     current_slot: Slot,
 ) -> Result<(SignedMessageInfo, Option<u16>), (axum::http::StatusCode, ProcessOrderResponse)> {
     match signed_msg {
-        SignedOrderType::Delegated(x) => {
+        SignedOrderType::Delegated { inner, .. } => {
             validate_order(
-                x.stop_loss_order_params.as_ref(),
-                x.take_profit_order_params.as_ref(),
-                x.slot,
+                inner.stop_loss_order_params.as_ref(),
+                inner.take_profit_order_params.as_ref(),
+                inner.slot,
                 current_slot,
             )?;
             Ok((
                 SignedMessageInfo {
-                    taker_pubkey: x.taker_pubkey,
-                    order_params: x.signed_msg_order_params,
-                    uuid: x.uuid,
-                    slot: x.slot,
+                    taker_pubkey: inner.taker_pubkey,
+                    order_params: inner.signed_msg_order_params,
+                    uuid: inner.uuid,
+                    slot: inner.slot,
                 },
-                x.max_margin_ratio,
+                inner.max_margin_ratio,
             ))
         }
-        SignedOrderType::Authority(x) => {
+        SignedOrderType::Authority { inner, .. } => {
             validate_order(
-                x.stop_loss_order_params.as_ref(),
-                x.take_profit_order_params.as_ref(),
-                x.slot,
+                inner.stop_loss_order_params.as_ref(),
+                inner.take_profit_order_params.as_ref(),
+                inner.slot,
                 current_slot,
             )?;
             Ok((
                 SignedMessageInfo {
-                    taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
-                    order_params: x.signed_msg_order_params,
-                    uuid: x.uuid,
-                    slot: x.slot,
+                    taker_pubkey: Wallet::derive_user_account(
+                        taker_authority,
+                        inner.sub_account_id,
+                    ),
+                    order_params: inner.signed_msg_order_params,
+                    uuid: inner.uuid,
+                    slot: inner.slot,
                 },
-                x.max_margin_ratio,
+                inner.max_margin_ratio,
             ))
         }
     }
