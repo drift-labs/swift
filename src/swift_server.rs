@@ -341,25 +341,37 @@ pub async fn process_order(
         };
     }
 
-    // If fat fingered order that requires sanitization, then just send the order
-    let will_sanitize = server_params.simulate_will_auction_params_sanitize(&order_params, context);
-    let order_metadata = OrderMetadataAndMessage {
-        signing_authority: signing_pubkey,
-        taker_authority,
-        order_message: incoming_message.message.original_message.clone(),
-        deserialized_order_message: signed_msg.clone(),
-        order_signature: taker_signature.into(),
-        ts: context.recv_ts,
-        uuid,
-        will_sanitize,
-    };
+    if let Some(order_message_str) = signed_msg.raw() {
+        // If fat fingered order that requires sanitization, then just send the order
+        let will_sanitize =
+            server_params.simulate_will_auction_params_sanitize(&order_params, context);
+        let order_metadata = OrderMetadataAndMessage {
+            market_index: order_params.market_index,
+            market_type: order_params.market_type,
+            signing_authority: signing_pubkey,
+            taker_authority,
+            order_message_str: order_message_str.to_owned(),
+            order_signature: taker_signature.into(),
+            ts: context.recv_ts,
+            uuid,
+            will_sanitize,
+        };
 
-    server_params
-        .metrics
-        .current_slot_gauge
-        .set(current_slot as f64);
+        server_params
+            .metrics
+            .current_slot_gauge
+            .set(current_slot as f64);
 
-    Ok(order_metadata)
+        Ok(order_metadata)
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ProcessOrderResponse {
+                message: "missing order message str",
+                error: None,
+            },
+        ))
+    }
 }
 
 pub async fn send_heartbeat(server_params: &'static ServerParams) {
@@ -835,7 +847,7 @@ pub async fn start_server() {
             interval.tick().await;
             let message = Message::try_compile(
                 &sender.pubkey(),
-                &[instruction.clone()],
+                std::slice::from_ref(&instruction),
                 &[],
                 Hash::default(),
             )
@@ -1856,6 +1868,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1887,6 +1900,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1922,6 +1936,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1955,6 +1970,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1989,6 +2005,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
