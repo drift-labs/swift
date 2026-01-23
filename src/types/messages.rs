@@ -448,7 +448,11 @@ mod tests {
                 == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
         );
 
-        if let SignedOrderType::Authority(signed_msg) = actual.order() {
+        if let SignedOrderType::Authority {
+            inner: signed_msg,
+            raw,
+        } = actual.order()
+        {
             let expected = SignedMsgOrderParamsMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -500,13 +504,6 @@ mod tests {
         }
         .encode();
         let order_metadata = OrderMetadataAndMessage::decode(&encoded).unwrap();
-        dbg!(base64::prelude::BASE64_STANDARD.encode(
-            &order_metadata
-                .order_message
-                .try_to_vec()
-                .unwrap()
-                .as_slice()
-        ),);
         assert_eq!(order_metadata.encode(), encoded);
     }
 
@@ -530,7 +527,7 @@ mod tests {
             ..Default::default()
         };
 
-        let signed_order_message = SignedOrderType::Authority(order_params);
+        let signed_order_message = SignedOrderType::authority(order_params);
         let hex_msg = faster_hex::hex_string(signed_order_message.to_borsh().as_slice());
 
         let order_metadata_json = OrderMetadataAndMessage {
@@ -586,17 +583,16 @@ mod tests {
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
-            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
-            message: SignedOrderTypeWithLen,
+            #[serde(deserialize_with = "deser_signed_msg_type")]
+            message: SignedOrderType,
         }
 
         let json = format!(r#"{{"message":"{}"}}"#, hex);
         let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
 
-        assert_eq!(wrapper.message.signed_len, payload.len());
-
-        match wrapper.message.order {
-            SignedOrderType::Authority(m) => {
+        match wrapper.message {
+            SignedOrderType::Authority { inner: m, raw } => {
+                assert_eq!(raw, Some(hex));
                 assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
                 assert_eq!(
                     m.signed_msg_order_params.auction_start_price,
@@ -621,7 +617,7 @@ mod tests {
                 );
                 assert_eq!(m.max_margin_ratio, None);
             }
-            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+            SignedOrderType::Delegated { .. } => panic!("expected Authority variant"),
         }
     }
 
@@ -640,17 +636,16 @@ mod tests {
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
-            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
-            message: SignedOrderTypeWithLen,
+            #[serde(deserialize_with = "deser_signed_msg_type")]
+            message: SignedOrderType,
         }
 
         let json = format!(r#"{{"message":"{}"}}"#, hex);
         let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
 
-        assert_eq!(wrapper.message.signed_len, payload.len());
-
-        match wrapper.message.order {
-            SignedOrderType::Authority(m) => {
+        match wrapper.message {
+            SignedOrderType::Authority { inner: m, raw } => {
+                assert_eq!(Some(hex), raw);
                 assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
                 assert_eq!(
                     m.signed_msg_order_params.auction_start_price,
@@ -675,7 +670,7 @@ mod tests {
                 );
                 assert_eq!(m.max_margin_ratio, Some(65535));
             }
-            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+            SignedOrderType::Delegated { .. } => panic!("expected Authority variant"),
         }
     }
 }

@@ -1850,7 +1850,7 @@ mod tests {
         let current_slot = 1000;
 
         // Test successful case
-        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
             taker_pubkey: Pubkey::new_unique(),
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1879,7 +1879,7 @@ mod tests {
         }));
 
         // Test invalid order amount case
-        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
             taker_pubkey: Pubkey::new_unique(),
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1918,7 +1918,7 @@ mod tests {
         let sub_account_id = 1;
 
         // Test successful case
-        let authority_msg = SignedOrderType::Authority(SignedMsgOrderParamsMessage {
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
             sub_account_id,
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1949,7 +1949,7 @@ mod tests {
         }));
 
         // Test invalid order amount case
-        let authority_msg = SignedOrderType::Authority(SignedMsgOrderParamsMessage {
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
             sub_account_id,
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1987,7 +1987,7 @@ mod tests {
         let current_slot = 1000;
 
         // Test slot too old
-        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
             taker_pubkey: Pubkey::new_unique(),
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -2031,8 +2031,8 @@ mod tests {
         .await
         .unwrap();
 
-        let mut taker_pubkey = Keypair::new().pubkey();
-        let mut taker_pubkey2 = Keypair::new().pubkey();
+        let taker_pubkey = Keypair::new().pubkey();
+        let taker_pubkey2 = Keypair::new().pubkey();
         let delegate_pubkey = Keypair::new().pubkey();
         let users: HashMap<Pubkey, User> = [
             (
