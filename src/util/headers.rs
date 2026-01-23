@@ -22,7 +22,7 @@ impl Header for XSwiftClientConsumer {
         let value = values.next().ok_or_else(headers::Error::invalid)?;
 
         Ok(XSwiftClientConsumer {
-            is_app_order: value.to_str().is_ok_and(|x| x == "drift-ui"),
+            is_app_order: value.to_str().is_ok_and(|x| x.starts_with("drift-ui")),
         })
     }
 
@@ -39,6 +39,7 @@ impl Header for XSwiftClientConsumer {
         let value = HeaderValue::from_static(s);
         values.extend(std::iter::once(value));
     }
+
     fn name() -> &'static HeaderName {
         &X_SWIFT_CLIENT_CONSUMER
     }

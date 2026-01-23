@@ -341,25 +341,37 @@ pub async fn process_order(
         };
     }
 
-    // If fat fingered order that requires sanitization, then just send the order
-    let will_sanitize = server_params.simulate_will_auction_params_sanitize(&order_params, context);
-    let order_metadata = OrderMetadataAndMessage {
-        signing_authority: signing_pubkey,
-        taker_authority,
-        order_message: incoming_message.message.original_message.clone(),
-        deserialized_order_message: *signed_msg,
-        order_signature: taker_signature.into(),
-        ts: context.recv_ts,
-        uuid,
-        will_sanitize,
-    };
+    if let Some(order_message_str) = signed_msg.raw() {
+        // If fat fingered order that requires sanitization, then just send the order
+        let will_sanitize =
+            server_params.simulate_will_auction_params_sanitize(&order_params, context);
+        let order_metadata = OrderMetadataAndMessage {
+            market_index: order_params.market_index,
+            market_type: order_params.market_type,
+            signing_authority: signing_pubkey,
+            taker_authority,
+            order_message_str: order_message_str.to_owned(),
+            order_signature: taker_signature.into(),
+            ts: context.recv_ts,
+            uuid,
+            will_sanitize,
+        };
 
-    server_params
-        .metrics
-        .current_slot_gauge
-        .set(current_slot as f64);
+        server_params
+            .metrics
+            .current_slot_gauge
+            .set(current_slot as f64);
 
-    Ok(order_metadata)
+        Ok(order_metadata)
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ProcessOrderResponse {
+                message: "missing order message str",
+                error: None,
+            },
+        ))
+    }
 }
 
 pub async fn send_heartbeat(server_params: &'static ServerParams) {
@@ -835,7 +847,7 @@ pub async fn start_server() {
             interval.tick().await;
             let message = Message::try_compile(
                 &sender.pubkey(),
-                &[instruction.clone()],
+                std::slice::from_ref(&instruction),
                 &[],
                 Hash::default(),
             )
@@ -1512,38 +1524,41 @@ fn extract_signed_message_info(
     current_slot: Slot,
 ) -> Result<(SignedMessageInfo, Option<u16>), (axum::http::StatusCode, ProcessOrderResponse)> {
     match signed_msg {
-        SignedOrderType::Delegated(x) => {
+        SignedOrderType::Delegated { inner, .. } => {
             validate_order(
-                x.stop_loss_order_params.as_ref(),
-                x.take_profit_order_params.as_ref(),
-                x.slot,
+                inner.stop_loss_order_params.as_ref(),
+                inner.take_profit_order_params.as_ref(),
+                inner.slot,
                 current_slot,
             )?;
             Ok((
                 SignedMessageInfo {
-                    taker_pubkey: x.taker_pubkey,
-                    order_params: x.signed_msg_order_params,
-                    uuid: x.uuid,
-                    slot: x.slot,
+                    taker_pubkey: inner.taker_pubkey,
+                    order_params: inner.signed_msg_order_params,
+                    uuid: inner.uuid,
+                    slot: inner.slot,
                 },
-                x.max_margin_ratio,
+                inner.max_margin_ratio,
             ))
         }
-        SignedOrderType::Authority(x) => {
+        SignedOrderType::Authority { inner, .. } => {
             validate_order(
-                x.stop_loss_order_params.as_ref(),
-                x.take_profit_order_params.as_ref(),
-                x.slot,
+                inner.stop_loss_order_params.as_ref(),
+                inner.take_profit_order_params.as_ref(),
+                inner.slot,
                 current_slot,
             )?;
             Ok((
                 SignedMessageInfo {
-                    taker_pubkey: Wallet::derive_user_account(taker_authority, x.sub_account_id),
-                    order_params: x.signed_msg_order_params,
-                    uuid: x.uuid,
-                    slot: x.slot,
+                    taker_pubkey: Wallet::derive_user_account(
+                        taker_authority,
+                        inner.sub_account_id,
+                    ),
+                    order_params: inner.signed_msg_order_params,
+                    uuid: inner.uuid,
+                    slot: inner.slot,
                 },
-                x.max_margin_ratio,
+                inner.max_margin_ratio,
             ))
         }
     }
@@ -1835,7 +1850,7 @@ mod tests {
         let current_slot = 1000;
 
         // Test successful case
-        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
             taker_pubkey: Pubkey::new_unique(),
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1853,6 +1868,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1863,7 +1879,7 @@ mod tests {
         }));
 
         // Test invalid order amount case
-        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
             taker_pubkey: Pubkey::new_unique(),
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1884,6 +1900,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -1901,7 +1918,7 @@ mod tests {
         let sub_account_id = 1;
 
         // Test successful case
-        let authority_msg = SignedOrderType::Authority(SignedMsgOrderParamsMessage {
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
             sub_account_id,
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1919,6 +1936,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1931,7 +1949,7 @@ mod tests {
         }));
 
         // Test invalid order amount case
-        let authority_msg = SignedOrderType::Authority(SignedMsgOrderParamsMessage {
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
             sub_account_id,
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1952,6 +1970,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
@@ -1968,7 +1987,7 @@ mod tests {
         let current_slot = 1000;
 
         // Test slot too old
-        let delegated_msg = SignedOrderType::Delegated(SignedMsgOrderParamsDelegateMessage {
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
             taker_pubkey: Pubkey::new_unique(),
             signed_msg_order_params: OrderParams {
                 market_index: 0,
@@ -1986,6 +2005,7 @@ mod tests {
             max_margin_ratio: None,
             builder_fee_tenth_bps: None,
             builder_idx: None,
+            isolated_position_deposit: None,
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
@@ -2011,8 +2031,8 @@ mod tests {
         .await
         .unwrap();
 
-        let mut taker_pubkey = Keypair::new().pubkey();
-        let mut taker_pubkey2 = Keypair::new().pubkey();
+        let taker_pubkey = Keypair::new().pubkey();
+        let taker_pubkey2 = Keypair::new().pubkey();
         let delegate_pubkey = Keypair::new().pubkey();
         let users: HashMap<Pubkey, User> = [
             (
