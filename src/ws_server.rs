@@ -118,11 +118,6 @@ pub struct ServerParams {
     pub metrics: WsServerMetrics,
 }
 
-#[derive(serde::Serialize)]
-pub struct TestMessage {
-    message: String,
-}
-
 impl Challenge {
     /// Try to authenticate
     ///

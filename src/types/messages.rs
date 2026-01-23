@@ -12,7 +12,7 @@ use drift_rs::{
     types::{MarketType, SignedMsgOrderParamsDelegateMessage},
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
-use serde::de::{value::StrDeserializer, IntoDeserializer};
+use serde::de::value::StrDeserializer;
 use serde_json::json;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 
@@ -88,11 +88,10 @@ impl OrderMetadataAndMessage {
     /// DEV: this performs a deserialization of the raw payload
     pub fn order_info(&self) -> SignedMessageInfo {
         // expect: message already succesfully deserialized by this point
-        deser_signed_msg_type::<StrDeserializer<serde::de::value::Error>>(
-            self.order_message_str.as_str().into_deserializer(),
-        )
-        .expect("deserializes")
-        .info(&self.taker_authority)
+        let deser =
+            StrDeserializer::<serde::de::value::Error>::new(self.order_message_str.as_str());
+        let res = deser_signed_msg_type(deser);
+        res.unwrap().info(&self.taker_authority)
     }
     /// Borsh serialize and
     /// base64 encode the message
@@ -505,6 +504,7 @@ mod tests {
         .encode();
         let order_metadata = OrderMetadataAndMessage::decode(&encoded).unwrap();
         assert_eq!(order_metadata.encode(), encoded);
+        dbg!(&order_metadata.order_info().order_params);
     }
 
     #[test]
