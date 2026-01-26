@@ -239,6 +239,7 @@ pub async fn process_order(
             uuid,
         },
         max_margin_ratio,
+        is_isolated_deposit,
     ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
 
     log::info!(
@@ -301,6 +302,7 @@ pub async fn process_order(
                 delegate_signer,
                 current_slot,
                 max_margin_ratio,
+                is_isolated_deposit,
                 context,
             )
             .await
@@ -443,7 +445,7 @@ pub async fn deposit_trade(
         &req.swift_order.taker_authority,
         current_slot,
     ) {
-        Ok((_info, max_margin_ratio)) => max_margin_ratio,
+        Ok((_info, max_margin_ratio, _is_isolated)) => max_margin_ratio,
         Err((_status, err)) => return (StatusCode::BAD_REQUEST, Json(err)),
     };
 
@@ -1058,6 +1060,7 @@ impl ServerParams {
         delegate_signer: Option<&Pubkey>,
         slot: Slot,
         max_margin_ratio: Option<u16>,
+        is_isolated_deposit: bool,
         context: &RequestContext,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
@@ -1189,7 +1192,10 @@ impl ServerParams {
                     match err.to_anchor_error_code() {
                         Some(code) => {
                             // insufficient collateral is prone to precision errors, allow the order through with some leniency
-                            if code == ProgramError::Drift(ErrorCode::InsufficientCollateral) {
+                            // EXCEPT for isolated deposits, where we want to return the error to the client
+                            if code == ProgramError::Drift(ErrorCode::InsufficientCollateral)
+                                && !is_isolated_deposit
+                            {
                                 if let Some(ref logs) = res.value.logs {
                                     if let Some(collateral_ratio) = extract_collateral_ratio(logs) {
                                         if collateral_ratio <= COLLATERAL_BUFFER {
@@ -1518,11 +1524,24 @@ fn validate_order(
     Ok(())
 }
 
+fn is_isolated_deposit(signed_msg: &SignedOrderType) -> bool {
+    match signed_msg {
+        SignedOrderType::Delegated { inner, .. } => inner
+            .isolated_position_deposit
+            .is_some_and(|amount| amount > 0),
+        SignedOrderType::Authority { inner, .. } => inner
+            .isolated_position_deposit
+            .is_some_and(|amount| amount > 0),
+    }
+}
+
 fn extract_signed_message_info(
     signed_msg: &SignedOrderType,
     taker_authority: &Pubkey,
     current_slot: Slot,
-) -> Result<(SignedMessageInfo, Option<u16>), (axum::http::StatusCode, ProcessOrderResponse)> {
+) -> Result<(SignedMessageInfo, Option<u16>, bool), (axum::http::StatusCode, ProcessOrderResponse)>
+{
+    let is_isolated = is_isolated_deposit(signed_msg);
     match signed_msg {
         SignedOrderType::Delegated { inner, .. } => {
             validate_order(
@@ -1539,6 +1558,7 @@ fn extract_signed_message_info(
                     slot: inner.slot,
                 },
                 inner.max_margin_ratio,
+                is_isolated,
             ))
         }
         SignedOrderType::Authority { inner, .. } => {
@@ -1559,6 +1579,7 @@ fn extract_signed_message_info(
                     slot: inner.slot,
                 },
                 inner.max_margin_ratio,
+                is_isolated,
             ))
         }
     }
@@ -1872,7 +1893,7 @@ mod tests {
         });
 
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(info, _)| {
+        assert!(result.is_ok_and(|(info, _, _)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
@@ -1940,7 +1961,7 @@ mod tests {
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(info, _margin_ratio)| {
+        assert!(result.is_ok_and(|(info, _margin_ratio, _is_isolated)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
@@ -2017,6 +2038,137 @@ mod tests {
                     error: Some(PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD.into())
                 }
             )));
+    }
+
+    #[test]
+    fn test_is_isolated_deposit() {
+        let taker_authority = Pubkey::new_unique();
+        let current_slot = 1000;
+
+        // Test delegated order with no isolated deposit
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
+            taker_pubkey: Pubkey::new_unique(),
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+            max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
+            isolated_position_deposit: None,
+        });
+        assert!(!is_isolated_deposit(&delegated_msg));
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+
+        // Test delegated order with isolated deposit of 0 (should be false)
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
+            taker_pubkey: Pubkey::new_unique(),
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+            max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
+            isolated_position_deposit: Some(0),
+        });
+        assert!(!is_isolated_deposit(&delegated_msg));
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+
+        // Test delegated order with isolated deposit > 0
+        let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
+            taker_pubkey: Pubkey::new_unique(),
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+            max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
+            isolated_position_deposit: Some(100_000_000), // 0.1 SOL
+        });
+        assert!(is_isolated_deposit(&delegated_msg));
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated));
+
+        // Test authority order with no isolated deposit
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
+            sub_account_id: 0,
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+            max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
+            isolated_position_deposit: None,
+        });
+        assert!(!is_isolated_deposit(&authority_msg));
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+
+        // Test authority order with isolated deposit > 0
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
+            sub_account_id: 0,
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: [1; 8],
+            slot: current_slot,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+            max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
+            isolated_position_deposit: Some(50_000_000), // 0.05 SOL
+        });
+        assert!(is_isolated_deposit(&authority_msg));
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated));
     }
 
     #[tokio::test]
@@ -2096,6 +2248,7 @@ mod tests {
                 Some(&delegate_pubkey),
                 1_000,
                 None,
+                false,
                 &context_primary,
             )
             .await;
@@ -2121,6 +2274,7 @@ mod tests {
                 Some(&delegate_pubkey),
                 1_000,
                 None,
+                false,
                 &context_secondary,
             )
             .await;
