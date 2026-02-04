@@ -42,7 +42,7 @@ use drift_rs::{
     drift_idl,
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
-    swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
+    swift_order_subscriber::{SignedMessageInfo, SignedOrderInfo, SignedOrderType},
     types::{
         accounts::{HighLeverageModeConfig, User},
         errors::ErrorCode,
@@ -164,18 +164,10 @@ pub async fn process_order(
     skip_sim: bool,
     context: &RequestContext,
 ) -> Result<OrderMetadataAndMessage, (http::StatusCode, ProcessOrderResponse)> {
-    let IncomingSignedMessage {
-        taker_pubkey,
-        signature: taker_signature,
-        message: _,
-        signing_authority,
-        taker_authority,
-    } = incoming_message;
-
-    let taker_authority = if taker_authority == Pubkey::default() {
-        taker_pubkey
+    let taker_authority = if incoming_message.taker_authority == Pubkey::default() {
+        incoming_message.taker_pubkey
     } else {
-        taker_authority
+        incoming_message.taker_authority
     };
 
     if server_params.farmer_pubkeys.contains(&taker_authority) {
@@ -194,10 +186,10 @@ pub async fn process_order(
 
     server_params.metrics.taker_orders_counter.inc();
 
-    let signing_pubkey = if signing_authority == Pubkey::default() {
+    let signing_pubkey = if incoming_message.signing_authority == Pubkey::default() {
         taker_authority
     } else {
-        signing_authority
+        incoming_message.signing_authority
     };
 
     log::trace!(
@@ -231,20 +223,15 @@ pub async fn process_order(
     };
 
     let current_slot = server_params.slot_subscriber.current_slot();
-    let (
-        SignedMessageInfo {
-            slot: taker_slot,
-            order_params,
-            taker_pubkey,
-            uuid,
-        },
-        max_margin_ratio,
-        is_isolated_deposit,
-    ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
-
+    let SignedMessageInfo {
+        ref order_params,
+        slot: taker_slot,
+        taker_pubkey,
+        uuid,
+    } = incoming_message.order().info(&taker_authority);
     log::info!(
         target: "server",
-        "{} signer={} taker_subaccount={} slot={} side={:?} base={} price={} order_type={:?} reduce_only={} post_only={:?} delegate_signer={:?}",
+        "{} signer={} taker_subaccount={} slot={} side={:?} base={} price={} order_type={:?} reduce_only={} post_only={:?} HLM={:?}, delegate_signer={:?}",
         context.log_prefix,
         signing_pubkey,
         taker_pubkey,
@@ -255,6 +242,7 @@ pub async fn process_order(
         order_params.order_type,
         order_params.reduce_only,
         order_params.post_only,
+        order_params.high_leverage_mode(),
         delegate_signer,
     );
 
@@ -276,35 +264,9 @@ pub async fn process_order(
         ));
     }
 
-    if let Err(err) = validate_signed_order_params(
-        &order_params,
-        market.map(|m| m.amm.min_order_size).unwrap_or(0),
-    ) {
-        log::warn!(
-            target: "server",
-            "{}: Order did not validate: {err:?}, {order_params:?}",
-            context.log_prefix
-        );
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            ProcessOrderResponse {
-                message: PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER,
-                error: Some(err.to_string()),
-            },
-        ));
-    }
-
     if !skip_sim {
         match server_params
-            .simulate_taker_order_rpc(
-                &taker_pubkey,
-                &order_params,
-                delegate_signer,
-                current_slot,
-                max_margin_ratio,
-                is_isolated_deposit,
-                context,
-            )
+            .simulate_taker_order_rpc(&taker_pubkey, &incoming_message, current_slot, context)
             .await
         {
             Ok(sim_res) => {
@@ -353,7 +315,7 @@ pub async fn process_order(
             signing_authority: signing_pubkey,
             taker_authority,
             order_message_str: order_message_str.to_owned(),
-            order_signature: taker_signature.into(),
+            order_signature: incoming_message.signature.into(),
             ts: context.recv_ts,
             uuid,
             will_sanitize,
@@ -445,7 +407,7 @@ pub async fn deposit_trade(
         &req.swift_order.taker_authority,
         current_slot,
     ) {
-        Ok((_info, max_margin_ratio, _is_isolated)) => max_margin_ratio,
+        Ok((_info, max_margin_ratio, _isolated_position_deposit)) => max_margin_ratio,
         Err((_status, err)) => return (StatusCode::BAD_REQUEST, Json(err)),
     };
 
@@ -469,8 +431,6 @@ pub async fn deposit_trade(
             }),
         );
     }
-
-    // verify place order ix exists
     let mut has_place_ix = false;
     for ix in req.deposit_tx.message.instructions() {
         if &ix.data[..8] == drift_idl::instructions::PlaceSignedMsgTakerOrder::DISCRIMINATOR {
@@ -1056,24 +1016,20 @@ impl ServerParams {
     async fn simulate_taker_order_rpc(
         &self,
         taker_subaccount_pubkey: &Pubkey,
-        taker_order_params: &OrderParams,
-        delegate_signer: Option<&Pubkey>,
+        message: &IncomingSignedMessage,
         slot: Slot,
-        max_margin_ratio: Option<u16>,
-        is_isolated_deposit: bool,
         context: &RequestContext,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
-
         let t0 = SystemTime::now();
 
-        if let Some(delegate) = delegate_signer {
-            log::debug!(
-                target: "sim",
-                "{}: delegate signer for sim: {delegate}",
-                context.log_prefix
-            );
-        }
+        // if let Some(delegate) = delegate_signer {
+        //     log::debug!(
+        //         target: "sim",
+        //         "{}: delegate signer for sim: {delegate}",
+        //         context.log_prefix
+        //     );
+        // }
 
         let user_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
@@ -1093,7 +1049,7 @@ impl ServerParams {
         }
 
         let user_result = user_with_timeout.unwrap();
-        let mut user = user_result.map_err(|err| {
+        let user = user_result.map_err(|err| {
             (
                 axum::http::StatusCode::NOT_FOUND,
                 format!("unable to fetch user: {err:?}"),
@@ -1109,20 +1065,10 @@ impl ServerParams {
         //     ));
         // }
 
-        log::info!(
-            target: "server",
-            "{:?}: max_leverage={},margin_mode={:?},activate_hlm={}",
-            user.authority,
-            taker_order_params.base_asset_amount == u64::MAX,
-            user.margin_mode,
-            taker_order_params.high_leverage_mode(),
-        );
-
         if self.is_rpc_sim_disabled() {
             return Ok(sim_result);
         }
 
-        let t1 = SystemTime::now();
         log::info!(
             target: "sim",
             "{}: fetch user: {:?}",
@@ -1130,39 +1076,50 @@ impl ServerParams {
             SystemTime::now().duration_since(t0)
         );
 
-        if self.simulate_taker_order_local(taker_order_params, &mut user, max_margin_ratio, context)
-        {
-            sim_result = SimulationStatus::Success;
-            log::info!(
-                target: "sim",
-                "{}: simulate tx (local): {:?}",
-                context.log_prefix,
-                SystemTime::now().duration_since(t1)
-            );
-            return Ok(sim_result);
-        }
+        // disable local sim
+        // if self.simulate_taker_order_local(
+        //     taker_order_params,
+        //     &mut user,
+        //     max_margin_ratio,
+        //     context,
+        // ) {
+        //     sim_result = SimulationStatus::Success;
+        //     log::info!(
+        //         target: "sim",
+        //         "{}: simulate tx (local): {:?}",
+        //         context.log_prefix,
+        //         SystemTime::now().duration_since(t1)
+        //     );
+        //     return Ok(sim_result);
+        // }
 
         // fallback to network sim
-        let mut tx = TransactionBuilder::new(
+        let tx_message = TransactionBuilder::new(
             self.drift.program_data(),
             *taker_subaccount_pubkey,
-            std::borrow::Cow::Owned(user),
+            std::borrow::Cow::Borrowed(&user),
             false,
         )
-        .with_priority_fee(5_000, Some(1_400_000));
-        if let Some(margin_ratio) = max_margin_ratio {
-            tx = tx.update_user_perp_position_custom_margin_ratio(
-                taker_order_params.market_index,
-                margin_ratio,
-            );
-        }
-        let message = tx.place_orders(vec![*taker_order_params]).build();
+        .with_priority_fee(5_000, Some(1_400_000))
+        .place_swift_order(
+            &SignedOrderInfo::new(
+                context.order_uuid.clone(),
+                message.taker_authority,
+                message.signing_authority,
+                message.order(),
+                // ed25519 sig -> solana sdk sig
+                message.signature.to_bytes().into(),
+                None,
+            ),
+            &user,
+        )
+        .build();
 
         let simulate_result_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
             self.drift.rpc().simulate_transaction_with_config(
                 &VersionedTransaction {
-                    message,
+                    message: tx_message,
                     // must provide a signature for the RPC call to work
                     signatures: vec![Signature::new_unique()],
                 },
@@ -1191,10 +1148,11 @@ impl ServerParams {
                     }));
                     match err.to_anchor_error_code() {
                         Some(code) => {
+                            let has_isolated_deposit = is_isolated_deposit(&message.order());
                             // insufficient collateral is prone to precision errors, allow the order through with some leniency
                             // EXCEPT for isolated deposits, where we want to return the error to the client
                             if code == ProgramError::Drift(ErrorCode::InsufficientCollateral)
-                                && !is_isolated_deposit
+                                && !has_isolated_deposit
                             {
                                 if let Some(ref logs) = res.value.logs {
                                     if let Some(collateral_ratio) = extract_collateral_ratio(logs) {
@@ -1208,7 +1166,7 @@ impl ServerParams {
                                                 target: "sim",
                                                 "{}: simulate tx (rpc): {:?}",
                                                 context.log_prefix,
-                                                SystemTime::now().duration_since(t1)
+                                                SystemTime::now().duration_since(t0)
                                             );
                                             return Ok(SimulationStatus::SuccessCollateralBuffer);
                                         }
@@ -1219,7 +1177,7 @@ impl ServerParams {
                                         &self.drift,
                                         taker_subaccount_pubkey,
                                         user,
-                                        taker_order_params,
+                                        &message.order().info(&Default::default()).order_params,
                                         res.context.slot,
                                         context,
                                     );
@@ -1242,7 +1200,7 @@ impl ServerParams {
                         target: "sim",
                         "{}: simulate tx (rpc): {:?}",
                         context.log_prefix,
-                        SystemTime::now().duration_since(t1)
+                        SystemTime::now().duration_since(t0)
                     );
                     sim_result = SimulationStatus::SuccessRpc;
                     Ok(sim_result)
@@ -1539,9 +1497,10 @@ fn extract_signed_message_info(
     signed_msg: &SignedOrderType,
     taker_authority: &Pubkey,
     current_slot: Slot,
-) -> Result<(SignedMessageInfo, Option<u16>, bool), (axum::http::StatusCode, ProcessOrderResponse)>
-{
-    let is_isolated = is_isolated_deposit(signed_msg);
+) -> Result<
+    (SignedMessageInfo, Option<u16>, Option<u64>),
+    (axum::http::StatusCode, ProcessOrderResponse),
+> {
     match signed_msg {
         SignedOrderType::Delegated { inner, .. } => {
             validate_order(
@@ -1558,7 +1517,7 @@ fn extract_signed_message_info(
                     slot: inner.slot,
                 },
                 inner.max_margin_ratio,
-                is_isolated,
+                inner.isolated_position_deposit,
             ))
         }
         SignedOrderType::Authority { inner, .. } => {
@@ -1579,7 +1538,7 @@ fn extract_signed_message_info(
                     slot: inner.slot,
                 },
                 inner.max_margin_ratio,
-                is_isolated,
+                inner.isolated_position_deposit,
             ))
         }
     }
@@ -1961,7 +1920,7 @@ mod tests {
         });
 
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(info, _margin_ratio, _is_isolated)| {
+        assert!(result.is_ok_and(|(info, _margin_ratio, _iso_deposit)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
                 && info.order_params.order_type == OrderType::Market
@@ -2068,7 +2027,7 @@ mod tests {
         });
         assert!(!is_isolated_deposit(&delegated_msg));
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test delegated order with isolated deposit of 0 (should be false)
         let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
@@ -2093,7 +2052,7 @@ mod tests {
         });
         assert!(!is_isolated_deposit(&delegated_msg));
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_some()));
 
         // Test delegated order with isolated deposit > 0
         let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
@@ -2118,7 +2077,7 @@ mod tests {
         });
         assert!(is_isolated_deposit(&delegated_msg));
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated == Some(100_000_000)));
 
         // Test authority order with no isolated deposit
         let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
@@ -2143,7 +2102,7 @@ mod tests {
         });
         assert!(!is_isolated_deposit(&authority_msg));
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test authority order with isolated deposit > 0
         let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
@@ -2168,7 +2127,7 @@ mod tests {
         });
         assert!(is_isolated_deposit(&authority_msg));
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated == Some(50_000_000)));
     }
 
     #[tokio::test]
@@ -2183,14 +2142,15 @@ mod tests {
         .await
         .unwrap();
 
-        let taker_pubkey = Keypair::new().pubkey();
-        let taker_pubkey2 = Keypair::new().pubkey();
+        let taker_authority = solana_sdk::pubkey!("FetTyW8xAYfd33x4GMHoE7hTuEdWLj1fNnhJuyVMUGGa");
+        let taker_pubkey = solana_sdk::pubkey!("FetTyW8xAYfd33x4GMHoE7hTuEdWLj1fNnhJuyVMUGGa");
+        let taker_pubkey2 = solana_sdk::pubkey!("C13FZykQfLXKuMAMh2iuG7JxhQqd8otujNRAgVETU6id");
         let delegate_pubkey = Keypair::new().pubkey();
         let users: HashMap<Pubkey, User> = [
             (
                 taker_pubkey,
                 User {
-                    authority: taker_pubkey,
+                    authority: taker_authority,
                     delegate: Pubkey::default(),
                     ..Default::default()
                 },
@@ -2198,7 +2158,7 @@ mod tests {
             (
                 taker_pubkey2,
                 User {
-                    authority: taker_pubkey2,
+                    authority: taker_authority,
                     delegate: delegate_pubkey,
                     ..Default::default()
                 },
@@ -2206,8 +2166,8 @@ mod tests {
         ]
         .into();
 
-        dbg!(users.contains_key(&taker_pubkey));
-        dbg!(users.contains_key(&taker_pubkey2));
+        dbg!(users.get(&taker_pubkey));
+        dbg!(users.get(&taker_pubkey2));
 
         let server_params = ServerParams {
             slot_subscriber: Arc::new(SuperSlotSubscriber::new(vec![], drift.rpc())),
@@ -2231,31 +2191,35 @@ mod tests {
             ..Default::default()
         };
 
+        let incoming_message = IncomingSignedMessage {
+            taker_pubkey,
+            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64])
+                .expect("test dummy signature"),
+            message: SignedOrderType::authority(SignedMsgOrderParamsMessage {
+                signed_msg_order_params: order_params.clone(),
+                ..Default::default()
+            }),
+            signing_authority: Pubkey::default(),
+            taker_authority,
+        };
+
         // Test
         let context_primary = RequestContext {
             recv_ts: unix_now_ms(),
             log_prefix: format!("[test-order {}]", taker_pubkey),
             market_index: order_params.market_index,
             market_type: "perp",
-            taker_authority: taker_pubkey,
+            taker_authority,
             order_uuid: "TESTORD0".into(),
         };
 
         let result = server_params
-            .simulate_taker_order_rpc(
-                &taker_pubkey,
-                &order_params,
-                Some(&delegate_pubkey),
-                1_000,
-                None,
-                false,
-                &context_primary,
-            )
+            .simulate_taker_order_rpc(&taker_pubkey, &incoming_message, 1_000, &context_primary)
             .await;
         assert!(result.is_err_and(|(status, msg, _)| {
             dbg!(&msg);
             status == axum::http::StatusCode::BAD_REQUEST
-                && msg.contains("signer is not configured delegate")
+                && msg.contains("invalid order. error code: Other")
         }));
 
         let context_secondary = RequestContext {
@@ -2263,26 +2227,36 @@ mod tests {
             log_prefix: format!("[test-order {}]", taker_pubkey2),
             market_index: order_params.market_index,
             market_type: "perp",
-            taker_authority: taker_pubkey2,
+            taker_authority,
             order_uuid: "TESTORD1".into(),
+        };
+
+        let incoming_message2 = IncomingSignedMessage {
+            taker_pubkey: taker_pubkey2,
+            signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64])
+                .expect("test dummy signature"),
+            message: SignedOrderType::authority(SignedMsgOrderParamsMessage {
+                signed_msg_order_params: order_params.clone(),
+                isolated_position_deposit: Some(10000),
+                ..Default::default()
+            }),
+            signing_authority: Pubkey::default(),
+            taker_authority: taker_pubkey2,
         };
 
         let result = server_params
             .simulate_taker_order_rpc(
                 &taker_pubkey2,
-                &order_params,
-                Some(&delegate_pubkey),
+                &incoming_message2,
                 1_000,
-                None,
-                false,
                 &context_secondary,
             )
             .await;
-        // it fails later at remote sim since the account is not a real drift account
+
         assert!(result.is_err_and(|(status, msg, _)| {
             dbg!(&msg);
             status == axum::http::StatusCode::BAD_REQUEST
-                && msg.contains("invalid order: AccountNotFound")
+                && msg.contains("invalid order. error code: Other")
         }));
     }
 }
