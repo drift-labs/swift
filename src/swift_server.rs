@@ -239,7 +239,7 @@ pub async fn process_order(
             uuid,
         },
         max_margin_ratio,
-        is_isolated_deposit,
+        isolated_position_deposit,
     ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
 
     log::info!(
@@ -302,7 +302,7 @@ pub async fn process_order(
                 delegate_signer,
                 current_slot,
                 max_margin_ratio,
-                is_isolated_deposit,
+                isolated_position_deposit,
                 context,
             )
             .await
@@ -1062,7 +1062,7 @@ impl ServerParams {
         delegate_signer: Option<&Pubkey>,
         slot: Slot,
         max_margin_ratio: Option<u16>,
-        is_isolated_deposit: bool,
+        isolated_deposit: Option<u64>,
         context: &RequestContext,
     ) -> Result<SimulationStatus, (axum::http::StatusCode, String, Option<Vec<String>>)> {
         let mut sim_result = SimulationStatus::Disabled;
@@ -1132,7 +1132,14 @@ impl ServerParams {
             SystemTime::now().duration_since(t0)
         );
 
-        if self.simulate_taker_order_local(taker_order_params, &mut user, max_margin_ratio, context)
+        // TODO: isolated deposits need changes for local simming
+        if isolated_deposit.is_none()
+            && self.simulate_taker_order_local(
+                taker_order_params,
+                &mut user,
+                max_margin_ratio,
+                context,
+            )
         {
             sim_result = SimulationStatus::Success;
             log::info!(
@@ -1156,6 +1163,12 @@ impl ServerParams {
             tx = tx.update_user_perp_position_custom_margin_ratio(
                 taker_order_params.market_index,
                 margin_ratio,
+            );
+        }
+        if let Some(amount) = isolated_deposit {
+            tx = tx.transfer_isolated_perp_position_deposit(
+                amount as i64,
+                taker_order_params.market_index,
             );
         }
         let message = tx.place_orders(vec![*taker_order_params]).build();
@@ -1196,7 +1209,7 @@ impl ServerParams {
                             // insufficient collateral is prone to precision errors, allow the order through with some leniency
                             // EXCEPT for isolated deposits, where we want to return the error to the client
                             if code == ProgramError::Drift(ErrorCode::InsufficientCollateral)
-                                && !is_isolated_deposit
+                                && isolated_deposit.is_none()
                             {
                                 if let Some(ref logs) = res.value.logs {
                                     if let Some(collateral_ratio) = extract_collateral_ratio(logs) {
@@ -1526,24 +1539,14 @@ fn validate_order(
     Ok(())
 }
 
-fn is_isolated_deposit(signed_msg: &SignedOrderType) -> bool {
-    match signed_msg {
-        SignedOrderType::Delegated { inner, .. } => inner
-            .isolated_position_deposit
-            .is_some_and(|amount| amount > 0),
-        SignedOrderType::Authority { inner, .. } => inner
-            .isolated_position_deposit
-            .is_some_and(|amount| amount > 0),
-    }
-}
-
 fn extract_signed_message_info(
     signed_msg: &SignedOrderType,
     taker_authority: &Pubkey,
     current_slot: Slot,
-) -> Result<(SignedMessageInfo, Option<u16>, bool), (axum::http::StatusCode, ProcessOrderResponse)>
-{
-    let is_isolated = is_isolated_deposit(signed_msg);
+) -> Result<
+    (SignedMessageInfo, Option<u16>, Option<u64>),
+    (axum::http::StatusCode, ProcessOrderResponse),
+> {
     match signed_msg {
         SignedOrderType::Delegated { inner, .. } => {
             validate_order(
@@ -1560,7 +1563,7 @@ fn extract_signed_message_info(
                     slot: inner.slot,
                 },
                 inner.max_margin_ratio,
-                is_isolated,
+                inner.isolated_position_deposit,
             ))
         }
         SignedOrderType::Authority { inner, .. } => {
@@ -1581,7 +1584,7 @@ fn extract_signed_message_info(
                     slot: inner.slot,
                 },
                 inner.max_margin_ratio,
-                is_isolated,
+                inner.isolated_position_deposit,
             ))
         }
     }
@@ -2070,7 +2073,7 @@ mod tests {
         });
         assert!(!is_isolated_deposit(&delegated_msg));
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test delegated order with isolated deposit of 0 (should be false)
         let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
@@ -2095,7 +2098,7 @@ mod tests {
         });
         assert!(!is_isolated_deposit(&delegated_msg));
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test delegated order with isolated deposit > 0
         let delegated_msg = SignedOrderType::delegated(SignedMsgOrderParamsDelegateMessage {
@@ -2120,7 +2123,7 @@ mod tests {
         });
         assert!(is_isolated_deposit(&delegated_msg));
         let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_some()));
 
         // Test authority order with no isolated deposit
         let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
@@ -2145,7 +2148,7 @@ mod tests {
         });
         assert!(!is_isolated_deposit(&authority_msg));
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| !is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test authority order with isolated deposit > 0
         let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
@@ -2170,7 +2173,7 @@ mod tests {
         });
         assert!(is_isolated_deposit(&authority_msg));
         let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
-        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated));
+        assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_some()));
     }
 
     #[tokio::test]
@@ -2250,7 +2253,7 @@ mod tests {
                 Some(&delegate_pubkey),
                 1_000,
                 None,
-                false,
+                None,
                 &context_primary,
             )
             .await;
@@ -2276,7 +2279,7 @@ mod tests {
                 Some(&delegate_pubkey),
                 1_000,
                 None,
-                false,
+                None,
                 &context_secondary,
             )
             .await;
