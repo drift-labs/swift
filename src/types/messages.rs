@@ -8,71 +8,16 @@ use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
 use drift_rs::{
-    swift_order_subscriber::{SignedOrderType, SWIFT_DELEGATE_MSG_PREFIX},
+    swift_order_subscriber::{deser_signed_msg_type, SignedMessageInfo, SignedOrderType},
     types::{MarketType, SignedMsgOrderParamsDelegateMessage},
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
+use serde::de::value::StrDeserializer;
 use serde_json::json;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 
 pub const MAX_SIGNED_MSG_BORSH_LEN: usize = SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8;
 pub const MAX_SIGNED_MSG_HEX_LEN: usize = MAX_SIGNED_MSG_BORSH_LEN * 2;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SignedOrderTypeWithLen {
-    /// length of the signed order when borsh encoded
-    pub signed_len: usize,
-    /// signed order message
-    pub order: SignedOrderType,
-    /// Original message bytes for ed25519
-    pub original_message: Vec<u8>,
-}
-
-/// Deserialize hex-ified, borsh bytes as a `SignedOrderType`
-pub fn deser_signed_msg_type_with_len<'de, D>(
-    deserializer: D,
-) -> Result<SignedOrderTypeWithLen, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let payload: &str = serde::Deserialize::deserialize(deserializer)?;
-    if payload.len() % 2 != 0 {
-        return Err(serde::de::Error::custom("Hex string length must be even"));
-    }
-
-    // decode expecting the largest possible variant
-    let borsh_len = payload.len() / 2;
-    if (borsh_len > SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8) || payload.is_empty() {
-        return Err(serde::de::Error::custom("invalid signed message hex"));
-    }
-
-    // messages from older clients that are too short will naturally pad to the largest message size
-    let mut borsh_buf = [0u8; SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8];
-    faster_hex::hex_decode(payload.as_bytes(), &mut borsh_buf[..borsh_len])
-        .map_err(serde::de::Error::custom)?;
-
-    let original_message = payload.as_bytes().to_vec();
-
-    // this is basically the same as if we derived AnchorDeserialize on `SignedOrderType` _expect_ it does not
-    // add a u8 to distinguish the enum
-    if borsh_buf[..8] == SWIFT_DELEGATE_MSG_PREFIX {
-        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
-            .map(|o| SignedOrderTypeWithLen {
-                signed_len: borsh_len,
-                order: SignedOrderType::Delegated(o),
-                original_message,
-            })
-            .map_err(serde::de::Error::custom)
-    } else {
-        AnchorDeserialize::deserialize(&mut &borsh_buf[8..])
-            .map(|o| SignedOrderTypeWithLen {
-                signed_len: borsh_len,
-                order: SignedOrderType::Authority(o),
-                original_message,
-            })
-            .map_err(serde::de::Error::custom)
-    }
-}
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct DepositAndPlaceRequest {
@@ -87,8 +32,8 @@ pub struct IncomingSignedMessage {
     pub taker_pubkey: Pubkey,
     #[serde(deserialize_with = "deser_signature")]
     pub signature: Signature,
-    #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
-    pub message: SignedOrderTypeWithLen,
+    #[serde(deserialize_with = "deser_signed_msg_type")]
+    pub message: SignedOrderType,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
     pub signing_authority: Pubkey,
     #[serde(deserialize_with = "deser_pubkey", default = "Default::default")]
@@ -98,7 +43,7 @@ pub struct IncomingSignedMessage {
 impl IncomingSignedMessage {
     /// Return the swift signed order
     pub fn order(&self) -> SignedOrderType {
-        self.message.order
+        self.message.clone()
     }
     /// Verify taker signature against hex encoded `message`
     pub fn verify_signature(&self) -> Result<()> {
@@ -110,31 +55,46 @@ impl IncomingSignedMessage {
             PublicKey::from_bytes(self.taker_pubkey.as_array())
         }?;
 
+        // expect: the raw payload should be populated
+        let signed_msg = self.message.raw().as_ref().expect("msg exists");
         pubkey
-            .verify(&self.message.original_message, &self.signature)
+            .verify(signed_msg.as_bytes(), &self.signature)
             .context("Signature did not verify")
     }
     pub fn verify_and_get_signed_message(&self) -> Result<&SignedOrderType> {
         self.verify_signature()?;
-        Ok(&self.message.order)
+        Ok(&self.message)
     }
 }
 
+/// Internal wire format for messages within the swift stack
 #[derive(AnchorDeserialize, AnchorSerialize, Clone, Debug, InitSpace)]
 pub struct OrderMetadataAndMessage {
     pub signing_authority: Pubkey,
     pub taker_authority: Pubkey,
-    #[max_len(MAX_SIGNED_MSG_HEX_LEN)]
-    pub order_message: Vec<u8>,
-    pub deserialized_order_message: SignedOrderType,
     pub order_signature: [u8; 64],
     pub uuid: [u8; 8],
     pub ts: u64,
+    pub market_index: u16,
+    pub market_type: MarketType,
     pub will_sanitize: bool,
+    #[max_len(MAX_SIGNED_MSG_HEX_LEN)]
+    pub order_message_str: String,
 }
 
 impl OrderMetadataAndMessage {
-    /// Borsh serialize and base64 encode the message
+    /// Get the signed order info
+    ///
+    /// DEV: this performs a deserialization of the raw payload
+    pub fn order_info(&self) -> SignedMessageInfo {
+        // expect: message already succesfully deserialized by this point
+        let deser =
+            StrDeserializer::<serde::de::value::Error>::new(self.order_message_str.as_str());
+        let res = deser_signed_msg_type(deser);
+        res.unwrap().info(&self.taker_authority)
+    }
+    /// Borsh serialize and
+    /// base64 encode the message
     pub fn encode(&self) -> String {
         let mut buffer = ArrayVec::<u8, { Self::INIT_SPACE }>::new_const();
         self.serialize(&mut buffer).expect("serialized");
@@ -160,25 +120,13 @@ impl OrderMetadataAndMessage {
     }
 
     pub fn jsonify(&self) -> serde_json::Value {
-        let taker_order_params = self
-            .deserialized_order_message
-            .info(&self.taker_authority)
-            .order_params;
-
-        let order_message_str = match core::str::from_utf8(&self.order_message) {
-            Ok(s) if s.as_bytes().iter().all(u8::is_ascii_hexdigit) && (s.len() % 2 == 0) => {
-                s.to_string()
-            }
-            _ => faster_hex::hex_string(self.order_message.as_slice()),
-        };
-
         json!({
-            "market_type": match taker_order_params.market_type {
+            "market_type": match self.market_type {
                 MarketType::Perp => "perp",
                 MarketType::Spot => "spot",
             },
-            "market_index": taker_order_params.market_index,
-            "order_message": order_message_str,
+            "market_index": self.market_index,
+            "order_message": self.order_message_str,
             "order_signature": base64::prelude::BASE64_STANDARD.encode(self.order_signature),
             "taker_authority": self.taker_authority.to_string(),
             "signing_authority": self.signing_authority.to_string(),
@@ -398,7 +346,7 @@ mod tests {
             actual.signing_authority
                 == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
         );
-        if let SignedOrderType::Delegated(signed_msg) = actual.order() {
+        if let SignedOrderType::Delegated { inner, .. } = actual.order() {
             let expected = SignedMsgOrderParamsDelegateMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -427,8 +375,9 @@ mod tests {
                 max_margin_ratio: None,
                 builder_fee_tenth_bps: None,
                 builder_idx: None,
+                isolated_position_deposit: None,
             };
-            assert_eq!(signed_msg, expected);
+            assert_eq!(inner, expected);
         } else {
             assert!(false, "unexpected variant");
         }
@@ -498,7 +447,11 @@ mod tests {
                 == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
         );
 
-        if let SignedOrderType::Authority(signed_msg) = actual.order() {
+        if let SignedOrderType::Authority {
+            inner: signed_msg,
+            raw,
+        } = actual.order()
+        {
             let expected = SignedMsgOrderParamsMessage {
                 signed_msg_order_params: OrderParams {
                     order_type: OrderType::Market,
@@ -527,6 +480,7 @@ mod tests {
                 max_margin_ratio: None,
                 builder_fee_tenth_bps: None,
                 builder_idx: None,
+                isolated_position_deposit: None,
             };
             assert_eq!(signed_msg, expected);
         } else {
@@ -537,10 +491,11 @@ mod tests {
     #[test]
     fn order_metadata_encode_decode_reflexive() {
         let encoded = OrderMetadataAndMessage {
+            market_index: 0,
+            market_type: MarketType::Perp,
             signing_authority: Pubkey::new_unique(),
             taker_authority: Pubkey::new_unique(),
-            order_message: vec![0u8; 2 * (SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8)],
-            deserialized_order_message: SignedOrderType::Authority(Default::default()),
+            order_message_str: "c8d5a65e2234f55d0001010080841e00000000000000000000000000020000000000000000013201bb60507d000000000117c0127c000000000000272108160000000073386c754a4c5a650000".to_string(),
             order_signature: [1u8; 64],
             ts: 55555,
             uuid: nanoid!(8).as_bytes().try_into().unwrap(),
@@ -548,14 +503,8 @@ mod tests {
         }
         .encode();
         let order_metadata = OrderMetadataAndMessage::decode(&encoded).unwrap();
-        dbg!(base64::prelude::BASE64_STANDARD.encode(
-            &order_metadata
-                .deserialized_order_message
-                .try_to_vec()
-                .unwrap()
-                .as_slice()
-        ),);
         assert_eq!(order_metadata.encode(), encoded);
+        dbg!(&order_metadata.order_info().order_params);
     }
 
     #[test]
@@ -578,16 +527,17 @@ mod tests {
             ..Default::default()
         };
 
-        let signed_order_message = SignedOrderType::Authority(order_params);
+        let signed_order_message = SignedOrderType::authority(order_params);
         let hex_msg = faster_hex::hex_string(signed_order_message.to_borsh().as_slice());
 
         let order_metadata_json = OrderMetadataAndMessage {
+            market_index: order_params.signed_msg_order_params.market_index,
+            market_type: order_params.signed_msg_order_params.market_type,
             signing_authority,
             taker_authority,
-            order_message: hex_msg.as_bytes().to_vec(),
             order_signature,
             uuid: order_params.uuid,
-            deserialized_order_message: signed_order_message.clone(),
+            order_message_str: hex_msg.clone(),
             ts: 55555,
             will_sanitize: false,
         }
@@ -633,17 +583,16 @@ mod tests {
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
-            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
-            message: SignedOrderTypeWithLen,
+            #[serde(deserialize_with = "deser_signed_msg_type")]
+            message: SignedOrderType,
         }
 
         let json = format!(r#"{{"message":"{}"}}"#, hex);
         let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
 
-        assert_eq!(wrapper.message.signed_len, payload.len());
-
-        match wrapper.message.order {
-            SignedOrderType::Authority(m) => {
+        match wrapper.message {
+            SignedOrderType::Authority { inner: m, raw } => {
+                assert_eq!(raw, Some(hex));
                 assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
                 assert_eq!(
                     m.signed_msg_order_params.auction_start_price,
@@ -668,7 +617,7 @@ mod tests {
                 );
                 assert_eq!(m.max_margin_ratio, None);
             }
-            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+            SignedOrderType::Delegated { .. } => panic!("expected Authority variant"),
         }
     }
 
@@ -687,17 +636,16 @@ mod tests {
 
         #[derive(serde::Deserialize)]
         struct Wrapper {
-            #[serde(deserialize_with = "deser_signed_msg_type_with_len")]
-            message: SignedOrderTypeWithLen,
+            #[serde(deserialize_with = "deser_signed_msg_type")]
+            message: SignedOrderType,
         }
 
         let json = format!(r#"{{"message":"{}"}}"#, hex);
         let wrapper: Wrapper = serde_json::from_str(&json).expect("deserializes");
 
-        assert_eq!(wrapper.message.signed_len, payload.len());
-
-        match wrapper.message.order {
-            SignedOrderType::Authority(m) => {
+        match wrapper.message {
+            SignedOrderType::Authority { inner: m, raw } => {
+                assert_eq!(Some(hex), raw);
                 assert_eq!(m.signed_msg_order_params.auction_duration, Some(10));
                 assert_eq!(
                     m.signed_msg_order_params.auction_start_price,
@@ -722,7 +670,7 @@ mod tests {
                 );
                 assert_eq!(m.max_margin_ratio, Some(65535));
             }
-            SignedOrderType::Delegated(_) => panic!("expected Authority variant"),
+            SignedOrderType::Delegated { .. } => panic!("expected Authority variant"),
         }
     }
 }

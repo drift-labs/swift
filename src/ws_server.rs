@@ -18,6 +18,7 @@ use dashmap::DashMap;
 use dotenv::dotenv;
 use drift_rs::{
     constants::MarketExt,
+    swift_order_subscriber::SignedMessageInfo,
     types::{
         accounts::{PerpMarket, SignedMsgWsDelegates, UserStats},
         MarketType,
@@ -115,11 +116,6 @@ pub struct ServerParams {
     pub host: String,
     pub port: String,
     pub metrics: WsServerMetrics,
-}
-
-#[derive(serde::Serialize)]
-pub struct TestMessage {
-    message: String,
 }
 
 impl Challenge {
@@ -706,11 +702,11 @@ async fn subscribe_kafka_consumer(
                     .with_label_values(&[topic])
                     .observe(forward_latency as f64);
 
-                let signed_info = order_metadata
-                    .deserialized_order_message
-                    .info(&order_metadata.taker_authority);
-                let taker_subaccount = signed_info.taker_pubkey;
-                let order_params = signed_info.order_params;
+                let SignedMessageInfo {
+                    taker_pubkey: taker_subaccount,
+                    order_params,
+                    ..
+                } = order_metadata.order_info();
 
                 log::info!(
                     target: "kafka",
@@ -859,11 +855,11 @@ async fn subscribe_redis_pubsub(
             .with_label_values(&[topic])
             .observe(forward_latency as f64);
 
-        let signed_info = order_metadata
-            .deserialized_order_message
-            .info(&order_metadata.taker_authority);
-        let taker_subaccount = signed_info.taker_pubkey;
-        let order_params = signed_info.order_params;
+        let SignedMessageInfo {
+            taker_pubkey: taker_subaccount,
+            order_params,
+            ..
+        } = order_metadata.order_info();
 
         log::info!(
             target: "redis",
