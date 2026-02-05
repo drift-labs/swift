@@ -244,7 +244,7 @@ pub async fn process_order(
 
     log::info!(
         target: "server",
-        "{} signer={} taker_subaccount={} slot={} side={:?} base={} price={} order_type={:?} reduce_only={} post_only={:?} delegate_signer={:?}",
+        "{} signer={} taker_subaccount={} slot={} side={:?} base={} price={} order_type={:?} reduce_only={} post_only={:?} iso={:?} delegate_signer={:?}",
         context.log_prefix,
         signing_pubkey,
         taker_pubkey,
@@ -255,6 +255,7 @@ pub async fn process_order(
         order_params.order_type,
         order_params.reduce_only,
         order_params.post_only,
+        isolated_position_deposit,
         delegate_signer,
     );
 
@@ -1705,6 +1706,17 @@ mod tests {
         SignedMsgTriggerOrderParams,
     };
     use solana_sdk::native_token::LAMPORTS_PER_SOL;
+
+    fn is_isolated_deposit(signed_msg: &SignedOrderType) -> bool {
+        match signed_msg {
+            SignedOrderType::Delegated { inner, .. } => inner
+                .isolated_position_deposit
+                .is_some_and(|amount| amount > 0),
+            SignedOrderType::Authority { inner, .. } => inner
+                .isolated_position_deposit
+                .is_some_and(|amount| amount > 0),
+        }
+    }
 
     fn create_test_order_params(
         order_type: OrderType,
