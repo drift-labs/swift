@@ -18,7 +18,8 @@ use crate::{
             PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD,
             PROCESS_ORDER_RESPONSE_ERROR_MSG_VERIFY_SIGNATURE,
-            PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY, PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+            PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY, PROCESS_ORDER_RESPONSE_INVALID_UUID_UTF8,
+            PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
         },
         types::{unix_now_ms, RequestContext},
     },
@@ -118,6 +119,16 @@ pub async fn process_order_wrapper(
     Json(incoming_message): Json<IncomingSignedMessage>,
 ) -> impl axum::response::IntoResponse {
     let context = RequestContext::from_incoming_message(&incoming_message);
+    if context.is_err() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_INVALID_UUID_UTF8,
+                error: None,
+            }),
+        );
+    }
+    let context = context.unwrap();
 
     let (status, resp) = match process_order(server_params, incoming_message, false, &context).await
     {
@@ -439,6 +450,16 @@ pub async fn deposit_trade(
         .order()
         .info(&req.swift_order.taker_authority);
     let context = RequestContext::from_incoming_message(&req.swift_order);
+    if context.is_err() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ProcessOrderResponse {
+                message: PROCESS_ORDER_RESPONSE_INVALID_UUID_UTF8,
+                error: None,
+            }),
+        );
+    }
+    let context = context.unwrap();
     let current_slot = server_params.slot_subscriber.current_slot();
 
     let max_margin_ratio = match extract_signed_message_info(
@@ -1705,6 +1726,7 @@ mod tests {
         accounts::User, SignedMsgOrderParamsDelegateMessage, SignedMsgOrderParamsMessage,
         SignedMsgTriggerOrderParams,
     };
+    use ed25519_dalek::Signature as Ed25519Signature;
     use solana_sdk::native_token::LAMPORTS_PER_SOL;
 
     fn is_isolated_deposit(signed_msg: &SignedOrderType) -> bool {
@@ -1880,6 +1902,78 @@ mod tests {
             validate_signed_order_params(&params, min_order_size),
             Ok(())
         );
+    }
+
+    #[test]
+    fn test_request_context_from_incoming_message_valid_utf8() {
+        let taker = Pubkey::new_unique();
+        let uuid_valid: [u8; 8] = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
+            sub_account_id: 0,
+            signed_msg_order_params: OrderParams {
+                market_index: 2,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: uuid_valid,
+            slot: 1000,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+            max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
+            isolated_position_deposit: None,
+        });
+        let msg = IncomingSignedMessage {
+            taker_pubkey: taker,
+            signature: Ed25519Signature::from_bytes(&[0u8; 64]).unwrap(),
+            message: authority_msg,
+            signing_authority: Pubkey::default(),
+            taker_authority: Pubkey::default(),
+        };
+        let ctx = RequestContext::from_incoming_message(&msg).expect("valid utf8 uuid");
+        assert_eq!(ctx.order_uuid, "abcdefgh");
+        assert_eq!(ctx.market_index, 2);
+        assert_eq!(ctx.market_type, "perp");
+        assert_eq!(ctx.taker_authority, taker);
+    }
+
+    #[test]
+    fn test_request_context_from_incoming_message_invalid_utf8() {
+        let taker = Pubkey::new_unique();
+        let uuid_invalid: [u8; 8] = [0xFF; 8];
+        let authority_msg = SignedOrderType::authority(SignedMsgOrderParamsMessage {
+            sub_account_id: 0,
+            signed_msg_order_params: OrderParams {
+                market_index: 0,
+                market_type: MarketType::Perp,
+                order_type: OrderType::Market,
+                base_asset_amount: LAMPORTS_PER_SOL,
+                price: 1000,
+                direction: PositionDirection::Long,
+                ..Default::default()
+            },
+            uuid: uuid_invalid,
+            slot: 1000,
+            stop_loss_order_params: None,
+            take_profit_order_params: None,
+            max_margin_ratio: None,
+            builder_fee_tenth_bps: None,
+            builder_idx: None,
+            isolated_position_deposit: None,
+        });
+        let msg = IncomingSignedMessage {
+            taker_pubkey: taker,
+            signature: Ed25519Signature::from_bytes(&[0u8; 64]).unwrap(),
+            message: authority_msg,
+            signing_authority: Pubkey::default(),
+            taker_authority: Pubkey::default(),
+        };
+        assert!(RequestContext::from_incoming_message(&msg).is_err());
     }
 
     #[test]
