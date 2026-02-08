@@ -154,6 +154,7 @@ pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT: &str =
     "Invalid base_asset_amount in tp/sl";
 pub const PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED: &str = "Failed to deliver message";
 pub const PROCESS_ORDER_RESPONSE_IGNORE_PUBKEY: &str = "Ignore pubkey";
+pub const PROCESS_ORDER_RESPONSE_INVALID_UUID_UTF8: &str = "Order uuid invalid utf8";
 
 #[derive(serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -449,7 +450,7 @@ mod tests {
 
         if let SignedOrderType::Authority {
             inner: signed_msg,
-            raw,
+            raw: _,
         } = actual.order()
         {
             let expected = SignedMsgOrderParamsMessage {
