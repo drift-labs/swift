@@ -1193,15 +1193,24 @@ impl ServerParams {
                 taker_order_params.market_index,
             );
         }
-        let message = tx.place_orders(vec![*taker_order_params]).build();
+
+        // always set fee payer to some other account with SOL
+        // supports privey wallets and how a swift order is intended to be placed anyway
+        let message = tx
+            .place_orders(vec![*taker_order_params])
+            .fee_payer(solana_sdk::pubkey!(
+                "Eiv8eZUWaEPMne8XjA6afzVJ2tJs1BJJ4a1MpZacMSRA"
+            ))
+            .build();
 
         let simulate_result_with_timeout = tokio::time::timeout(
             self.config.simulation_timeout,
             self.drift.rpc().simulate_transaction_with_config(
                 &VersionedTransaction {
                     message,
-                    // must provide a signature for the RPC call to work
-                    signatures: vec![Signature::new_unique()],
+                    // must provide placerholder signature(s) for the RPC call to work
+                    // signer + fee payer
+                    signatures: vec![Signature::new_unique(), Signature::new_unique()],
                 },
                 RpcSimulateTransactionConfig {
                     sig_verify: false,
