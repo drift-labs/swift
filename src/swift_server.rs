@@ -969,13 +969,51 @@ fn validate_market_order_params(params: &OrderParams) -> Result<(), ErrorCode> {
 /// Validates Limit order params. Handles both regular limits (no auction params)
 /// and oracle-offset limits (oracle_price_offset != 0 with oracle auction params).
 fn validate_limit_order_params(params: &OrderParams) -> Result<(), ErrorCode> {
-    if params.auction_duration.is_none()
-        && params.auction_start_price.is_none()
-        && params.auction_end_price.is_none()
-    {
-        Ok(())
+    let is_oracle_offset = params.oracle_price_offset.is_some_and(|o| o != 0);
+
+    if is_oracle_offset {
+        let offset = params.oracle_price_offset.unwrap() as i64;
+        let has_auction = params.auction_duration.is_some_and(|d| d > 0);
+
+        if has_auction {
+            let start = params
+                .auction_start_price
+                .ok_or(ErrorCode::InvalidOrderAuction)?;
+            let end = params
+                .auction_end_price
+                .ok_or(ErrorCode::InvalidOrderAuction)?;
+
+            if params.direction == PositionDirection::Long {
+                if start <= end && end <= offset {
+                    Ok(())
+                } else {
+                    Err(ErrorCode::InvalidOrderAuction)
+                }
+            } else if start >= end && end >= offset {
+                Ok(())
+            } else {
+                Err(ErrorCode::InvalidOrderAuction)
+            }
+        } else {
+            // no auction — start/end must be zero or None
+            let start_ok = params.auction_start_price.map_or(true, |p| p == 0);
+            let end_ok = params.auction_end_price.map_or(true, |p| p == 0);
+            if start_ok && end_ok {
+                Ok(())
+            } else {
+                Err(ErrorCode::InvalidOrderAuction)
+            }
+        }
     } else {
-        Err(ErrorCode::InvalidOrderAuction)
+        // regular limit — no auction params allowed
+        if params.auction_duration.is_none()
+            && params.auction_start_price.is_none()
+            && params.auction_end_price.is_none()
+        {
+            Ok(())
+        } else {
+            Err(ErrorCode::InvalidOrderAuction)
+        }
     }
 }
 
@@ -2485,5 +2523,91 @@ mod tests {
             status == axum::http::StatusCode::BAD_REQUEST
                 && msg.contains("invalid order: AccountNotFound")
         }));
+    }
+
+    #[test]
+    fn test_validate_oracle_offset_limit_order() {
+        let min_order_size = 1 * LAMPORTS_PER_SOL;
+
+        // Valid: oracle-offset limit long with auction, start <= end <= offset
+        let mut params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((50, 100, 200)),
+        );
+        params.oracle_price_offset = Some(300);
+        params.price = 0;
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Valid: oracle-offset limit short with auction, start >= end >= offset
+        let mut params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Short,
+            Some((50, 200, 100)),
+        );
+        params.oracle_price_offset = Some(-300);
+        params.price = 0;
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Valid: oracle-offset limit with no auction (start/end zero or None)
+        let mut params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        params.oracle_price_offset = Some(100);
+        params.price = 0;
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Invalid: oracle-offset limit long, end > offset
+        let mut params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((50, 100, 400)),
+        );
+        params.oracle_price_offset = Some(300);
+        params.price = 0;
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
+
+        // Invalid: oracle-offset limit long, reversed auction (start > end)
+        let mut params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((50, 200, 100)),
+        );
+        params.oracle_price_offset = Some(300);
+        params.price = 0;
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
+
+        // Invalid: oracle-offset limit short, end < offset
+        let mut params = create_test_order_params(
+            OrderType::Limit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Short,
+            Some((50, 200, 100)),
+        );
+        params.oracle_price_offset = Some(150);
+        params.price = 0;
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
     }
 }
