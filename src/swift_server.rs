@@ -1042,9 +1042,27 @@ fn validate_trigger_market_order_params(params: &OrderParams) -> Result<(), Erro
 }
 
 /// Validates TriggerLimit order params.
-fn validate_trigger_limit_order_params(_params: &OrderParams) -> Result<(), ErrorCode> {
-    // placeholder — implemented in Task 5
-    Err(ErrorCode::InvalidOrderMarketType)
+/// Same as TriggerMarket except price must be non-zero (limit price required).
+fn validate_trigger_limit_order_params(params: &OrderParams) -> Result<(), ErrorCode> {
+    if !params.trigger_price.is_some_and(|p| p != 0) {
+        return Err(ErrorCode::InvalidTriggerOrderCondition);
+    }
+    if !matches!(
+        params.trigger_condition,
+        OrderTriggerCondition::Above | OrderTriggerCondition::Below
+    ) {
+        return Err(ErrorCode::InvalidTriggerOrderCondition);
+    }
+    if params.price == 0 {
+        return Err(ErrorCode::InvalidOrderMarketType);
+    }
+    if params.oracle_price_offset.is_some_and(|o| o != 0) {
+        return Err(ErrorCode::InvalidOrderMarketType);
+    }
+    if params.post_only != PostOnlyParam::None {
+        return Err(ErrorCode::InvalidOrderMarketType);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2733,6 +2751,99 @@ mod tests {
             None,
         );
         params.price = 0;
+        params.trigger_price = Some(50_000);
+        params.trigger_condition = OrderTriggerCondition::Above;
+        params.post_only = PostOnlyParam::MustPostOnly;
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderMarketType)
+        );
+    }
+
+    #[test]
+    fn test_validate_trigger_limit_order() {
+        let min_order_size = 1 * LAMPORTS_PER_SOL;
+
+        // Valid trigger limit order (price != 0)
+        let mut params = create_test_order_params(
+            OrderType::TriggerLimit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        params.trigger_price = Some(50_000);
+        params.trigger_condition = OrderTriggerCondition::Above;
+        // price is 1_000 from helper — non-zero, valid for trigger limit
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Valid: short with Below condition
+        let mut params = create_test_order_params(
+            OrderType::TriggerLimit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Short,
+            None,
+        );
+        params.trigger_price = Some(50_000);
+        params.trigger_condition = OrderTriggerCondition::Below;
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Invalid: price == 0 (trigger limit must have limit price)
+        let mut params = create_test_order_params(
+            OrderType::TriggerLimit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        params.price = 0;
+        params.trigger_price = Some(50_000);
+        params.trigger_condition = OrderTriggerCondition::Above;
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderMarketType)
+        );
+
+        // Invalid: trigger_price is None
+        let mut params = create_test_order_params(
+            OrderType::TriggerLimit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        params.trigger_price = None;
+        params.trigger_condition = OrderTriggerCondition::Above;
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidTriggerOrderCondition)
+        );
+
+        // Invalid: oracle_price_offset set
+        let mut params = create_test_order_params(
+            OrderType::TriggerLimit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        params.trigger_price = Some(50_000);
+        params.trigger_condition = OrderTriggerCondition::Above;
+        params.oracle_price_offset = Some(100);
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderMarketType)
+        );
+
+        // Invalid: post_only set
+        let mut params = create_test_order_params(
+            OrderType::TriggerLimit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
         params.trigger_price = Some(50_000);
         params.trigger_condition = OrderTriggerCondition::Above;
         params.post_only = PostOnlyParam::MustPostOnly;
