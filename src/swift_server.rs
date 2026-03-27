@@ -47,8 +47,9 @@ use drift_rs::{
     types::{
         accounts::{HighLeverageModeConfig, User},
         errors::ErrorCode,
-        CommitmentConfig, MarketId, MarketStatus, MarketType, OrderParams, OrderType,
-        PositionDirection, ProgramError, SdkError, SdkResult, SignedMsgTriggerOrderParams,
+        CommitmentConfig, MarketId, MarketStatus, MarketType, OrderParams, OrderTriggerCondition,
+        OrderType, PositionDirection, PostOnlyParam, ProgramError, SdkError, SdkResult,
+        SignedMsgTriggerOrderParams,
         VersionedMessage, VersionedTransaction,
     },
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
@@ -922,13 +923,6 @@ fn validate_signed_order_params(
     taker_order_params: &OrderParams,
     min_order_size: u64,
 ) -> Result<(), ErrorCode> {
-    if !matches!(
-        taker_order_params.order_type,
-        OrderType::Market | OrderType::Oracle | OrderType::Limit
-    ) {
-        return Err(ErrorCode::InvalidOrderMarketType);
-    }
-
     if !matches!(taker_order_params.market_type, MarketType::Perp) {
         return Err(ErrorCode::InvalidOrderMarketType);
     }
@@ -941,31 +935,60 @@ fn validate_signed_order_params(
         }
     }
 
-    // has_valid_auction_params
-    if taker_order_params.auction_duration.is_some()
-        && taker_order_params.auction_start_price.is_some()
-        && taker_order_params.auction_end_price.is_some()
-    {
-        let start_price = taker_order_params.auction_start_price.unwrap();
-        let end_price = taker_order_params.auction_end_price.unwrap();
+    match taker_order_params.order_type {
+        OrderType::Market | OrderType::Oracle => validate_market_order_params(taker_order_params),
+        OrderType::Limit => validate_limit_order_params(taker_order_params),
+        OrderType::TriggerMarket => validate_trigger_market_order_params(taker_order_params),
+        OrderType::TriggerLimit => validate_trigger_limit_order_params(taker_order_params),
+    }
+}
 
-        if taker_order_params.direction == PositionDirection::Long && start_price <= end_price
-            || taker_order_params.direction == PositionDirection::Short && start_price >= end_price
+/// Validates Market and Oracle order auction params.
+/// All three auction params must be present with correct price direction.
+fn validate_market_order_params(params: &OrderParams) -> Result<(), ErrorCode> {
+    if params.auction_duration.is_some()
+        && params.auction_start_price.is_some()
+        && params.auction_end_price.is_some()
+    {
+        let start_price = params.auction_start_price.unwrap();
+        let end_price = params.auction_end_price.unwrap();
+
+        if params.direction == PositionDirection::Long && start_price <= end_price
+            || params.direction == PositionDirection::Short && start_price >= end_price
         {
             Ok(())
         } else {
             log::info!(target: "server", "auction price reversed");
             Err(ErrorCode::InvalidOrderAuction)
         }
-    } else if taker_order_params.order_type == OrderType::Limit
-        && taker_order_params.auction_duration.is_none()
-        && taker_order_params.auction_start_price.is_none()
-        && taker_order_params.auction_end_price.is_none()
+    } else {
+        Err(ErrorCode::InvalidOrderAuction)
+    }
+}
+
+/// Validates Limit order params. Handles both regular limits (no auction params)
+/// and oracle-offset limits (oracle_price_offset != 0 with oracle auction params).
+fn validate_limit_order_params(params: &OrderParams) -> Result<(), ErrorCode> {
+    if params.auction_duration.is_none()
+        && params.auction_start_price.is_none()
+        && params.auction_end_price.is_none()
     {
         Ok(())
     } else {
         Err(ErrorCode::InvalidOrderAuction)
     }
+}
+
+/// Validates TriggerMarket order params.
+fn validate_trigger_market_order_params(_params: &OrderParams) -> Result<(), ErrorCode> {
+    // placeholder — implemented in Task 4
+    Err(ErrorCode::InvalidOrderMarketType)
+}
+
+/// Validates TriggerLimit order params.
+fn validate_trigger_limit_order_params(_params: &OrderParams) -> Result<(), ErrorCode> {
+    // placeholder — implemented in Task 5
+    Err(ErrorCode::InvalidOrderMarketType)
 }
 
 #[derive(Debug)]
@@ -1844,7 +1867,7 @@ mod tests {
     fn test_validate_auction_params() {
         let min_order_size = 1 * LAMPORTS_PER_SOL;
 
-        // Test valid auction params for long position
+        // Limit with auction params — now invalid (limit orders must have no auction params)
         let params = create_test_order_params(
             OrderType::Limit,
             MarketType::Perp,
@@ -1852,9 +1875,12 @@ mod tests {
             PositionDirection::Long,
             Some((100, 1000, 1100)), // start < end for long
         );
-        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
 
-        // Test valid auction params for short position
+        // Limit with auction params — now invalid (limit orders must have no auction params)
         let params = create_test_order_params(
             OrderType::Limit,
             MarketType::Perp,
@@ -1862,7 +1888,10 @@ mod tests {
             PositionDirection::Short,
             Some((100, 1100, 1000)), // start > end for short
         );
-        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
 
         // Test invalid auction params for long position
         let params = create_test_order_params(
@@ -1900,6 +1929,7 @@ mod tests {
         );
         assert!(validate_signed_order_params(&params, min_order_size).is_ok());
 
+        // Limit with auction params — now invalid (limit orders must have no auction params)
         let params = create_test_order_params(
             OrderType::Limit,
             MarketType::Perp,
@@ -1909,7 +1939,58 @@ mod tests {
         );
         assert_eq!(
             validate_signed_order_params(&params, min_order_size),
-            Ok(())
+            Err(ErrorCode::InvalidOrderAuction)
+        );
+    }
+
+    #[test]
+    fn test_validate_market_order_params_extracted() {
+        let min_order_size = 1 * LAMPORTS_PER_SOL;
+
+        // Market long with valid auction: start <= end
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((50, 99, 100)),
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Market short with valid auction: start >= end
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Short,
+            Some((50, 100, 99)),
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // Market with no auction params — invalid
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
+        );
+
+        // Market long with reversed auction — invalid
+        let params = create_test_order_params(
+            OrderType::Market,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            Some((50, 100, 99)),
+        );
+        assert_eq!(
+            validate_signed_order_params(&params, min_order_size),
+            Err(ErrorCode::InvalidOrderAuction)
         );
     }
 
