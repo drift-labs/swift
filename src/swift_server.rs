@@ -925,6 +925,7 @@ fn validate_signed_order_params(
     if !matches!(
         taker_order_params.order_type,
         OrderType::Market | OrderType::Oracle | OrderType::Limit
+            | OrderType::TriggerMarket | OrderType::TriggerLimit
     ) {
         return Err(ErrorCode::InvalidOrderMarketType);
     }
@@ -957,7 +958,10 @@ fn validate_signed_order_params(
             log::info!(target: "server", "auction price reversed");
             Err(ErrorCode::InvalidOrderAuction)
         }
-    } else if taker_order_params.order_type == OrderType::Limit
+    } else if matches!(
+        taker_order_params.order_type,
+        OrderType::Limit | OrderType::TriggerMarket | OrderType::TriggerLimit
+    )
         && taker_order_params.auction_duration.is_none()
         && taker_order_params.auction_start_price.is_none()
         && taker_order_params.auction_end_price.is_none()
@@ -1911,6 +1915,32 @@ mod tests {
             validate_signed_order_params(&params, min_order_size),
             Ok(())
         );
+    }
+
+    #[test]
+    fn test_validate_trigger_order_params() {
+        let min_order_size = 1 * LAMPORTS_PER_SOL;
+
+        // TriggerMarket with no auction params should pass
+        let params = create_test_order_params(
+            OrderType::TriggerMarket,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
+        // TriggerLimit with no auction params should pass
+        let params = create_test_order_params(
+            OrderType::TriggerLimit,
+            MarketType::Perp,
+            min_order_size,
+            PositionDirection::Long,
+            None,
+        );
+        assert!(validate_signed_order_params(&params, min_order_size).is_ok());
+
     }
 
     #[test]
