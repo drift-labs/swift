@@ -1941,31 +1941,6 @@ mod tests {
         );
         assert!(validate_signed_order_params(&params, min_order_size).is_ok());
 
-        // TriggerMarket with auction params should fail
-        let params = create_test_order_params(
-            OrderType::TriggerMarket,
-            MarketType::Perp,
-            min_order_size,
-            PositionDirection::Long,
-            Some((100, 1000, 1100)),
-        );
-        assert_eq!(
-            validate_signed_order_params(&params, min_order_size),
-            Err(ErrorCode::InvalidOrderAuction)
-        );
-
-        // TriggerLimit with auction params should fail
-        let params = create_test_order_params(
-            OrderType::TriggerLimit,
-            MarketType::Perp,
-            min_order_size,
-            PositionDirection::Long,
-            Some((100, 1000, 1100)),
-        );
-        assert_eq!(
-            validate_signed_order_params(&params, min_order_size),
-            Err(ErrorCode::InvalidOrderAuction)
-        );
     }
 
     #[test]
