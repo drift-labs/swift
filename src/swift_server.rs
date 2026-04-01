@@ -251,7 +251,7 @@ pub async fn process_order(
         },
         max_margin_ratio,
         isolated_position_deposit,
-    ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot)?;
+    ) = extract_signed_message_info(signed_msg, &taker_authority, current_slot, false)?;
 
     log::info!(
         target: "server",
@@ -462,10 +462,13 @@ pub async fn deposit_trade(
     let context = context.unwrap();
     let current_slot = server_params.slot_subscriber.current_slot();
 
+    // Skip slot validation for durable nonce transactions (e.g. Fireblocks custodial wallets)
+    let skip_slot_validation = is_durable_nonce_tx(&req.deposit_tx);
     let max_margin_ratio = match extract_signed_message_info(
         &req.swift_order.order(),
         &req.swift_order.taker_authority,
         current_slot,
+        skip_slot_validation,
     ) {
         Ok((_info, max_margin_ratio, _is_isolated)) => max_margin_ratio,
         Err((_status, err)) => return (StatusCode::BAD_REQUEST, Json(err)),
@@ -1537,11 +1540,35 @@ fn extract_collateral_ratio(logs: &[String]) -> Option<f64> {
     None
 }
 
+/// Check if a transaction uses a durable nonce by inspecting its first instruction.
+/// Durable nonce transactions have an AdvanceNonceAccount (SystemProgram) instruction as the
+/// first instruction. This is a Solana protocol-level convention used by custodial wallets
+/// like Fireblocks to keep transactions valid beyond the normal ~151 slot blockhash window.
+fn is_durable_nonce_tx(tx: &VersionedTransaction) -> bool {
+    let instructions = tx.message.instructions();
+    let first_ix = match instructions.first() {
+        Some(ix) => ix,
+        None => return false,
+    };
+
+    let account_keys = tx.message.static_account_keys();
+    let program_id = match account_keys.get(first_ix.program_id_index as usize) {
+        Some(key) => key,
+        None => return false,
+    };
+
+    // AdvanceNonceAccount is SystemProgram instruction index 4
+    *program_id == solana_sdk::system_program::id()
+        && first_ix.data.first().copied() == Some(4)
+        && first_ix.data.len() == 4
+}
+
 fn validate_order(
     stop_loss: Option<&SignedMsgTriggerOrderParams>,
     take_profit: Option<&SignedMsgTriggerOrderParams>,
     taker_slot: Slot,
     current_slot: Slot,
+    skip_slot_validation: bool,
 ) -> Result<(), (axum::http::StatusCode, ProcessOrderResponse)> {
     // Validate order parameters
     if stop_loss.is_some_and(|x| x.base_asset_amount == 0 || x.trigger_price == 0)
@@ -1556,8 +1583,8 @@ fn validate_order(
         ));
     }
 
-    // Validate slot
-    if taker_slot < current_slot - 500 {
+    // Validate slot - skip for durable nonce transactions (e.g. Fireblocks custodial wallets)
+    if !skip_slot_validation && taker_slot < current_slot - 500 {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
             ProcessOrderResponse {
@@ -1574,6 +1601,7 @@ fn extract_signed_message_info(
     signed_msg: &SignedOrderType,
     taker_authority: &Pubkey,
     current_slot: Slot,
+    skip_slot_validation: bool,
 ) -> Result<
     (SignedMessageInfo, Option<u16>, Option<u64>),
     (axum::http::StatusCode, ProcessOrderResponse),
@@ -1585,6 +1613,7 @@ fn extract_signed_message_info(
                 inner.take_profit_order_params.as_ref(),
                 inner.slot,
                 current_slot,
+                skip_slot_validation,
             )?;
             Ok((
                 SignedMessageInfo {
@@ -1603,6 +1632,7 @@ fn extract_signed_message_info(
                 inner.take_profit_order_params.as_ref(),
                 inner.slot,
                 current_slot,
+                skip_slot_validation,
             )?;
             Ok((
                 SignedMessageInfo {
@@ -2012,7 +2042,7 @@ mod tests {
             isolated_position_deposit: None,
         });
 
-        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot, false);
         assert!(result.is_ok_and(|(info, _, _)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
@@ -2044,7 +2074,7 @@ mod tests {
             isolated_position_deposit: None,
         });
 
-        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot, false);
         assert!(result.is_err_and(|x| {
             x.0 == axum::http::StatusCode::BAD_REQUEST
                 && x.1.message == PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT
@@ -2080,7 +2110,7 @@ mod tests {
             isolated_position_deposit: None,
         });
 
-        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot, false);
         assert!(result.is_ok_and(|(info, _margin_ratio, _is_isolated)| {
             info.slot == current_slot
                 && info.order_params.base_asset_amount == LAMPORTS_PER_SOL
@@ -2114,7 +2144,7 @@ mod tests {
             isolated_position_deposit: None,
         });
 
-        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot, false);
         assert!(result.is_err_and(|x| {
             x.0 == axum::http::StatusCode::BAD_REQUEST
                 && x.1.message == PROCESS_ORDER_RESPONSE_ERROR_MSG_INVALID_ORDER_AMOUNT
@@ -2149,7 +2179,7 @@ mod tests {
             isolated_position_deposit: None,
         });
 
-        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot, false);
         assert!(result.is_err_and(|x| x
             == (
                 axum::http::StatusCode::BAD_REQUEST,
@@ -2158,6 +2188,69 @@ mod tests {
                     error: Some(PROCESS_ORDER_RESPONSE_ERROR_MSG_ORDER_SLOT_TOO_OLD.into())
                 }
             )));
+
+        // Test slot too old but skip_slot_validation=true (durable nonce / custodial wallet)
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot, true);
+        assert!(result.is_ok(), "should skip slot validation for durable nonce transactions");
+    }
+
+    #[test]
+    fn test_is_durable_nonce_tx() {
+        // AdvanceNonceAccount is SystemProgram instruction with index 4 (little-endian u32)
+        let advance_nonce_data: Vec<u8> = vec![4, 0, 0, 0];
+        let system_program = solana_sdk::system_program::id();
+        let nonce_account = Pubkey::new_unique();
+        let authority = Pubkey::new_unique();
+
+        // Build a minimal versioned transaction with AdvanceNonceAccount as first ix
+        let message = solana_sdk::message::v0::Message {
+            header: solana_sdk::message::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            },
+            account_keys: vec![authority, nonce_account, system_program],
+            recent_blockhash: Hash::default(),
+            instructions: vec![
+                solana_sdk::instruction::CompiledInstruction {
+                    program_id_index: 2, // system_program
+                    accounts: vec![1, 0], // nonce_account, authority
+                    data: advance_nonce_data,
+                },
+            ],
+            address_table_lookups: vec![],
+        };
+        let tx = VersionedTransaction {
+            signatures: vec![solana_sdk::signature::Signature::default()],
+            message: VersionedMessage::V0(message),
+        };
+
+        assert!(is_durable_nonce_tx(&tx), "should detect durable nonce tx");
+
+        // Build a transaction WITHOUT durable nonce
+        let non_nonce_message = solana_sdk::message::v0::Message {
+            header: solana_sdk::message::MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![authority, Pubkey::new_unique()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![
+                solana_sdk::instruction::CompiledInstruction {
+                    program_id_index: 1,
+                    accounts: vec![0],
+                    data: vec![1, 2, 3],
+                },
+            ],
+            address_table_lookups: vec![],
+        };
+        let non_nonce_tx = VersionedTransaction {
+            signatures: vec![solana_sdk::signature::Signature::default()],
+            message: VersionedMessage::V0(non_nonce_message),
+        };
+
+        assert!(!is_durable_nonce_tx(&non_nonce_tx), "should not detect non-nonce tx as durable nonce");
     }
 
     #[test]
@@ -2187,7 +2280,7 @@ mod tests {
             isolated_position_deposit: None,
         });
         assert!(!is_isolated_deposit(&delegated_msg));
-        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot, false);
         assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test delegated order with isolated deposit of 0 (should be false)
@@ -2212,7 +2305,7 @@ mod tests {
             isolated_position_deposit: Some(0),
         });
         assert!(!is_isolated_deposit(&delegated_msg));
-        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot, false);
         assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test delegated order with isolated deposit > 0
@@ -2237,7 +2330,7 @@ mod tests {
             isolated_position_deposit: Some(100_000_000), // 0.1 SOL
         });
         assert!(is_isolated_deposit(&delegated_msg));
-        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&delegated_msg, &taker_authority, current_slot, false);
         assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_some()));
 
         // Test authority order with no isolated deposit
@@ -2262,7 +2355,7 @@ mod tests {
             isolated_position_deposit: None,
         });
         assert!(!is_isolated_deposit(&authority_msg));
-        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot, false);
         assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_none()));
 
         // Test authority order with isolated deposit > 0
@@ -2287,7 +2380,7 @@ mod tests {
             isolated_position_deposit: Some(50_000_000), // 0.05 SOL
         });
         assert!(is_isolated_deposit(&authority_msg));
-        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot);
+        let result = extract_signed_message_info(&authority_msg, &taker_authority, current_slot, false);
         assert!(result.is_ok_and(|(_, _, is_isolated)| is_isolated.is_some()));
     }
 
