@@ -21,7 +21,7 @@ use drift_rs::{
     swift_order_subscriber::SignedMessageInfo,
     types::{
         accounts::{PerpMarket, SignedMsgWsDelegates, UserStats},
-        MarketType,
+        MarketType, MarketTypeExt,
     },
     Pubkey, RpcClient, Wallet,
 };

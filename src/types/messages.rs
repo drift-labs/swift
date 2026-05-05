@@ -1,22 +1,20 @@
 use std::str::FromStr;
 
-use anchor_lang::{
-    prelude::borsh::{self},
-    AnchorDeserialize, AnchorSerialize, InitSpace, Space,
-};
+use anchor_lang::{AnchorDeserialize, AnchorSerialize, Space};
 use anyhow::{Context, Result};
 use arrayvec::ArrayVec;
 use base64::Engine;
 use drift_rs::{
+    drift_idl::types::SignedMsgOrderParamsDelegateMessage as IdlSignedMsgOrderParamsDelegateMessage,
     swift_order_subscriber::{deser_signed_msg_type, SignedMessageInfo, SignedOrderType},
-    types::{MarketType, SignedMsgOrderParamsDelegateMessage},
+    types::{market_type_from_str, MarketType},
 };
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde::de::value::StrDeserializer;
 use serde_json::json;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
 
-pub const MAX_SIGNED_MSG_BORSH_LEN: usize = SignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8;
+pub const MAX_SIGNED_MSG_BORSH_LEN: usize = IdlSignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8;
 pub const MAX_SIGNED_MSG_HEX_LEN: usize = MAX_SIGNED_MSG_BORSH_LEN * 2;
 
 #[derive(serde::Deserialize, Clone, Debug, PartialEq)]
@@ -68,7 +66,7 @@ impl IncomingSignedMessage {
 }
 
 /// Internal wire format for messages within the swift stack
-#[derive(AnchorDeserialize, AnchorSerialize, Clone, Debug, InitSpace)]
+#[derive(AnchorDeserialize, AnchorSerialize, Clone, Debug)]
 pub struct OrderMetadataAndMessage {
     pub signing_authority: Pubkey,
     pub taker_authority: Pubkey,
@@ -78,8 +76,15 @@ pub struct OrderMetadataAndMessage {
     pub market_index: u16,
     pub market_type: MarketType,
     pub will_sanitize: bool,
-    #[max_len(MAX_SIGNED_MSG_HEX_LEN)]
     pub order_message_str: String,
+}
+
+// `MarketType` is drift's native (anchor 1.0) enum, which does not implement
+// `anchor_lang::Space`, so we cannot derive `InitSpace` on this struct.
+// Compute the upper bound manually — Borsh layout: pubkey(32)*2 + [u8;64] +
+// [u8;8] + u64 + u16 + enum tag(1) + bool(1) + String(4 + max_bytes).
+impl Space for OrderMetadataAndMessage {
+    const INIT_SPACE: usize = 32 + 32 + 64 + 8 + 8 + 2 + 1 + 1 + 4 + MAX_SIGNED_MSG_HEX_LEN;
 }
 
 impl OrderMetadataAndMessage {
@@ -304,7 +309,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let market_type: &str = serde::Deserialize::deserialize(deserializer)?;
-    MarketType::from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
+    market_type_from_str(market_type).map_err(|_| serde::de::Error::custom("perp or spot"))
 }
 
 /// Deserialize solana transaction
@@ -528,7 +533,7 @@ mod tests {
             ..Default::default()
         };
 
-        let signed_order_message = SignedOrderType::authority(order_params);
+        let signed_order_message = SignedOrderType::authority(order_params.clone());
         let hex_msg = faster_hex::hex_string(signed_order_message.to_borsh().as_slice());
 
         let order_metadata_json = OrderMetadataAndMessage {
