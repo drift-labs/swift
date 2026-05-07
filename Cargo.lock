@@ -1967,6 +1967,7 @@ checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 [[package]]
 name = "drift"
 version = "2.162.0"
+source = "git+ssh://git@github.com/drift-labs/protocol-v2-shadow?rev=36c92ac02#36c92ac022b2118c77e41b708f8f89176f54cf59"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
@@ -1994,6 +1995,7 @@ dependencies = [
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=67750b1#67750b1a3e398f6ba19551076c639b8b66bd29d0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2015,6 +2017,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=67750b1#67750b1a3e398f6ba19551076c639b8b66bd29d0"
 dependencies = [
  "futures-util",
  "gjson",
@@ -2036,6 +2039,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=67750b1#67750b1a3e398f6ba19551076c639b8b66bd29d0"
 dependencies = [
  "ahash 0.8.12",
  "anchor-lang",
@@ -3740,6 +3744,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openbook-v2-light"
 version = "0.1.0"
+source = "git+ssh://git@github.com/drift-labs/protocol-v2-shadow?rev=36c92ac02#36c92ac022b2118c77e41b708f8f89176f54cf59"
 dependencies = [
  "anchor-lang",
  "borsh 1.6.1",
@@ -4203,6 +4208,7 @@ checksum = "44de48029c54ec1ca570786b5baeb906b0fc2409c8e0145585e287ee7a526c72"
 [[package]]
 name = "pyth_lazer"
 version = "0.1.0"
+source = "git+ssh://git@github.com/drift-labs/protocol-v2-shadow?rev=36c92ac02#36c92ac022b2118c77e41b708f8f89176f54cf59"
 dependencies = [
  "anchor-lang",
  "anyhow",
