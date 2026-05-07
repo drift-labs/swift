@@ -26,8 +26,8 @@ bincode = "1"
 clap = { version = "4.0", features = ["derive"] }
 dashmap = "6.1.0"
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs.git", rev = "67750b1" }
-drift = { git = "ssh://git@github.com/drift-labs/protocol-v2-shadow", rev = "36c92ac02", default-features = false, features = ["drift-rs", "mainnet-beta", "no-entrypoint"] }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs.git", rev = "d419aa9" }
+drift = { git = "https://github.com/drift-labs/protocol-v2", rev = "36c92ac02", default-features = false, features = ["drift-rs", "mainnet-beta", "no-entrypoint"] }
 solana-account-info = "3.1"
 solana-clock = "3"
 ed25519-dalek = "1.0.1"
