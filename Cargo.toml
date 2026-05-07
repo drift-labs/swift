@@ -26,7 +26,7 @@ bincode = "1"
 clap = { version = "4.0", features = ["derive"] }
 dashmap = "6.1.0"
 dotenv = "0.15.0"
-drift-rs = { git = "https://github.com/drift-labs/drift-rs.git", rev = "fbc2e12" }
+drift-rs = { git = "https://github.com/drift-labs/drift-rs.git", rev = "c793431" }
 drift = { git = "https://github.com/drift-labs/protocol-v2", rev = "36c92ac02", default-features = false, features = ["drift-rs", "mainnet-beta", "cpi"] }
 solana-account-info = "3.1"
 solana-clock = "3"
