@@ -29,7 +29,7 @@ use crate::{
         metrics::{metrics_handler, MetricsServerParams, SwiftServerMetrics},
     },
 };
-use anchor_lang::{AnchorDeserialize, Discriminator};
+use anchor_lang::{AccountDeserialize, Discriminator};
 use axum::{
     extract::State,
     http::{self, Method, StatusCode},
@@ -39,17 +39,17 @@ use axum::{
 use base64::Engine;
 use dotenv::dotenv;
 use drift_rs::{
-    constants::high_leverage_mode_account,
+    constants::state_account,
     drift_idl,
     event_subscriber::PubsubClient,
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
     types::{
-        accounts::{HighLeverageModeConfig, User},
+        accounts::User,
         errors::ErrorCode,
-        CommitmentConfig, MarketId, MarketStatus, MarketType, OrderParams, OrderType,
-        PositionDirection, ProgramError, SdkError, SdkResult, SignedMsgTriggerOrderParams,
-        VersionedMessage, VersionedTransaction,
+        CommitmentConfig, MarketId, MarketStatus, MarketType, MarketTypeExt, OrderParams,
+        OrderParamsExt, OrderType, PositionDirection, ProgramError, SdkError, SdkResult,
+        SignedMsgTriggerOrderParams, VersionedMessage, VersionedTransaction,
     },
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
@@ -74,6 +74,7 @@ use solana_sdk::{
     signature::{Keypair, Signature},
     signer::Signer,
 };
+use solana_system_interface::instruction as system_instruction;
 use tower_http::cors::{Any, CorsLayer};
 
 /// Accept orders under-collaterized upto this ratio.
@@ -445,10 +446,6 @@ pub async fn deposit_trade(
     State(server_params): State<&'static ServerParams>,
     Json(req): Json<DepositAndPlaceRequest>,
 ) -> impl axum::response::IntoResponse {
-    let signed_order_info = req
-        .swift_order
-        .order()
-        .info(&req.swift_order.taker_authority);
     let context = RequestContext::from_incoming_message(&req.swift_order);
     if context.is_err() {
         return (
@@ -462,6 +459,10 @@ pub async fn deposit_trade(
     let context = context.unwrap();
     let current_slot = server_params.slot_subscriber.current_slot();
 
+    let signed_order_info = req
+        .swift_order
+        .order()
+        .info(&req.swift_order.taker_authority);
     let max_margin_ratio = match extract_signed_message_info(
         &req.swift_order.order(),
         &req.swift_order.taker_authority,
@@ -539,8 +540,11 @@ pub async fn deposit_trade(
                 );
             }
             if let Some(acc) = res.accounts {
-                user_after_deposit =
-                    User::try_from_slice(&acc[0].as_ref().unwrap().data.decode().unwrap()).ok();
+                user_after_deposit = acc
+                    .first()
+                    .and_then(|a| a.as_ref())
+                    .and_then(|a| a.data.decode())
+                    .and_then(|data| User::try_deserialize(&mut data.as_slice()).ok());
             }
         }
         Err(err) => {
@@ -552,10 +556,10 @@ pub async fn deposit_trade(
         }
     }
 
-    if let Some(mut user) = user_after_deposit {
+    if let Some(user) = user_after_deposit {
         if !server_params.simulate_taker_order_local(
             &signed_order_info.order_params,
-            &mut user,
+            &user,
             max_margin_ratio,
             &context,
         ) {
@@ -861,7 +865,7 @@ pub async fn start_server() {
     let rpc_sim_loop = tokio::spawn(async {
         let sender = Keypair::new();
         let receiver = Keypair::new();
-        let instruction = solana_sdk::system_instruction::transfer(
+        let instruction = system_instruction::transfer(
             &sender.pubkey(),
             &receiver.pubkey(),
             1_000_000_000u64,
@@ -1010,12 +1014,12 @@ impl ServerParams {
     fn simulate_taker_order_local(
         &self,
         order_params: &OrderParams,
-        user: &mut drift_rs::types::accounts::User,
+        user: &drift_rs::types::accounts::User,
         max_margin_ratio: Option<u16>,
         context: &RequestContext,
     ) -> bool {
-        let state = match self.drift.state_account() {
-            Ok(s) => s,
+        let state_bytes = match self.drift.account_raw(state_account()) {
+            Ok(b) => b,
             Err(err) => {
                 log::warn!(
                     target: "sim",
@@ -1025,47 +1029,35 @@ impl ServerParams {
                 return false;
             }
         };
-        let mut hlm: HighLeverageModeConfig =
-            match self.drift.try_get_account(high_leverage_mode_account()) {
-                Ok(s) => s,
-                Err(err) => {
-                    log::warn!(
-                        target: "sim",
-                        "{}: HLM config account fetch failed: {err:?}",
-                        context.log_prefix
-                    );
-                    return false;
-                }
-            };
+
         let mut accounts_builder = AccountsListBuilder::default();
-        let accounts = accounts_builder.try_build(
+        let accounts = match accounts_builder.try_build(
             &self.drift,
             user,
             &[MarketId::new(
                 order_params.market_index,
                 order_params.market_type,
             )],
-        );
-        if let Err(err) = accounts {
-            log::warn!(
-                target: "sim",
-                "{}: couldn't build accounts for sim: {err:?}",
-                context.log_prefix
-            );
-            return false;
-        }
-
-        // simulation executed with error status
-        match drift_rs::ffi::simulate_place_perp_order(
-            user,
-            &mut accounts.unwrap(),
-            &state,
-            order_params,
-            Some(&mut hlm),
-            max_margin_ratio,
-            &mut None,
         ) {
-            Ok(_) => true,
+            Ok(a) => a,
+            Err(err) => {
+                log::warn!(
+                    target: "sim",
+                    "{}: couldn't build accounts for sim: {err:?}",
+                    context.log_prefix
+                );
+                return false;
+            }
+        };
+
+        match crate::util::local_sim::simulate_place_perp_order(
+            user,
+            accounts,
+            &state_bytes,
+            *order_params,
+            max_margin_ratio,
+        ) {
+            Ok(()) => true,
             Err(err) => {
                 log::debug!(
                     target: "sim",
@@ -1117,7 +1109,7 @@ impl ServerParams {
         }
 
         let user_result = user_with_timeout.unwrap();
-        let mut user = user_result.map_err(|err| {
+        let user = user_result.map_err(|err| {
             (
                 axum::http::StatusCode::NOT_FOUND,
                 format!("unable to fetch user: {err:?}"),
@@ -1135,10 +1127,9 @@ impl ServerParams {
 
         log::info!(
             target: "server",
-            "{:?}: max_leverage={},margin_mode={:?},activate_hlm={}",
+            "{:?}: max_leverage={},activate_hlm={}",
             user.authority,
             taker_order_params.base_asset_amount == u64::MAX,
-            user.margin_mode,
             taker_order_params.high_leverage_mode(),
         );
 
@@ -1158,7 +1149,7 @@ impl ServerParams {
         if isolated_deposit.is_none()
             && self.simulate_taker_order_local(
                 taker_order_params,
-                &mut user,
+                &user,
                 max_margin_ratio,
                 context,
             )
@@ -1233,7 +1224,9 @@ impl ServerParams {
                     );
                     let err = SdkError::Rpc(Box::new(client_error::Error {
                         request: None,
-                        kind: client_error::ErrorKind::TransactionError(simulate_err.to_owned()),
+                        kind: Box::new(client_error::ErrorKind::TransactionError(
+                            simulate_err.to_owned().into(),
+                        )),
                     }));
                     match err.to_anchor_error_code() {
                         Some(code) => {
@@ -1344,13 +1337,11 @@ impl ServerParams {
             }
         };
 
-        match drift_rs::ffi::simulate_will_auction_params_sanitize(
-            order_params,
-            &perp_market,
-            oracle_data.data.price,
-            true,
-        ) {
-            Ok(result) => result,
+        // Mirrors the on-chain `place_perp_order` sanitize step: returns true
+        // when the program would adjust the auction params at placement time.
+        let mut params = order_params.clone();
+        match params.update_perp_auction_params(&perp_market, oracle_data.data.price, true) {
+            Ok(sanitized) => sanitized,
             Err(err) => {
                 log::debug!(
                     target: "sim",
