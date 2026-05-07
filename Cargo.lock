@@ -1995,7 +1995,7 @@ dependencies = [
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=d419aa9#d419aa9c265767d5874bf1c765d305aa372de9ce"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=fbc2e12#fbc2e126004b3510a4350048d537f2668ceb6f55"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2017,7 +2017,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=d419aa9#d419aa9c265767d5874bf1c765d305aa372de9ce"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=fbc2e12#fbc2e126004b3510a4350048d537f2668ceb6f55"
 dependencies = [
  "futures-util",
  "gjson",
@@ -2039,7 +2039,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=d419aa9#d419aa9c265767d5874bf1c765d305aa372de9ce"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=fbc2e12#fbc2e126004b3510a4350048d537f2668ceb6f55"
 dependencies = [
  "ahash 0.8.12",
  "anchor-lang",
@@ -3019,7 +3019,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -4266,7 +4266,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4303,7 +4303,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
