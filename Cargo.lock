@@ -1995,7 +1995,7 @@ dependencies = [
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=c793431#c79343122bcce1189d7e768f7568c5275af5ba3f"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=d54bb79#d54bb798007b3d5fbddafcfa85c09378da251dad"
 dependencies = [
  "anchor-lang-idl",
  "proc-macro2",
@@ -2017,7 +2017,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=c793431#c79343122bcce1189d7e768f7568c5275af5ba3f"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=d54bb79#d54bb798007b3d5fbddafcfa85c09378da251dad"
 dependencies = [
  "futures-util",
  "gjson",
@@ -2039,7 +2039,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=c793431#c79343122bcce1189d7e768f7568c5275af5ba3f"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=d54bb79#d54bb798007b3d5fbddafcfa85c09378da251dad"
 dependencies = [
  "ahash 0.8.12",
  "anchor-lang",
