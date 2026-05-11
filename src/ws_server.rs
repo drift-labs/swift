@@ -984,7 +984,7 @@ fn decode_pubkey(request: &str) -> Result<Pubkey, &'static str> {
 #[cfg(test)]
 mod test {
     use serde_json::{json, Value};
-    use solana_sdk::signature::Keypair;
+    use solana_keypair::Keypair;
 
     use super::*;
 

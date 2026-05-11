@@ -1,7 +1,7 @@
 use std::time::UNIX_EPOCH;
 
 use drift_rs::types::MarketType;
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 
 use crate::types::messages::IncomingSignedMessage;
 

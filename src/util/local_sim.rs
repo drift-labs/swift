@@ -29,7 +29,7 @@ use drift::{
 };
 use solana_account_info::AccountInfo;
 use solana_clock::Clock;
-use solana_sdk::pubkey::Pubkey;
+use solana_pubkey::Pubkey;
 
 #[allow(deprecated)]
 fn account_info_from<'a>(slot: &'a mut (Pubkey, OwnedAccount)) -> AccountInfo<'a> {

@@ -12,7 +12,8 @@ use drift_rs::{
 use ed25519_dalek::{PublicKey, Signature, Verifier};
 use serde::de::value::StrDeserializer;
 use serde_json::json;
-use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+use solana_pubkey::Pubkey;
+use solana_transaction::versioned::VersionedTransaction;
 
 pub const MAX_SIGNED_MSG_BORSH_LEN: usize = IdlSignedMsgOrderParamsDelegateMessage::INIT_SPACE + 8;
 pub const MAX_SIGNED_MSG_HEX_LEN: usize = MAX_SIGNED_MSG_BORSH_LEN * 2;
@@ -350,7 +351,7 @@ mod tests {
         assert!(actual.verify_signature().is_ok());
         assert!(
             actual.signing_authority
-                == solana_sdk::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
+                == solana_pubkey::pubkey!("GiMXQkJXLVjScmQDkoLJShBJpTh9SDPvT2AZQq8NyEBf")
         );
         if let SignedOrderType::Delegated { inner, .. } = actual.order() {
             let expected = SignedMsgOrderParamsDelegateMessage {
@@ -373,7 +374,9 @@ mod tests {
                     auction_start_price: Some(2102419643),
                     auction_end_price: Some(2081603607),
                 },
-                taker_pubkey: solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"),
+                taker_pubkey: solana_pubkey::pubkey!(
+                    "4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE"
+                ),
                 slot: 369631527,
                 uuid: [115, 56, 108, 117, 74, 76, 90, 101],
                 take_profit_order_params: None,
@@ -450,7 +453,7 @@ mod tests {
         assert!(actual.verify_signature().is_ok());
         assert!(
             actual.signing_authority
-                == solana_sdk::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
+                == solana_pubkey::pubkey!("4rmhwytmKH1XsgGAUyUUH7U64HS5FtT6gM8HGKAfwcFE")
         );
 
         if let SignedOrderType::Authority {

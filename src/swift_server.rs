@@ -54,19 +54,18 @@ use log::warn;
 use prometheus::Registry;
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use solana_account_decoder_client_types::UiAccountEncoding;
+use solana_clock::Slot;
+use solana_hash::Hash;
+use solana_keypair::Keypair;
+use solana_message::v0::Message;
+use solana_pubkey::Pubkey;
 use solana_rpc_client_api::{
     client_error,
     config::{RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig},
     response::RpcSimulateTransactionResult,
 };
-use solana_sdk::{
-    clock::Slot,
-    hash::Hash,
-    message::v0::Message,
-    pubkey::Pubkey,
-    signature::{Keypair, Signature},
-    signer::Signer,
-};
+use solana_signature::Signature;
+use solana_signer::Signer;
 use solana_system_interface::instruction as system_instruction;
 use tower_http::cors::{Any, CorsLayer};
 
@@ -1140,7 +1139,7 @@ impl ServerParams {
         // supports privey wallets and how a swift order is intended to be placed anyway
         let message = tx
             .place_orders(vec![*taker_order_params])
-            .fee_payer(solana_sdk::pubkey!(
+            .fee_payer(solana_pubkey::pubkey!(
                 "Eiv8eZUWaEPMne8XjA6afzVJ2tJs1BJJ4a1MpZacMSRA"
             ))
             .build();
@@ -1613,7 +1612,7 @@ mod tests {
         SignedMsgTriggerOrderParams,
     };
     use ed25519_dalek::Signature as Ed25519Signature;
-    use solana_sdk::native_token::LAMPORTS_PER_SOL;
+    use solana_native_token::LAMPORTS_PER_SOL;
 
     fn is_isolated_deposit(signed_msg: &SignedOrderType) -> bool {
         match signed_msg {

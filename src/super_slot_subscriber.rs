@@ -7,7 +7,7 @@ use std::{
 };
 
 use drift_rs::{event_subscriber::PubsubClient, slot_subscriber::SlotSubscriber, RpcClient};
-use solana_sdk::clock::Slot;
+use solana_clock::Slot;
 
 /// Combines multiple slot subscribers for redundancy
 /// Tracks the latest slot known by its constituents

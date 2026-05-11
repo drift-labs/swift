@@ -4,7 +4,8 @@ use anchor_lang::AccountDeserialize;
 use base64::Engine;
 use drift_rs::{types::accounts::User, DriftClient};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
-use solana_sdk::{clock::Slot, pubkey::Pubkey};
+use solana_clock::Slot;
+use solana_pubkey::Pubkey;
 
 /// Fallback lookup strategy
 #[derive(Clone)]
@@ -140,7 +141,7 @@ impl UserAccountFetcher {
 #[cfg(test)]
 mod tests {
     use drift_rs::{Context, RpcClient};
-    use solana_sdk::signature::Keypair;
+    use solana_keypair::Keypair;
 
     use super::*;
 
@@ -157,14 +158,14 @@ mod tests {
         .unwrap();
         let u = UserAccountFetcher::from_env(drift.clone()).await;
         let keys = [
-            solana_sdk::pubkey!("9wcC14v9n3YvGenSnAnsA8yTwnCyUg3ayTBGaJUNEnn6"),
-            solana_sdk::pubkey!("6nBSTpFpAqw32CKdauAL1FnSLvrtUpBgeXXjPEL2ooB7"),
-            solana_sdk::pubkey!("ECqYuYada7SCFyJKX8ieRWyy4rTYh9eiEiofbftwy12V"),
-            solana_sdk::pubkey!("FGHNtir5sfFyQfiGZ1cPxagCFLrBA1B9qdEQSkeqw3rP"),
-            solana_sdk::pubkey!("FdXRVMFkNEXf9uWmcYfkxRvLTDKeY3X9uxhxaQLuuVHR"),
-            solana_sdk::pubkey!("2tyhK1zxrMYRNDZX9EnPDSAqBNYz8MXRwLVE96g5ZKEw"),
-            solana_sdk::pubkey!("34gEWrhb9WQd16DhS2o28A4xmBnXgE5caWe6kYhzY2XA"),
-            solana_sdk::pubkey!("9TDcwUU43bbhGM8JDMY7FT8797foKA32ekSH9eieT3jX"),
+            solana_pubkey::pubkey!("9wcC14v9n3YvGenSnAnsA8yTwnCyUg3ayTBGaJUNEnn6"),
+            solana_pubkey::pubkey!("6nBSTpFpAqw32CKdauAL1FnSLvrtUpBgeXXjPEL2ooB7"),
+            solana_pubkey::pubkey!("ECqYuYada7SCFyJKX8ieRWyy4rTYh9eiEiofbftwy12V"),
+            solana_pubkey::pubkey!("FGHNtir5sfFyQfiGZ1cPxagCFLrBA1B9qdEQSkeqw3rP"),
+            solana_pubkey::pubkey!("FdXRVMFkNEXf9uWmcYfkxRvLTDKeY3X9uxhxaQLuuVHR"),
+            solana_pubkey::pubkey!("2tyhK1zxrMYRNDZX9EnPDSAqBNYz8MXRwLVE96g5ZKEw"),
+            solana_pubkey::pubkey!("34gEWrhb9WQd16DhS2o28A4xmBnXgE5caWe6kYhzY2XA"),
+            solana_pubkey::pubkey!("9TDcwUU43bbhGM8JDMY7FT8797foKA32ekSH9eieT3jX"),
         ];
 
         let slot = drift.rpc().get_slot().await.unwrap();
