@@ -96,7 +96,7 @@ pub struct ServerParams {
     drift: drift_rs::DriftClient,
     slot_subscriber: Arc<SuperSlotSubscriber>,
     metrics: SwiftServerMetrics,
-    redis_pool: Option<MultiplexedConnection>,
+    redis_pool: MultiplexedConnection,
     user_account_fetcher: UserAccountFetcher,
     config: Arc<Config>,
     farmer_pubkeys: HashSet<Pubkey>,
@@ -385,11 +385,7 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
     let heartbeat_time = unix_now_ms();
     let log_prefix = format!("[heartbeat: {heartbeat_time}]");
 
-    let Some(mut conn) = server_params.redis_pool.clone() else {
-        log::error!(target: "redis", "{log_prefix}: no redis connection; skipping heartbeat");
-        return;
-    };
-
+    let mut conn = server_params.redis_pool.clone();
     let topic = "heartbeat";
     let start = std::time::Instant::now();
     let result: redis::RedisResult<i64> = conn
@@ -623,16 +619,10 @@ pub async fn health_check(
         true
     };
 
-    // Check if optional accounts are healthy
-    let redis_health = if server_params.redis_pool.is_some() {
-        if let Some(mut conn) = server_params.redis_pool.clone() {
-            let ping_result: redis::RedisResult<String> = conn.ping().await;
-            ping_result.is_ok()
-        } else {
-            false
-        }
-    } else {
-        true
+    let redis_health = {
+        let mut conn = server_params.redis_pool.clone();
+        let ping_result: redis::RedisResult<String> = conn.ping().await;
+        ping_result.is_ok()
     };
 
     // Check if server has metadata available for all spot and perp markets
@@ -677,10 +667,9 @@ pub async fn start_server() {
     // Start server
     dotenv().ok();
 
-    let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string()) == "true";
     let drift_env = env::var("ENV").unwrap_or("devnet".to_string());
 
-    log::info!(target: "server", "RUNNING_LOCAL: {running_local}, ENV: {drift_env}");
+    log::info!(target: "server", "ENV: {drift_env}");
 
     let redis_pool = {
         let elasticache_host =
@@ -697,12 +686,10 @@ pub async fn start_server() {
         };
         log::info!(target: "redis", "connecting to redis at {connection_string}");
         let client = redis::Client::open(connection_string).expect("valid redis URL");
-        Some(
-            client
-                .get_multiplexed_tokio_connection()
-                .await
-                .expect("redis connected"),
-        )
+        client
+            .get_multiplexed_tokio_connection()
+            .await
+            .expect("redis connected")
     };
 
     let rpc_endpoint =
@@ -1325,25 +1312,7 @@ impl ServerParams {
         metrics_labels: &[&str; 3],
         context: &RequestContext,
     ) -> (axum::http::StatusCode, ProcessOrderResponse) {
-        let Some(mut conn) = self.redis_pool.clone() else {
-            log::error!(
-                target: "redis",
-                "{} topic={topic}: no redis connection for order {uuid}",
-                context.log_prefix,
-            );
-            self.metrics
-                .redis_publish_fail_counter
-                .with_label_values(&[topic])
-                .inc();
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                ProcessOrderResponse {
-                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                    error: Some("redis connection unavailable".into()),
-                },
-            );
-        };
-
+        let mut conn = self.redis_pool.clone();
         let publish_start = std::time::Instant::now();
         let result: redis::RedisResult<i64> =
             conn.publish(topic.to_string(), payload.to_string()).await;
@@ -2237,6 +2206,11 @@ mod tests {
         dbg!(users.contains_key(&taker_pubkey));
         dbg!(users.contains_key(&taker_pubkey2));
 
+        let redis_pool = redis::Client::open("redis://localhost:6379")
+            .expect("valid redis URL")
+            .get_multiplexed_tokio_connection()
+            .await
+            .expect("redis connected");
         let server_params = ServerParams {
             slot_subscriber: Arc::new(SuperSlotSubscriber::new(vec![], drift.rpc())),
             metrics: SwiftServerMetrics::new(),
@@ -2244,7 +2218,7 @@ mod tests {
             config: Arc::new(crate::swift_server::Config::from_env()),
             drift,
             farmer_pubkeys: Default::default(),
-            redis_pool: Default::default(),
+            redis_pool,
         };
 
         // Create mock order params
