@@ -7,7 +7,6 @@ use std::{
 };
 
 use crate::{
-    connection::kafka_connect::KafkaClientBuilder,
     super_slot_subscriber::SuperSlotSubscriber,
     types::{
         messages::{
@@ -45,20 +44,14 @@ use drift_rs::{
     math::account_list_builder::AccountsListBuilder,
     swift_order_subscriber::{SignedMessageInfo, SignedOrderType},
     types::{
-        accounts::User,
-        errors::ErrorCode,
-        CommitmentConfig, MarketId, MarketStatus, MarketType, MarketTypeExt, OrderParams,
-        OrderParamsExt, OrderType, PositionDirection, ProgramError, SdkError, SdkResult,
-        SignedMsgTriggerOrderParams, VersionedMessage, VersionedTransaction,
+        accounts::User, errors::ErrorCode, CommitmentConfig, MarketId, MarketStatus, MarketType,
+        MarketTypeExt, OrderParams, OrderParamsExt, OrderType, PositionDirection, ProgramError,
+        SdkError, SdkResult, SignedMsgTriggerOrderParams, VersionedMessage, VersionedTransaction,
     },
     Context, DriftClient, RpcClient, TransactionBuilder, Wallet,
 };
 use log::warn;
 use prometheus::Registry;
-use rdkafka::{
-    producer::{FutureProducer, FutureRecord, Producer},
-    util::Timeout,
-};
 use redis::{aio::MultiplexedConnection, AsyncCommands};
 use solana_account_decoder_client_types::UiAccountEncoding;
 use solana_rpc_client_api::{
@@ -102,7 +95,6 @@ impl Config {
 pub struct ServerParams {
     drift: drift_rs::DriftClient,
     slot_subscriber: Arc<SuperSlotSubscriber>,
-    kafka_producer: Option<FutureProducer>,
     metrics: SwiftServerMetrics,
     redis_pool: Option<MultiplexedConnection>,
     user_account_fetcher: UserAccountFetcher,
@@ -393,51 +385,54 @@ pub async fn send_heartbeat(server_params: &'static ServerParams) {
     let heartbeat_time = unix_now_ms();
     let log_prefix = format!("[heartbeat: {heartbeat_time}]");
 
-    if let Some(kafka_producer) = &server_params.kafka_producer {
-        match kafka_producer
-            .send(
-                FutureRecord::<String, String>::to("heartbeat").payload(&"love you".to_string()),
-                Timeout::After(Duration::ZERO),
-            )
-            .await
-        {
-            Ok(_) => {
-                log::trace!(target: "kafka", "{log_prefix}: Sent heartbeat");
-                server_params
-                    .metrics
-                    .order_type_counter
-                    .with_label_values(&["_", "heartbeat", "_"])
-                    .inc();
-            }
-            Err((e, _)) => {
-                log::error!(
-                    target: "kafka",
-                    "{log_prefix}: Failed to deliver heartbeat, error: {e:?}"
-                );
-                server_params.metrics.kafka_forward_fail_counter.inc();
-            }
+    let Some(mut conn) = server_params.redis_pool.clone() else {
+        log::error!(target: "redis", "{log_prefix}: no redis connection; skipping heartbeat");
+        return;
+    };
+
+    let topic = "heartbeat";
+    let start = std::time::Instant::now();
+    let result: redis::RedisResult<i64> = conn
+        .publish(topic.to_string(), "love you".to_string())
+        .await;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    server_params
+        .metrics
+        .redis_publish_latency
+        .observe(elapsed_ms);
+
+    match result {
+        Ok(receivers) => {
+            log::trace!(
+                target: "redis",
+                "{log_prefix}: published heartbeat receivers={receivers} latency_ms={elapsed_ms:.2}"
+            );
+            server_params
+                .metrics
+                .order_type_counter
+                .with_label_values(&["_", "heartbeat", "_"])
+                .inc();
+            server_params
+                .metrics
+                .redis_publish_success_counter
+                .with_label_values(&[topic])
+                .inc();
+            server_params
+                .metrics
+                .redis_publish_subscribers
+                .with_label_values(&[topic])
+                .set(receivers);
         }
-    } else {
-        let conn = server_params.redis_pool.clone();
-        match conn
-            .unwrap()
-            .publish::<String, String, i64>("heartbeat".to_string(), "love you".to_string())
-            .await
-        {
-            Ok(_) => {
-                log::trace!(target: "redis", "{log_prefix}: Sent redis heartbeat");
-                server_params
-                    .metrics
-                    .order_type_counter
-                    .with_label_values(&["_", "heartbeat", "_"])
-                    .inc();
-            }
-            Err(e) => {
-                log::error!(
-                    target: "redis",
-                    "{log_prefix}: Failed to deliver heartbeat, error: {e:?}"
-                );
-            }
+        Err(e) => {
+            log::error!(
+                target: "redis",
+                "{log_prefix}: failed to publish heartbeat, error: {e:?}"
+            );
+            server_params
+                .metrics
+                .redis_publish_fail_counter
+                .with_label_values(&[topic])
+                .inc();
         }
     }
 }
@@ -682,45 +677,25 @@ pub async fn start_server() {
     // Start server
     dotenv().ok();
 
-    let use_kafka: bool = env::var("USE_KAFKA").unwrap_or_else(|_| "false".to_string()) == "true";
     let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string()) == "true";
     let drift_env = env::var("ENV").unwrap_or("devnet".to_string());
 
-    log::info!(target: "server", "USE_KAFKA: {use_kafka}, RUNNING_LOCAL: {running_local}, ENV: {drift_env}");
+    log::info!(target: "server", "RUNNING_LOCAL: {running_local}, ENV: {drift_env}");
 
-    let kafka_producer = if use_kafka {
-        let producer = if running_local {
-            log::info!(target: "kafka", "Starting local Kafka producer");
-            KafkaClientBuilder::local().producer()
-        } else {
-            log::info!(target: "kafka", "Starting AWS Kafka producer");
-            KafkaClientBuilder::aws_from_env().await.producer()
-        };
-
-        match producer {
-            Ok(prod) => Some(prod),
-            Err(e) => {
-                log::error!(target: "kafka", "Failed to create Kafka producer: {e:?}");
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
-    let redis_pool = if !use_kafka {
+    let redis_pool = {
         let elasticache_host =
             env::var("ELASTICACHE_HOST").unwrap_or_else(|_| "localhost".to_string());
         let elasticache_port = env::var("ELASTICACHE_PORT").unwrap_or_else(|_| "6379".to_string());
-        let connection_string = if env::var("USE_SSL")
+        let use_ssl = env::var("USE_SSL")
             .unwrap_or_else(|_| "false".to_string())
             .to_lowercase()
-            == "true"
-        {
+            == "true";
+        let connection_string = if use_ssl {
             format!("rediss://{}:{}", elasticache_host, elasticache_port)
         } else {
             format!("redis://{}:{}", elasticache_host, elasticache_port)
         };
+        log::info!(target: "redis", "connecting to redis at {connection_string}");
         let client = redis::Client::open(connection_string).expect("valid redis URL");
         Some(
             client
@@ -728,8 +703,6 @@ pub async fn start_server() {
                 .await
                 .expect("redis connected"),
         )
-    } else {
-        None
     };
 
     let rpc_endpoint =
@@ -781,7 +754,6 @@ pub async fn start_server() {
     let state: &'static ServerParams = Box::leak(Box::new(ServerParams {
         drift: client,
         slot_subscriber: Arc::new(slot_subscriber),
-        kafka_producer,
         metrics,
         redis_pool,
         user_account_fetcher,
@@ -865,11 +837,8 @@ pub async fn start_server() {
     let rpc_sim_loop = tokio::spawn(async {
         let sender = Keypair::new();
         let receiver = Keypair::new();
-        let instruction = system_instruction::transfer(
-            &sender.pubkey(),
-            &receiver.pubkey(),
-            1_000_000_000u64,
-        );
+        let instruction =
+            system_instruction::transfer(&sender.pubkey(), &receiver.pubkey(), 1_000_000_000u64);
 
         let mut interval = tokio::time::interval(Duration::from_secs(5));
 
@@ -1147,12 +1116,7 @@ impl ServerParams {
 
         // TODO: isolated deposits need changes for local simming
         if isolated_deposit.is_none()
-            && self.simulate_taker_order_local(
-                taker_order_params,
-                &user,
-                max_margin_ratio,
-                context,
-            )
+            && self.simulate_taker_order_local(taker_order_params, &user, max_margin_ratio, context)
         {
             sim_result = SimulationStatus::Success;
             log::info!(
@@ -1361,135 +1325,88 @@ impl ServerParams {
         metrics_labels: &[&str; 3],
         context: &RequestContext,
     ) -> (axum::http::StatusCode, ProcessOrderResponse) {
-        if let Some(kafka_producer) = &self.kafka_producer {
-            let enqueue_result = match kafka_producer
-                .send_result(FutureRecord::<String, String>::to(topic).payload(payload))
-            {
-                Ok(fut) => fut.await,
-                Err((err, _)) => {
-                    log::error!(
-                        target: "kafka",
-                        "{} topic={topic}: failed to queue order {uuid}, error: {err:?}",
-                        context.log_prefix,
-                    );
-                    self.metrics.kafka_forward_fail_counter.inc();
-                    return (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                            error: Some(format!("kafka publish error: {err:?}")),
-                        },
-                    );
-                }
-            };
+        let Some(mut conn) = self.redis_pool.clone() else {
+            log::error!(
+                target: "redis",
+                "{} topic={topic}: no redis connection for order {uuid}",
+                context.log_prefix,
+            );
+            self.metrics
+                .redis_publish_fail_counter
+                .with_label_values(&[topic])
+                .inc();
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                ProcessOrderResponse {
+                    message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
+                    error: Some("redis connection unavailable".into()),
+                },
+            );
+        };
 
-            match enqueue_result {
-                Ok(Ok(_delivery_result)) => {
-                    log::trace!(
-                        target: "kafka",
-                        "{} topic={topic}: queued message for order {uuid}",
+        let publish_start = std::time::Instant::now();
+        let result: redis::RedisResult<i64> =
+            conn.publish(topic.to_string(), payload.to_string()).await;
+        let publish_rtt_ms = publish_start.elapsed().as_secs_f64() * 1000.0;
+        self.metrics.redis_publish_latency.observe(publish_rtt_ms);
+
+        match result {
+            Ok(receivers) => {
+                self.metrics
+                    .order_type_counter
+                    .with_label_values(metrics_labels)
+                    .inc();
+                self.metrics
+                    .redis_publish_success_counter
+                    .with_label_values(&[topic])
+                    .inc();
+                self.metrics
+                    .redis_publish_subscribers
+                    .with_label_values(&[topic])
+                    .set(receivers);
+                self.metrics
+                    .response_time_histogram
+                    .observe((unix_now_ms() - context.recv_ts) as f64);
+
+                let publish_latency = unix_now_ms().saturating_sub(context.recv_ts);
+                if receivers == 0 && topic != "heartbeat" {
+                    log::warn!(
+                        target: "redis",
+                        "{} topic={topic}: published order {uuid} latency_ms={publish_latency} publish_rtt_ms={publish_rtt_ms:.2} receivers=0",
                         context.log_prefix
                     );
-                    self.metrics
-                        .order_type_counter
-                        .with_label_values(metrics_labels)
-                        .inc();
-
-                    self.metrics
-                        .kafka_inflight_count
-                        .set(kafka_producer.in_flight_count() as i64);
-
-                    self.metrics
-                        .response_time_histogram
-                        .observe((unix_now_ms() - context.recv_ts) as f64);
-
-                    let publish_latency = unix_now_ms().saturating_sub(context.recv_ts);
+                } else {
                     log::info!(
-                        target: "kafka",
-                        "{} topic={topic}: published order {uuid} latency_ms={publish_latency}",
+                        target: "redis",
+                        "{} topic={topic}: published order {uuid} latency_ms={publish_latency} publish_rtt_ms={publish_rtt_ms:.2} receivers={receivers}",
                         context.log_prefix
                     );
-                    (
-                        axum::http::StatusCode::OK,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                            error: None,
-                        },
-                    )
                 }
-                Ok(Err((e, _))) => {
-                    log::error!(
-                        target: "kafka",
-                        "{} topic={topic}: failed to deliver order {uuid}, error: {e:?}",
-                        context.log_prefix
-                    );
-                    self.metrics.kafka_forward_fail_counter.inc();
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                            error: Some(format!("kafka publish error: {e:?}")),
-                        },
-                    )
-                }
-                Err(_) => {
-                    log::error!(
-                        target: "kafka",
-                        "{} topic={topic}: failed to queue order {uuid}",
-                        context.log_prefix,
-                    );
-                    self.metrics.kafka_forward_fail_counter.inc();
-                    (
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
-                            error: Some("kafka publish error".into()),
-                        },
-                    )
-                }
+                (
+                    axum::http::StatusCode::OK,
+                    ProcessOrderResponse {
+                        message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
+                        error: None,
+                    },
+                )
             }
-        } else {
-            let mut conn = self.redis_pool.clone().unwrap();
-            match conn
-                .publish::<String, String, i64>(topic.to_string(), payload.to_string())
-                .await
-            {
-                Ok(_) => {
-                    log::trace!(
-                        target: "redis",
-                        "{} topic={topic}: queued redis message for order {uuid}",
-                        context.log_prefix
-                    );
-                    self.metrics
-                        .order_type_counter
-                        .with_label_values(metrics_labels)
-                        .inc();
-
-                    self.metrics
-                        .response_time_histogram
-                        .observe((unix_now_ms() - context.recv_ts) as f64);
-
-                    let publish_latency = unix_now_ms().saturating_sub(context.recv_ts);
-                    log::info!(
-                        target: "redis",
-                        "{} topic={topic}: published order {uuid} latency_ms={publish_latency}",
-                        context.log_prefix
-                    );
-                    (
-                        axum::http::StatusCode::OK,
-                        ProcessOrderResponse {
-                            message: PROCESS_ORDER_RESPONSE_MESSAGE_SUCCESS,
-                            error: None,
-                        },
-                    )
-                }
-                Err(e) => (
+            Err(e) => {
+                log::error!(
+                    target: "redis",
+                    "{} topic={topic}: failed to publish order {uuid}, error: {e:?}",
+                    context.log_prefix
+                );
+                self.metrics
+                    .redis_publish_fail_counter
+                    .with_label_values(&[topic])
+                    .inc();
+                (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     ProcessOrderResponse {
                         message: PROCESS_ORDER_RESPONSE_ERROR_MSG_DELIVERY_FAILED,
                         error: Some(format!("redis publish error: {e:?}")),
                     },
-                ),
+                )
             }
         }
     }
@@ -2327,7 +2244,6 @@ mod tests {
             config: Arc::new(crate::swift_server::Config::from_env()),
             drift,
             farmer_pubkeys: Default::default(),
-            kafka_producer: Default::default(),
             redis_pool: Default::default(),
         };
 

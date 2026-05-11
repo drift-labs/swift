@@ -11,7 +11,7 @@ pub enum WsError {
     Unauthenticated,
     /// Client failed to authenticate its challenge
     FailedChallenge,
-    /// Unknown kafkas topic
+    /// Unknown topic
     UnknownTopic(String),
     /// Server couldn't handle the message backpressure
     /// in a timely manner

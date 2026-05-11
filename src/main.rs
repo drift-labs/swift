@@ -1,7 +1,6 @@
 use clap::{Arg, Command};
 
 mod confirmation_server;
-mod connection;
 mod super_slot_subscriber;
 mod swift_server;
 mod types;

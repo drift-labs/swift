@@ -1,46 +1,36 @@
 services:
-  zookeeper:
-    image: wurstmeister/zookeeper:latest
+  redis:
+    image: redis:7-alpine
     ports:
-      - "2181:2181"
+      - "6379:6379"
 
-  kafka:
-    depends_on:
-    - zookeeper
-    image: wurstmeister/kafka:latest
-    ports:
-      - "9092:9092"
-      - "9093:9093"
-    environment:
-      KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka:9093,OUTSIDE://host.docker.internal:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
-      KAFKA_LISTENERS: INSIDE://0.0.0.0:9093,OUTSIDE://0.0.0.0:9092
-      KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-  
   fastlane:
     build: .
     depends_on:
-    - kafka
+    - redis
     ports:
       - "3000:3000"
-    command: ["--server", "fastlane"]
+    command: ["--server", "swift"]
     platform: "linux/amd64"
     environment:
-      RUST_LOG: "kafka=debug,ws=debug"
+      RUST_LOG: "redis=debug,ws=debug,server=info"
       RUNNING_LOCAL: true
+      ELASTICACHE_HOST: redis
+      ELASTICACHE_PORT: 6379
+      USE_SSL: "false"
       ENDPOINT: "https://api.devnet.solana.com"
-  
+
   fastlane-ws:
     build: .
     depends_on:
-    - kafka
+    - redis
     ports:
     - "6969:6969"
     command: ["--server", "ws"]
     platform: "linux/amd64"
     environment:
-      RUST_LOG: "info"
+      RUST_LOG: "redis=info,ws=info"
       RUNNING_LOCAL: true
+      ELASTICACHE_HOST: redis
+      ELASTICACHE_PORT: 6379
+      USE_SSL: "false"

@@ -72,12 +72,10 @@ pub fn simulate_place_perp_order(
     }
 
     let spot_infos = build_infos(&mut accounts.spot_markets);
-    let spot_map =
-        SpotMarketMap::load(&Default::default(), &mut spot_infos.iter().peekable())?;
+    let spot_map = SpotMarketMap::load(&Default::default(), &mut spot_infos.iter().peekable())?;
 
     let perp_infos = build_infos(&mut accounts.perp_markets);
-    let perp_map =
-        PerpMarketMap::load(&Default::default(), &mut perp_infos.iter().peekable())?;
+    let perp_map = PerpMarketMap::load(&Default::default(), &mut perp_infos.iter().peekable())?;
 
     let oracle_infos = build_infos(&mut accounts.oracles);
     let mut oracle_map = OracleMap::load(

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use prometheus::{
     Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec,
-    IntGauge, Opts, Registry, TextEncoder,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -34,11 +34,13 @@ pub async fn metrics_handler(
 pub struct SwiftServerMetrics {
     pub taker_orders_counter: Counter,
     pub order_type_counter: CounterVec,
-    pub kafka_forward_fail_counter: Counter,
+    pub redis_publish_fail_counter: CounterVec,
+    pub redis_publish_success_counter: CounterVec,
+    pub redis_publish_latency: Histogram,
+    pub redis_publish_subscribers: IntGaugeVec,
     pub current_slot_gauge: Gauge,
     pub rpc_simulation_status: CounterVec,
     pub response_time_histogram: Histogram,
-    pub kafka_inflight_count: IntGauge,
 }
 
 impl SwiftServerMetrics {
@@ -56,9 +58,36 @@ impl SwiftServerMetrics {
             &["market_type", "market_index", "sanitized"],
         )
         .unwrap();
-        let kafka_forward_fail_counter = Counter::new(
-            "swift_kafka_forward_fail_count",
-            "Number of failed forwards to Kafka",
+        let redis_publish_fail_counter = CounterVec::new(
+            Opts::new(
+                "swift_redis_publish_fail_count",
+                "Number of failed Redis publishes (by topic)",
+            ),
+            &["topic"],
+        )
+        .unwrap();
+        let redis_publish_success_counter = CounterVec::new(
+            Opts::new(
+                "swift_redis_publish_success_count",
+                "Number of successful Redis publishes (by topic)",
+            ),
+            &["topic"],
+        )
+        .unwrap();
+        let redis_publish_latency = Histogram::with_opts(HistogramOpts {
+            common_opts: Opts::new(
+                "swift_redis_publish_latency_ms",
+                "Redis PUBLISH round-trip latency in ms",
+            ),
+            buckets: prometheus::exponential_buckets(0.5, 2.0, 10).unwrap(),
+        })
+        .unwrap();
+        let redis_publish_subscribers = IntGaugeVec::new(
+            Opts::new(
+                "swift_redis_publish_subscribers",
+                "Subscriber count returned by the last Redis PUBLISH (by topic)",
+            ),
+            &["topic"],
         )
         .unwrap();
         let current_slot_gauge = Gauge::new("swift_current_slot", "Current slot").unwrap();
@@ -70,8 +99,6 @@ impl SwiftServerMetrics {
             buckets: prometheus::exponential_buckets(1.0, 2.0, 10).unwrap(),
         })
         .unwrap();
-        let kafka_inflight_count =
-            IntGauge::new("swift_kafka_inflight_count", "Inflight kafka messages").unwrap();
         let rpc_simulation_status = CounterVec::new(
             Opts::new("swift_rpc_sim_status", "RPC order simulation status"),
             &["status"],
@@ -81,11 +108,13 @@ impl SwiftServerMetrics {
         SwiftServerMetrics {
             taker_orders_counter,
             order_type_counter,
-            kafka_forward_fail_counter,
+            redis_publish_fail_counter,
+            redis_publish_success_counter,
+            redis_publish_latency,
+            redis_publish_subscribers,
             current_slot_gauge,
             rpc_simulation_status,
             response_time_histogram,
-            kafka_inflight_count,
         }
     }
 
@@ -97,16 +126,22 @@ impl SwiftServerMetrics {
             .register(Box::new(self.order_type_counter.clone()))
             .unwrap();
         registry
-            .register(Box::new(self.kafka_forward_fail_counter.clone()))
+            .register(Box::new(self.redis_publish_fail_counter.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.redis_publish_success_counter.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.redis_publish_latency.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.redis_publish_subscribers.clone()))
             .unwrap();
         registry
             .register(Box::new(self.current_slot_gauge.clone()))
             .unwrap();
         registry
             .register(Box::new(self.response_time_histogram.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(self.kafka_inflight_count.clone()))
             .unwrap();
         registry
             .register(Box::new(self.rpc_simulation_status.clone()))
@@ -116,7 +151,9 @@ impl SwiftServerMetrics {
 
 #[derive(Clone)]
 pub struct WsServerMetrics {
-    pub kafka_message_forward_latency: HistogramVec,
+    pub redis_message_forward_latency: HistogramVec,
+    pub redis_messages_received: CounterVec,
+    pub redis_subscriber_reconnects: Counter,
     pub ws_connections: GaugeVec,
     pub ws_outbox_size: Histogram,
     pub ws_connection_errors: CounterVec,
@@ -124,13 +161,26 @@ pub struct WsServerMetrics {
 
 impl WsServerMetrics {
     pub fn new() -> Self {
-        let kafka_message_forward_latency = HistogramVec::new(
+        let redis_message_forward_latency = HistogramVec::new(
             HistogramOpts::new(
-                "swift_kafka_message_latency_seconds",
-                "Latency of messages forwarded through Kafka in seconds",
+                "swift_redis_message_latency_seconds",
+                "Latency of messages forwarded through Redis in seconds",
             )
-            .buckets(prometheus::exponential_buckets(0.005, 2.0, 10).unwrap()), // Adjust these values as needed
+            .buckets(prometheus::exponential_buckets(0.005, 2.0, 10).unwrap()),
             &["topic"],
+        )
+        .unwrap();
+        let redis_messages_received = CounterVec::new(
+            Opts::new(
+                "swift_redis_messages_received_count",
+                "Number of Redis pubsub messages received (by topic)",
+            ),
+            &["topic"],
+        )
+        .unwrap();
+        let redis_subscriber_reconnects = Counter::new(
+            "swift_redis_subscriber_reconnects_count",
+            "Number of times the Redis pubsub subscriber task has restarted",
         )
         .unwrap();
         let ws_connections = GaugeVec::new(
@@ -155,7 +205,9 @@ impl WsServerMetrics {
         .unwrap();
 
         WsServerMetrics {
-            kafka_message_forward_latency,
+            redis_message_forward_latency,
+            redis_messages_received,
+            redis_subscriber_reconnects,
             ws_connections,
             ws_outbox_size,
             ws_connection_errors,
@@ -164,7 +216,13 @@ impl WsServerMetrics {
 
     pub fn register(&self, registry: &prometheus::Registry) {
         registry
-            .register(Box::new(self.kafka_message_forward_latency.clone()))
+            .register(Box::new(self.redis_message_forward_latency.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.redis_messages_received.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(self.redis_subscriber_reconnects.clone()))
             .unwrap();
         registry
             .register(Box::new(self.ws_connections.clone()))

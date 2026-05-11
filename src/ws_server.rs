@@ -33,10 +33,6 @@ use futures_util::{
 use log::{debug, warn};
 use prometheus::Registry;
 use rand::Rng;
-use rdkafka::{
-    consumer::{Consumer, StreamConsumer},
-    Message as KafkaMessage,
-};
 use serde::Deserialize;
 use tokio::{
     io::AsyncWriteExt,
@@ -49,10 +45,8 @@ use tokio::{
 use tokio_tungstenite::tungstenite::{
     self, extensions::DeflateConfig, protocol::WebSocketConfig, Message,
 };
-use uuid::Uuid;
 
 use crate::{
-    connection::kafka_connect::KafkaClientBuilder,
     types::{
         messages::{
             OrderMetadataAndMessage, SubscribeActions, WsAuthMessage, WsClientMessage, WsMessage,
@@ -70,7 +64,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const FAST_SLOW_WS_DIFF: Duration = Duration::from_secs(1);
 
 const HEARTBEAT_LOG_INTERVAL_MS: u64 = 30_000;
-static LAST_KAFKA_HEARTBEAT_LOG_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_REDIS_HEARTBEAT_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
 fn should_log_heartbeat(last_log: &AtomicU64) -> bool {
@@ -456,7 +449,7 @@ impl WsConnection {
         let res = 'handler: loop {
             let is_fast_ws = self.is_fast();
             let has_subs = !self.subscribed_topics.is_empty();
-            let mut kafka_subs =
+            let mut topic_subs =
                 FuturesUnordered::from_iter(self.subscribed_topics.iter_mut().map(|r| r.1.recv()))
                     .try_ready_chunks(8);
             tokio::select! {
@@ -466,7 +459,7 @@ impl WsConnection {
                     debug!(target: "ws", "queued {n_read} outbox messages");
                 }
                 client_message = ws_stream.next() => {
-                    drop(kafka_subs);
+                    drop(topic_subs);
                     match client_message {
                             Some(Ok(Message::Text(ref message))) => {
                                 match serde_json::from_str::<WsClientMessage>(message) {
@@ -510,13 +503,12 @@ impl WsConnection {
                             }
                         }
                 },
-                batch_updates = kafka_subs.next(), if has_subs => {
-                    // forward kafka messages to the outbox
+                batch_updates = topic_subs.next(), if has_subs => {
+                    // forward broadcast messages to the outbox
                     match batch_updates {
                         Some(Ok(updates)) => {
                             if is_fast_ws {
                                 for new_order_info in updates {
-                                    // forward kafka messages to the outbox
                                     if let Err(err) = self.message_tx.try_send(new_order_info.json) {
                                         // client will miss this message
                                         // either channel is full or closed
@@ -533,7 +525,6 @@ impl WsConnection {
                                 tokio::spawn(async move {
                                     let _ = delay_fut.await;
                                     for new_order_info in updates {
-                                        // forward kafka messages to the outbox
                                         if let Err(err) = sender.try_send(new_order_info.json) {
                                             // client will miss this message
                                             // either channel is full or closed
@@ -546,7 +537,7 @@ impl WsConnection {
                         Some(Err(err)) => {
                             log::error!(
                                 target: "ws",
-                                "{:?}. couldn't load kafka msg: {err:?}",
+                                "{:?}. couldn't load msg: {err:?}",
                                 self.pubkey.to_string()
                             );
                             break 'handler Err(WsError::ChannelClosed);
@@ -562,7 +553,7 @@ impl WsConnection {
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    drop(kafka_subs);
+                    drop(topic_subs);
                     if !self.authenticated {
                         debug!(
                             target: "ws",
@@ -618,159 +609,6 @@ impl WsConnection {
     }
 }
 
-async fn subscribe_kafka_consumer(
-    kafka_consumer: &StreamConsumer,
-    server_params: &'static ServerParams,
-    topics_prefix: &str,
-) {
-    kafka_consumer
-        .subscribe(&[topics_prefix, "heartbeat"])
-        .context("Failed to subscribe to topics")
-        .expect("subscribed topic prefix");
-
-    log::info!(
-        target: "kafka",
-        "subscribed to topics: '{topics_prefix}'",
-    );
-    loop {
-        match kafka_consumer.recv().await {
-            Ok(message) => {
-                let topic = message.topic();
-
-                // encountered new topic
-                if !server_params.subscriptions.contains_key(topic) {
-                    log::info!(target: "kafka", "loaded new topic: {topic}");
-                    server_params
-                        .subscriptions
-                        .insert(topic.to_string(), broadcast::channel(20).0);
-                };
-
-                let tx = server_params
-                    .subscriptions
-                    .get(topic)
-                    .expect("topic channel exists");
-
-                let receiver_count = tx.receiver_count();
-                if receiver_count == 0 {
-                    if topic != "heartbeat" {
-                        log::warn!(
-                            target: "kafka",
-                            "No receiver found for topic: {topic}, dropping order message"
-                        );
-                    } else if should_log_heartbeat(&LAST_KAFKA_HEARTBEAT_LOG_MS) {
-                        log::trace!(target: "kafka", "Received heartbeat message");
-                    }
-                    continue;
-                }
-                let payload: &[u8] = message.payload().context("Failed to get payload").unwrap();
-                let payload_str = std::str::from_utf8(payload)
-                    .context("Failed to convert payload to string")
-                    .unwrap();
-
-                let (order_metadata, deposit) = if !topic.contains("deposit") {
-                    (
-                        OrderMetadataAndMessage::decode(payload_str)
-                            .context("Failed to decode order metadata"),
-                        None,
-                    )
-                } else {
-                    #[derive(Deserialize)]
-                    struct DepositOrder<'a> {
-                        #[serde(borrow)]
-                        deposit: &'a str,
-                        #[serde(borrow)]
-                        order: &'a str,
-                    }
-                    let value: DepositOrder = serde_json::from_str(payload_str).unwrap();
-                    (
-                        OrderMetadataAndMessage::decode(value.order)
-                            .context("Failed to decode order metadata"),
-                        Some(value.deposit),
-                    )
-                };
-
-                if let Err(ref err) = order_metadata {
-                    log::error!(target: "kafka", "Failed to decode order metadata: {err:?}, {order_metadata:?}");
-                    continue;
-                }
-                let order_metadata = order_metadata.unwrap();
-                let now_ms = unix_now_ms();
-                let forward_latency = now_ms.saturating_sub(order_metadata.ts);
-                server_params
-                    .metrics
-                    .kafka_message_forward_latency
-                    .with_label_values(&[topic])
-                    .observe(forward_latency as f64);
-
-                let SignedMessageInfo {
-                    taker_pubkey: taker_subaccount,
-                    order_params,
-                    ..
-                } = order_metadata.order_info();
-
-                log::info!(
-                    target: "kafka",
-                    "topic={topic} uuid={} market_type={} market_index={} direction={:?} base={} price={} order_type={:?} taker_authority={} signer={} taker_subaccount={} will_sanitize={} deposit_present={} recv_lag_ms={forward_latency} receivers={receiver_count}",
-                    order_metadata.uuid(),
-                    order_params.market_type.as_str(),
-                    order_params.market_index,
-                    order_params.direction,
-                    order_params.base_asset_amount,
-                    order_params.price,
-                    order_params.order_type,
-                    order_metadata.taker_authority,
-                    order_metadata.signing_authority,
-                    taker_subaccount,
-                    order_metadata.will_sanitize,
-                    deposit.is_some(),
-                );
-
-                let mut message = WsMessage::new(topic).set_order(&order_metadata);
-                // order has a deposit tx attached
-                if let Some(deposit) = deposit {
-                    message = message.set_deposit(deposit);
-                }
-
-                log::trace!("message jsonify(): {:?}", message);
-                match tx.send(OrderNotification {
-                    json: message.jsonify(),
-                    recv_lag: forward_latency,
-                }) {
-                    Ok(_) => {
-                        log::debug!(
-                            target: "kafka",
-                            "topic={topic} uuid={} forwarded at {} receivers={receiver_count}",
-                            order_metadata.uuid(),
-                            now_ms,
-                        );
-                    }
-                    Err(e) => {
-                        log::error!(
-                            target: "kafka",
-                            "topic={topic} uuid={} failed to forward at {} error={e:?}",
-                            order_metadata.uuid(),
-                            now_ms,
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                log::error!("Error receiving message: {e:?}");
-                if let Ok(partitions) = kafka_consumer.assignment() {
-                    for partition in partitions.elements() {
-                        log::error!(
-                            target: "kafka",
-                            "Currently assigned topic: {}, partition: {}",
-                            partition.topic(),
-                            partition.partition()
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
 async fn subscribe_redis_pubsub(
     mut redis: redis::aio::PubSub,
     server_params: &'static ServerParams,
@@ -788,13 +626,15 @@ async fn subscribe_redis_pubsub(
         return Err(());
     }
 
+    log::info!(target: "redis", "subscribed to {} topics", all_topics.len());
+
     let mut stream = redis.on_message();
     while let Some(message) = stream.next().await {
         let topic = message.get_channel_name();
 
         // encountered new topic
         if !server_params.subscriptions.contains_key(topic) {
-            log::info!(target: "ws", "loaded new topic: {topic}");
+            log::info!(target: "redis", "loaded new topic: {topic}");
             server_params
                 .subscriptions
                 .insert(topic.to_string(), broadcast::channel(20).0);
@@ -805,12 +645,18 @@ async fn subscribe_redis_pubsub(
             .get(topic)
             .expect("topic channel exists");
 
+        server_params
+            .metrics
+            .redis_messages_received
+            .with_label_values(&[topic])
+            .inc();
+
         let receiver_count = tx.receiver_count();
         if receiver_count == 0 {
             if topic != "heartbeat" {
-                log::warn!(target: "ws", "No receiver found for topic: {topic}, dropping order message!");
+                log::warn!(target: "redis", "No receiver found for topic: {topic}, dropping order message!");
             } else if should_log_heartbeat(&LAST_REDIS_HEARTBEAT_LOG_MS) {
-                log::trace!(target: "ws", "Received heartbeat message");
+                log::trace!(target: "redis", "Received heartbeat message");
             }
             continue;
         }
@@ -842,7 +688,7 @@ async fn subscribe_redis_pubsub(
         };
 
         if let Err(ref err) = order_metadata {
-            log::error!(target: "ws", "Failed to decode order metadata: {err:?}, {order_metadata:?}");
+            log::error!(target: "redis", "Failed to decode order metadata: {err:?}, {order_metadata:?}");
             continue;
         }
         let order_metadata = order_metadata.unwrap();
@@ -851,9 +697,9 @@ async fn subscribe_redis_pubsub(
 
         server_params
             .metrics
-            .kafka_message_forward_latency
+            .redis_message_forward_latency
             .with_label_values(&[topic])
-            .observe(forward_latency as f64);
+            .observe(forward_latency as f64 / 1000.0);
 
         let SignedMessageInfo {
             taker_pubkey: taker_subaccount,
@@ -962,64 +808,51 @@ pub async fn start_server() {
         metrics: ws_metrics,
     }));
 
-    // Create the kafka consumer and subscribe
-    let use_kafka: bool = env::var("USE_KAFKA").unwrap_or_else(|_| "false".to_string()) == "true";
-    log::info!(target: "ws", "use_kafka: {use_kafka}");
-
-    if use_kafka {
-        let running_local = env::var("RUNNING_LOCAL").unwrap_or("false".to_string());
-        let kafka_consumer = if running_local == "true" {
-            log::info!(target: "kafka", "starting local consumer");
-            KafkaClientBuilder::local().consumer()
-        } else {
-            log::info!(target: "kafka", "starting aws consumer");
-            KafkaClientBuilder::aws_from_env()
-                .await
-                .uuid(Uuid::new_v4())
-                .consumer()
-        };
-
-        if let Err(err) = kafka_consumer {
-            log::error!(target: "kafka", "Failed to create consumer: {err:?}");
-            return;
-        }
-
-        // Subscribe to kafka messages on a background task
-        tokio::spawn(async move {
-            let _ =
-                subscribe_kafka_consumer(&kafka_consumer.unwrap(), state, "^swift_orders_.*").await;
-            log::warn!(target: "kafka", "kafka subscriber task ended");
-            std::process::exit(1);
-        });
+    // Create the redis pubsub subscriber
+    let elasticache_host = env::var("ELASTICACHE_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let elasticache_port = env::var("ELASTICACHE_PORT").unwrap_or_else(|_| "6379".to_string());
+    let connection_string = if env::var("USE_SSL").unwrap_or_else(|_| "false".to_string()) == "true"
+    {
+        format!("rediss://{}:{}", elasticache_host, elasticache_port)
     } else {
-        let elasticache_host =
-            env::var("ELASTICACHE_HOST").unwrap_or_else(|_| "localhost".to_string());
-        let elasticache_port = env::var("ELASTICACHE_PORT").unwrap_or_else(|_| "6379".to_string());
-        let connection_string =
-            if env::var("USE_SSL").unwrap_or_else(|_| "false".to_string()) == "true" {
-                format!("rediss://{}:{}", elasticache_host, elasticache_port)
-            } else {
-                format!("redis://{}:{}", elasticache_host, elasticache_port)
-            };
+        format!("redis://{}:{}", elasticache_host, elasticache_port)
+    };
 
-        log::info!(target: "ws", "connecting to redis at {connection_string}");
+    log::info!(target: "redis", "connecting to redis at {connection_string}");
 
-        let client = redis::Client::open(connection_string)
-            .context("Failed to create redis client")
-            .expect("redis client created");
+    let redis_client = redis::Client::open(connection_string)
+        .context("Failed to create redis client")
+        .expect("redis client created");
 
-        let pubsub = client
-            .get_async_pubsub()
-            .await
-            .context("Failed to create redis pubsub")
-            .expect("redis pubsub created");
-
-        tokio::spawn(async move {
-            let _ = subscribe_redis_pubsub(pubsub, state, topic_names).await;
-            log::warn!(target: "redis", "redis subscriber task ended");
-            std::process::exit(1);
-        });
-    }
+    tokio::spawn(async move {
+        // Reconnect loop: if the subscriber exits, try to re-establish the pubsub
+        // connection rather than tearing down the whole ws server.
+        let mut attempt: u32 = 0;
+        loop {
+            match redis_client.get_async_pubsub().await {
+                Ok(pubsub) => {
+                    if attempt > 0 {
+                        log::info!(target: "redis", "pubsub reconnected after {attempt} attempts");
+                    }
+                    attempt = 0;
+                    let _ = subscribe_redis_pubsub(pubsub, state, topic_names.clone()).await;
+                    log::warn!(target: "redis", "redis subscriber task ended; reconnecting");
+                    state.metrics.redis_subscriber_reconnects.inc();
+                }
+                Err(err) => {
+                    log::error!(
+                        target: "redis",
+                        "failed to create redis pubsub (attempt {attempt}): {err:?}"
+                    );
+                    state.metrics.redis_subscriber_reconnects.inc();
+                }
+            }
+            attempt = attempt.saturating_add(1);
+            // exponential-ish backoff, capped at 30s
+            let backoff_ms = 250u64.saturating_mul(1u64 << attempt.min(7));
+            tokio::time::sleep(Duration::from_millis(backoff_ms.min(30_000))).await;
+        }
+    });
 
     // Metrics
     let registry = Arc::new(registry);
@@ -1404,7 +1237,7 @@ mod test {
                 .fast_ws
                 .store(is_fast, std::sync::atomic::Ordering::Relaxed);
 
-            // spawn 'kafka producer'
+            // spawn upstream publisher
             tokio::spawn(async move {
                 // wait to send the update after the Ws connection is alive
                 tokio::time::sleep(Duration::from_millis(50)).await;
