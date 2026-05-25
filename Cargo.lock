@@ -1438,7 +1438,7 @@ checksum = "77c90badedccf4105eca100756a0b1289e191f6fcbdadd3cee1d2f614f97da8f"
 [[package]]
 name = "drift"
 version = "2.162.0"
-source = "git+ssh://git@github.com/drift-labs/protocol-v2-shadow?rev=a0bdfea74bff46fae3f280acefed35f6b634dc67#a0bdfea74bff46fae3f280acefed35f6b634dc67"
+source = "git+https://github.com/drift-labs/protocol-v2?rev=a0bdfea74bff46fae3f280acefed35f6b634dc67#a0bdfea74bff46fae3f280acefed35f6b634dc67"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
@@ -1463,7 +1463,7 @@ dependencies = [
 [[package]]
 name = "drift-idl-gen"
 version = "0.2.0"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=534600c#534600ccdb1e5db7385400ab5e531617daf63746"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=77a466c#77a466cd03e5c44b5d9a533afe16291b6047d311"
 dependencies = [
  "anchor-lang-idl",
  "proc-macro2",
@@ -1485,7 +1485,7 @@ dependencies = [
 [[package]]
 name = "drift-pubsub-client"
 version = "0.1.1"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=534600c#534600ccdb1e5db7385400ab5e531617daf63746"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=77a466c#77a466cd03e5c44b5d9a533afe16291b6047d311"
 dependencies = [
  "futures-util",
  "gjson",
@@ -1507,7 +1507,7 @@ dependencies = [
 [[package]]
 name = "drift-rs"
 version = "1.0.0"
-source = "git+https://github.com/drift-labs/drift-rs.git?rev=534600c#534600ccdb1e5db7385400ab5e531617daf63746"
+source = "git+https://github.com/drift-labs/drift-rs.git?rev=77a466c#77a466cd03e5c44b5d9a533afe16291b6047d311"
 dependencies = [
  "ahash 0.8.12",
  "anchor-lang",
@@ -3320,7 +3320,7 @@ checksum = "44de48029c54ec1ca570786b5baeb906b0fc2409c8e0145585e287ee7a526c72"
 [[package]]
 name = "pyth_lazer"
 version = "0.1.0"
-source = "git+ssh://git@github.com/drift-labs/protocol-v2-shadow?rev=a0bdfea74bff46fae3f280acefed35f6b634dc67#a0bdfea74bff46fae3f280acefed35f6b634dc67"
+source = "git+https://github.com/drift-labs/protocol-v2?rev=a0bdfea74bff46fae3f280acefed35f6b634dc67#a0bdfea74bff46fae3f280acefed35f6b634dc67"
 dependencies = [
  "anchor-lang",
  "anyhow",
